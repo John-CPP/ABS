@@ -4,13 +4,16 @@ set -e
 # -------------------------------------------------
 # Paths
 # -------------------------------------------------
-PACKAGES_PATH="/media/storage/packages/my"
-CHROOT_BASE_PATH="/media/storage/packages/my/chroot"
-READY_MADE_PACKAGES_PATH="/media/storage/packages/abs_ready"
-MASTER_CHROOT="${CHROOT_BASE_PATH}/base"
 
-CACHYOS_REPO_URL="https://github.com/CachyOS/CachyOS-PKGBUILDS.git"
-CACHYOS_PACKAGES_PATH="${PACKAGES_PATH}/CachyOS-PKGBUILDS"
+
+CONFIG_FILE="./abs.config"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    echo "ERROR: Config file '$CONFIG_FILE' not found"
+    exit 1
+fi
 
 mkdir -p "$PACKAGES_PATH" "$CHROOT_BASE_PATH" "$READY_MADE_PACKAGES_PATH"
 
