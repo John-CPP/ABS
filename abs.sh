@@ -460,17 +460,20 @@ for pkg in "${PKG_ARRAY[@]}"; do
 (
     prepare_repo "$pkg"
 
-    [[ "$DOWNLOAD_ONLY" -eq 1 ]] && exit 0
-
-    vlog "==> MODE=$MODE, building package $pkg..."
-    if [[ "$MODE" == "local" ]]; then
-        build_local "$pkg"
+    if [[ "$DOWNLOAD_ONLY" -eq 1 ]]; then
+        vlog "==> Download-only mode, skipping build for $pkg"
     else
-        build_chroot "$pkg"
-    fi
+        vlog "==> MODE=$MODE, building package $pkg..."
 
-    if [[ "$COMPILE_ONLY" == 0 ]]; then
-        install_built_packages "$pkg"
+        if [[ "$MODE" == "local" ]]; then
+            build_local "$pkg"
+        else
+            build_chroot "$pkg"
+        fi
+
+        if [[ "$COMPILE_ONLY" -eq 0 ]]; then
+            install_built_packages "$pkg"
+        fi
     fi
 )
 done
