@@ -296,6 +296,7 @@ prepare_arch_repo() {
 # ----------------- CachyOS Repo -----------------
 prepare_cachyos_repo() {
     local pkg="$1"
+    local PKG_DIR
 
     mkdir -p "$CACHYOS_PACKAGES_PATH"
 
@@ -456,9 +457,10 @@ fi
 }
 
 for pkg in "${PKG_ARRAY[@]}"; do
+(
     prepare_repo "$pkg"
 
-    [[ "$DOWNLOAD_ONLY" -eq 1 ]] && continue
+    [[ "$DOWNLOAD_ONLY" -eq 1 ]] && exit 0
 
     vlog "==> MODE=$MODE, building package $pkg..."
     if [[ "$MODE" == "local" ]]; then
@@ -470,6 +472,7 @@ for pkg in "${PKG_ARRAY[@]}"; do
     if [[ "$COMPILE_ONLY" == 0 ]]; then
         install_built_packages "$pkg"
     fi
+)
 done
 
 blog "==> All requested packages processed successfully"
