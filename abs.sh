@@ -84,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --) shift; break ;;
         --cachyos) USE_CACHYOS=1 ;;
+        --help) usage ;;
         -*)
             flags="${1#-}"
             for (( i=0; i<${#flags}; i++ )); do
