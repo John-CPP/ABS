@@ -129,7 +129,6 @@ do_full_cleaning() {
 
 remove_chroot() {
     check_sudo_removal "$MASTER_CHROOT"
-    mkdir -p "$MASTER_CHROOT"
 }
 
 remove_all_cache() {
@@ -140,16 +139,16 @@ remove_all_cache() {
 
     npm cache clean --force
 
-    sudo sudo pacman -Scc
+    sudo pacman -Scc --noconfirm
 }
 
 check_sudo_removal() {
     local cmd=("$@")
 
     if [[ "$SUDO" -eq 1 ]]; then
-            sudo rm -rf "$cmd"
+            sudo rm -rf "${cmd[@]}"
         else
-            rm -rf "$cmd"
+            rm -rf "${cmd[@]}"
     fi
 }
 
@@ -166,7 +165,7 @@ bump_pkgrel() {
 
     current=$(grep -E '^pkgrel=' PKGBUILD | cut -d= -f2 || true)
     if [[ -z "$current" ]]; then
-        vlog "pkgrel=1.2" >> PKGBUILD
+        echo "pkgrel=1.2" >> PKGBUILD
         return
     fi
 
@@ -190,7 +189,7 @@ install_all_keys() {
 }
 
 prepare_sums_pkgrel() {
-    vlog "==> Package folder: $PKG_DIR"
+    vlog "==> Package folder: $PWD"
     vlog "==> Preparing pkgsums..."
     prepare_pkgsums
     vlog "==> Bumping pkgrel..."
@@ -447,13 +446,13 @@ if [[ ${#PKG_ARRAY[@]} -eq 0 && "$MODE" != "chroot" ]]; then
 fi
 
 
-[[ ${#PKG_ARRAY[@]} -eq 0 ]] && {
+    [[ ${#PKG_ARRAY[@]} -eq 0 ]] && {
     if [[ "$MODE" == "chroot" ]]; then
         blog "==> No packages specified, preparing/updating chroot"
         ensure_master_chroot
         update_chroot
         vlog "==> Chroot ready"
-        exit 1
+        exit 0
     else
         usage
     fi
