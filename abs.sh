@@ -361,11 +361,23 @@ build_local() {
     vlog "==> Building $pkg locally"
     export PKGDEST="$READY_MADE_PACKAGES_PATH"
 
-    shopt -s nullglob
-    local files=("${READY_MADE_PACKAGES_PATH}/${pkg}-"*.pkg.tar.zst)
-    shopt -u nullglob
+    local expected_files=()
+    mapfile -t expected_files < <(makepkg --packagelist 2>/dev/null || true)
 
-    if [[ ${#files[@]} -gt 0 && "$NEWBUILD" -eq 0 ]]; then
+    local all_expected_exist=1
+    if [[ ${#expected_files[@]} -eq 0 ]]; then
+        all_expected_exist=0
+    else
+        local expected_file
+        for expected_file in "${expected_files[@]}"; do
+            [[ -f "$expected_file" ]] || {
+                all_expected_exist=0
+                break
+            }
+        done
+    fi
+
+    if [[ "$all_expected_exist" -eq 1 && "$NEWBUILD" -eq 0 ]]; then
         vlog "==> Package already built, skipping"
     else
         fix_unknown_keys makepkg --syncdeps --noconfirm --needed -f
@@ -379,16 +391,32 @@ build_chroot() {
     ensure_master_chroot
     update_chroot
 
-    shopt -s nullglob
-    local files=("${READY_MADE_PACKAGES_PATH}/${pkg}-"*.pkg.tar.zst)
-    shopt -u nullglob
+    local expected_files=()
+    mapfile -t expected_files < <(makepkg --packagelist 2>/dev/null || true)
 
-    if [[ ${#files[@]} -gt 0 && "$NEWBUILD" -eq 0 ]]; then
+    local all_expected_exist=1
+    if [[ ${#expected_files[@]} -eq 0 ]]; then
+        all_expected_exist=0
+    else
+        local expected_file
+        for expected_file in "${expected_files[@]}"; do
+            [[ -f "$expected_file" ]] || {
+                all_expected_exist=0
+                break
+            }
+        done
+    fi
+
+    if [[ "$all_expected_exist" -eq 1 && "$NEWBUILD" -eq 0 ]]; then
         vlog "==> Package already built, skipping"
         return 0
     fi
 
-    [[ "$NEWBUILD" -eq 1 ]] && check_sudo_removal "${READY_MADE_PACKAGES_PATH}/${pkg}-"*.pkg.tar.zst
+    if [[ "$NEWBUILD" -eq 1 ]]; then
+        local stale_files=()
+        mapfile -t stale_files < <(makepkg --packagelist 2>/dev/null || true)
+        [[ ${#stale_files[@]} -gt 0 ]] && check_sudo_removal "${stale_files[@]}"
+    fi
     export PKGDEST="$READY_MADE_PACKAGES_PATH"
 
     # Import known keys before build
@@ -399,9 +427,14 @@ build_chroot() {
 
 install_built_packages() {
     local pkg="$1"
-    shopt -s nullglob
-    local files=("${READY_MADE_PACKAGES_PATH}/${pkg}-"*.pkg.tar.zst)
-    shopt -u nullglob
+    local files=()
+    mapfile -t files < <(makepkg --packagelist 2>/dev/null || true)
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        shopt -s nullglob
+        files=("${READY_MADE_PACKAGES_PATH}/${pkg}-"*.pkg.tar.zst)
+        shopt -u nullglob
+    fi
 
     [[ ${#files[@]} -eq 0 ]] && return
 
