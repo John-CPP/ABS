@@ -42,6 +42,23 @@ Lightweight helper for building Arch Linux and CachyOS packages.
 bash abs.sh -h -u -n package-name
 ```
 
+### Handling broken tip commits
+
+Arch package repositories sometimes land a test commit that does not build yet. ABS now handles this by pausing before any build starts, showing the last 5 commits for every requested package, and letting you choose the commit for each package first.
+
+For example:
+
+```bash
+bash abs.sh systemd gimp
+```
+
+The script will:
+1. Clone or update all requested package repositories.
+2. Show the last 5 commits for `systemd`.
+3. Show the last 5 commits for `gimp`.
+4. Ask you to choose one commit for each package.
+5. Only after all selections are made, continue with checksum preparation and builds.
+
 ---
 
 ## License
