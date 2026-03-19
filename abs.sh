@@ -33,6 +33,8 @@ SILENT=0
 COMPILE_ONLY=0
 REMOVE_CHROOT=0
 DO_FULL_CLEANING=0
+declare -A PKG_DIR_MAP
+declare -A PKG_REF_MAP
 
 # -------------------------------------------------
 # Verbose helper
@@ -207,6 +209,64 @@ prepare_pkgsums() {
     fi
 }
 
+checkout_repo_ref() {
+    local ref="$1"
+
+    [[ -z "$ref" ]] && return 0
+    vlog "==> Checking out git ref '$ref'"
+    git checkout --force "$ref"
+}
+
+select_commit_for_package() {
+    local pkg="$1"
+    local pkg_dir="$2"
+    local commits commit_count selection line hash subject
+    local -a commit_lines=()
+
+    cd "$pkg_dir"
+    vlog "==> Fetching recent commits for $pkg"
+    git fetch --all --tags --prune || true
+
+    mapfile -t commit_lines < <(git log -n 5 --pretty=format:'%h|%s')
+    commit_count=${#commit_lines[@]}
+
+    if [[ "$commit_count" -eq 0 ]]; then
+        blog "==> No commits found for $pkg"
+        return 1
+    fi
+
+    blog ""
+    blog "==> Select packaging commit for $pkg"
+    local idx=1
+    for line in "${commit_lines[@]}"; do
+        hash="${line%%|*}"
+        subject="${line#*|}"
+        blog "  [$idx] $hash - $subject"
+        ((idx++))
+    done
+
+    while true; do
+        read -rp "Choose commit for $pkg [1-${commit_count}] (default 1): " selection
+        selection="${selection:-1}"
+
+        if [[ "$selection" =~ ^[1-9][0-9]*$ ]] && (( selection >= 1 && selection <= commit_count )); then
+            line="${commit_lines[$((selection - 1))]}"
+            PKG_REF_MAP["$pkg"]="${line%%|*}"
+            blog "==> Selected ${PKG_REF_MAP[$pkg]} for $pkg"
+            return 0
+        fi
+
+        blog "Please choose a number between 1 and ${commit_count}."
+    done
+}
+
+select_commits_for_packages() {
+    local pkg
+    for pkg in "${PKG_ARRAY[@]}"; do
+        select_commit_for_package "$pkg" "${PKG_DIR_MAP[$pkg]}"
+    done
+}
+
 # ----------------- Key Helpers -----------------
 import_keys_from_pkgbuild() {
     local chroot_root="$1"
@@ -286,13 +346,12 @@ prepare_arch_repo() {
         vlog "==> Updating repo for $pkg"
         cd "$pkg_dir"
         git pull  || true
-        prepare_sums_pkgrel
     else
         vlog "==> Cloning repo for $pkg"
         git clone "https://gitlab.archlinux.org/archlinux/packaging/packages/${pkg}.git" "$pkg_dir"
-        cd "$pkg_dir"
-        prepare_sums_pkgrel
     fi
+
+    PKG_DIR_MAP["$pkg"]="$pkg_dir"
 }
 
 # ----------------- CachyOS Repo -----------------
@@ -327,8 +386,7 @@ prepare_cachyos_repo() {
         exit 1
     fi
 
-    cd "$PKG_DIR"
-    prepare_sums_pkgrel
+    PKG_DIR_MAP["$pkg"]="$PKG_DIR"
 }
 
 prepare_repo() {
@@ -425,6 +483,24 @@ build_chroot() {
     fix_unknown_keys makechrootpkg -c -r "$MASTER_CHROOT" -d "$PWD"
 }
 
+build_package() {
+    local pkg="$1"
+    local pkg_dir="${PKG_DIR_MAP[$pkg]}"
+    local pkg_ref="${PKG_REF_MAP[$pkg]}"
+
+    cd "$pkg_dir"
+    checkout_repo_ref "$pkg_ref"
+    prepare_sums_pkgrel
+
+    vlog "==> MODE=$MODE, building package $pkg..."
+
+    if [[ "$MODE" == "local" ]]; then
+        build_local "$pkg"
+    else
+        build_chroot "$pkg"
+    fi
+}
+
 install_built_packages() {
     local pkg="$1"
     local files=()
@@ -492,19 +568,23 @@ fi
 }
 
 for pkg in "${PKG_ARRAY[@]}"; do
-(
     prepare_repo "$pkg"
+done
+
+select_commits_for_packages
+
+for pkg in "${PKG_ARRAY[@]}"; do
+(
+    vlog "==> Using package directory ${PKG_DIR_MAP[$pkg]}"
+    vlog "==> Using selected ref ${PKG_REF_MAP[$pkg]} for $pkg"
 
     if [[ "$DOWNLOAD_ONLY" -eq 1 ]]; then
+        cd "${PKG_DIR_MAP[$pkg]}"
+        checkout_repo_ref "${PKG_REF_MAP[$pkg]}"
+        prepare_sums_pkgrel
         vlog "==> Download-only mode, skipping build for $pkg"
     else
-        vlog "==> MODE=$MODE, building package $pkg..."
-
-        if [[ "$MODE" == "local" ]]; then
-            build_local "$pkg"
-        else
-            build_chroot "$pkg"
-        fi
+        build_package "$pkg"
 
         if [[ "$COMPILE_ONLY" -eq 0 ]]; then
             install_built_packages "$pkg"
