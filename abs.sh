@@ -25,7 +25,6 @@ DOWNLOAD_ONLY=0
 NEWBUILD=0
 CLEAN=0
 SUDO=0
-USE_CACHYOS=0
 INSTALL_KEYS=0
 UPDATE_PKGSUMS=0
 VERBOSE=0
@@ -33,6 +32,11 @@ SILENT=0
 COMPILE_ONLY=0
 REMOVE_CHROOT=0
 DO_FULL_CLEANING=0
+SYSTEM_UPDATE=0
+TARGET_REPO="arch" # Default repository
+
+# Default system update command if not set in config
+SYSTEM_UPDATE_COMMAND="${SYSTEM_UPDATE_COMMAND:-sudo pacman -Syu}"
 
 # -------------------------------------------------
 # Verbose helper
@@ -73,7 +77,8 @@ Options:
   -u    Update pkgsums before building
   -v    Verbose mode (show script comments)
   -i    Silent Mode
-  --cachyos  Use CachyOS-PKGBUILDS repo instead of Arch Linux
+  --repo=NAME  Use a specific repository from config (default: arch)
+  -U    Perform full system update (${SYSTEM_UPDATE_COMMAND}) with manual compilation of configured packages
 
 Flags can be combined (e.g. -ch, -hnc).
 EOF
@@ -86,7 +91,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --) shift; break ;;
-        --cachyos) USE_CACHYOS=1 ;;
+        --repo=*) TARGET_REPO="${1#*=}" ;;
         --help) usage ;;
         -*)
             flags="${1#-}"
@@ -106,6 +111,7 @@ while [[ $# -gt 0 ]]; do
                     o) COMPILE_ONLY=1 ;;
                     r) REMOVE_CHROOT=1 ;;
                     e) DO_FULL_CLEANING=1 ;;
+                    U) SYSTEM_UPDATE=1 ;;
                     *) usage ;;
                 esac
             done
@@ -272,58 +278,72 @@ fix_unknown_keys() {
 }
 
 
-# ----------------- Arch Repo -----------------
-prepare_arch_repo() {
-    local pkg="$1"
-    local pkg_dir="${PACKAGES_PATH}/${pkg}"
+# ----------------- Repo Helpers -----------------
+prepare_git_repo() {
+    local repo_name="$1"
+    local repo_url="${REPOSITORIES[$repo_name]}"
+    local pkg_input="$2"
 
-    if [[ "$CLEAN" -eq 1 && -d "$pkg_dir" ]]; then
-        vlog "==> Cleaning repo for $pkg"
-        check_sudo_removal "$pkg_dir"
-    fi
+    # Resolve the actual package base name to clone, if an alias exists
+    local pkg="${PACKAGE_ALIASES[$pkg_input]:-$pkg_input}"
 
-    if [[ -d "$pkg_dir" ]]; then
-        vlog "==> Updating repo for $pkg"
-        cd "$pkg_dir"
-        git pull  || true
-        prepare_sums_pkgrel
-    else
-        vlog "==> Cloning repo for $pkg"
-        git clone "https://gitlab.archlinux.org/archlinux/packaging/packages/${pkg}.git" "$pkg_dir"
-        cd "$pkg_dir"
-        prepare_sums_pkgrel
-    fi
-}
-
-# ----------------- CachyOS Repo -----------------
-prepare_cachyos_repo() {
-    local pkg="$1"
+    local REPO_DIR="${PACKAGES_PATH}/${repo_name}"
     local PKG_DIR
 
-    mkdir -p "$CACHYOS_PACKAGES_PATH"
-
-    if [[ "$CLEAN" -eq 1 && -d "$CACHYOS_PACKAGES_PATH" ]]; then
-        vlog "==> Cleaning CachyOS repo"
-        if [[ "$SUDO" -eq 1 ]]; then
-            sudo rm -rf "$CACHYOS_PACKAGES_PATH"
-        else
-            rm -rf "$CACHYOS_PACKAGES_PATH"
-        fi
+    if [[ -z "$repo_url" ]]; then
+        blog "Error: Repository '$repo_name' not found in config."
+        exit 1
     fi
 
-    if [[ -d "$CACHYOS_PACKAGES_PATH/.git" ]]; then
-        vlog "==> Updating CachyOS-PKGBUILDS repo"
-        cd "$CACHYOS_PACKAGES_PATH"
+    if [[ "$repo_name" == "arch" ]]; then
+        # Arch uses a different structure (one git repo per package)
+        PKG_DIR="${PACKAGES_PATH}/arch/${pkg}"
+        if [[ "$CLEAN" -eq 1 && -d "$PKG_DIR" ]]; then
+            vlog "==> Cleaning arch repo for $pkg"
+            check_sudo_removal "$PKG_DIR"
+        fi
+
+        if [[ -d "$PKG_DIR" ]]; then
+            vlog "==> Updating arch repo for $pkg"
+            cd "$PKG_DIR"
+            git pull || true
+        else
+            vlog "==> Cloning arch repo for $pkg"
+            mkdir -p "${PACKAGES_PATH}/arch"
+            git clone "${repo_url}/${pkg}.git" "$PKG_DIR"
+            cd "$PKG_DIR"
+        fi
+        prepare_sums_pkgrel
+        return
+    fi
+
+    # Other repos (CachyOS, ventureoo) use a monolithic repo containing many packages
+    mkdir -p "$REPO_DIR"
+
+    if [[ "$CLEAN" -eq 1 && -d "$REPO_DIR" ]]; then
+        vlog "==> Cleaning repo $repo_name"
+        check_sudo_removal "$REPO_DIR"
+    fi
+
+    if [[ -d "$REPO_DIR/.git" ]]; then
+        vlog "==> Updating repo $repo_name"
+        cd "$REPO_DIR"
         git pull --ff-only || true
     else
-        vlog "==> Cloning CachyOS-PKGBUILDS repo"
-        git clone "$CACHYOS_REPO_URL" "$CACHYOS_PACKAGES_PATH"
+        vlog "==> Cloning repo $repo_name"
+        git clone "$repo_url" "$REPO_DIR"
     fi
 
     # Locate package folder by PKGBUILD
-    PKG_DIR=$(find "$CACHYOS_PACKAGES_PATH" -type f -name "PKGBUILD" -exec dirname {} \; | grep -i "$pkg" | head -n1)
+    PKG_DIR=$(find "$REPO_DIR" -type f -name "PKGBUILD" -exec dirname {} \; | grep -i "/$pkg$" | head -n1)
+
     if [[ -z "$PKG_DIR" ]]; then
-        blog "Package $pkg not found in CachyOS repo"
+        # Try finding anywhere if exact match fails
+        PKG_DIR=$(find "$REPO_DIR" -type f -name "PKGBUILD" -exec dirname {} \; | grep -i "$pkg" | head -n1)
+    fi
+
+    if [[ -z "$PKG_DIR" ]]; then
+        blog "Package $pkg not found in repo $repo_name"
         exit 1
     fi
 
@@ -331,13 +351,13 @@ prepare_cachyos_repo() {
     prepare_sums_pkgrel
 }
 
+
 prepare_repo() {
     local pkg="$1"
-    if [[ "$USE_CACHYOS" -eq 1 ]]; then
-        prepare_cachyos_repo "$pkg"
-    else
-        prepare_arch_repo "$pkg"
-    fi
+    local custom_repo="$2"
+    local repo_to_use="${custom_repo:-$TARGET_REPO}"
+
+    prepare_git_repo "$repo_to_use" "$pkg"
 }
 
 # ----------------- Chroot Helpers -----------------
@@ -425,8 +445,32 @@ build_chroot() {
     fix_unknown_keys makechrootpkg -c -r "$MASTER_CHROOT" -d "$PWD"
 }
 
+should_skip_install() {
+    local pkg_file="$1"
+    local pkg_name
+
+    # Use pacman to get the actual package name. It's the most reliable method.
+    pkg_name=$(pacman -Qp "$pkg_file" 2>/dev/null | awk '{print $1}')
+
+    if [[ -z "$pkg_name" ]]; then
+        return 1 # Don't skip if we can't identify it
+    fi
+
+    for skip_pkg in "${SKIP_INSTALL_PACKAGES[@]}"; do
+        if [[ "$pkg_name" == "$skip_pkg" ]]; then
+            return 0 # Should skip
+        fi
+    done
+
+    return 1 # Should not skip
+}
+
 install_built_packages() {
-    local pkg="$1"
+    local pkg_input="$1"
+
+    # Use the resolved package name to look for output files
+    local pkg="${PACKAGE_ALIASES[$pkg_input]:-$pkg_input}"
+
     local files=()
     mapfile -t files < <(makepkg --packagelist 2>/dev/null || true)
 
@@ -438,21 +482,119 @@ install_built_packages() {
 
     [[ ${#files[@]} -eq 0 ]] && return
 
+    # Filter out skipped packages first
+    local valid_files=()
     for f in "${files[@]}"; do
-        while true; do
-            read -rp "Install $f ? [Y/n] " yn
-            case "$yn" in
-                [Yy]*|"")
-                    sudo pacman -U "$f" || sudo pacman -U "$f"
-                    break
-                    ;;
-                [Nn]*) break ;;
-                *) echo "Answer Y or N" ;;
-            esac
-        done
+        if should_skip_install "$f"; then
+            vlog "==> Skipping installation of ignored package: $(basename "$f")"
+        else
+            valid_files+=("$f")
+        fi
+    done
+
+    if [[ ${#valid_files[@]} -eq 0 ]]; then
+        return
+    fi
+
+    echo "==> Packages available for installation:"
+    local i=1
+    for f in "${valid_files[@]}"; do
+        echo "  $i) $(basename "$f")"
+        ((i++))
+    done
+
+    while true; do
+        read -rp "Enter numbers of packages to install (e.g. 1,2,3 or 1-3, 4) [leave empty to install all, 'n' to skip]: " choice
+
+        if [[ -z "$choice" ]]; then
+            # Install all
+            sudo pacman -U "${valid_files[@]}" || sudo pacman -U "${valid_files[@]}"
+            break
+        elif [[ "$choice" =~ ^[Nn]$ ]]; then
+            echo "Skipping installation."
+            break
+        elif [[ "$choice" =~ ^[-0-9,[:space:]]+$ ]]; then
+            # Parse ranges and comma separated values
+            local -a selected_indices=()
+
+            # Remove spaces
+            choice="${choice// /}"
+
+            IFS=',' read -ra parts <<< "$choice"
+            for part in "${parts[@]}"; do
+                if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                    local start="${BASH_REMATCH[1]}"
+                    local end="${BASH_REMATCH[2]}"
+                    for (( j=start; j<=end; j++ )); do
+                        selected_indices+=("$j")
+                    done
+                else
+                    selected_indices+=("$part")
+                fi
+            done
+
+            # Collect selected files
+            local -a files_to_install=()
+            for idx in "${selected_indices[@]}"; do
+                # Convert 1-based index to 0-based
+                local array_idx=$((idx - 1))
+                if [[ $array_idx -ge 0 && $array_idx -lt ${#valid_files[@]} ]]; then
+                    files_to_install+=("${valid_files[$array_idx]}")
+                else
+                    echo "Warning: Number $idx is out of range."
+                fi
+            done
+
+            if [[ ${#files_to_install[@]} -gt 0 ]]; then
+                sudo pacman -U "${files_to_install[@]}" || sudo pacman -U "${files_to_install[@]}"
+                break
+            else
+                echo "No valid packages selected."
+            fi
+        else
+            echo "Invalid input format. Please use numbers, commas, and hyphens (e.g. 1,2,3 or 1-3)."
+        fi
     done
 }
 
+process_package() {
+    local pkg_input="$1"
+    local custom_repo="$2"
+
+    local pkg="${PACKAGE_ALIASES[$pkg_input]:-$pkg_input}"
+
+    (
+        prepare_repo "$pkg" "$custom_repo"
+
+        # Execute pre-build commands if any
+        if [[ -n "${PRE_UPDATE_COMMANDS[$pkg_input]}" ]]; then
+            vlog "==> Running pre-update commands for $pkg_input"
+            eval "${PRE_UPDATE_COMMANDS[$pkg_input]}"
+        fi
+
+        if [[ "$DOWNLOAD_ONLY" -eq 1 ]]; then
+            vlog "==> Download-only mode, skipping build for $pkg"
+        else
+            vlog "==> MODE=$MODE, building package $pkg..."
+
+            if [[ "$MODE" == "local" ]]; then
+                build_local "$pkg"
+            else
+                build_chroot "$pkg"
+            fi
+
+            if [[ "$COMPILE_ONLY" -eq 0 ]]; then
+                install_built_packages "$pkg"
+
+                # Execute post-build commands if any
+                if [[ -n "${POST_UPDATE_COMMANDS[$pkg_input]}" ]]; then
+                    vlog "==> Running post-update commands for $pkg_input"
+                    eval "${POST_UPDATE_COMMANDS[$pkg_input]}"
+                fi
+            fi
+        fi
+    )
+}
 
 # -------------------------------------------------
 # Main
@@ -473,13 +615,76 @@ if [[ "$DO_FULL_CLEANING" -eq 1 ]]; then
     blog "==> Full cleaning done."
 fi
 
+# System Update logic
+if [[ "$SYSTEM_UPDATE" -eq 1 ]]; then
+    blog "==> Checking for system updates..."
+
+    # Get list of packages that need updating (from arch repos)
+    # CheckUpdates returns non-zero if no updates, so we ignore failures
+    updates_available=$(checkupdates 2>/dev/null || true)
+
+    if [[ -z "$updates_available" ]]; then
+        blog "==> System is up to date."
+    else
+        # Collect manual packages that are in the update list
+        declare -a pkgs_to_compile=()
+
+        while read -r update_line; do
+            pkg_name=$(echo "$update_line" | awk '{print $1}')
+
+            # Check if this package is in our manual update list
+            if [[ -n "${MANUAL_UPDATE_PACKAGES[$pkg_name]}" ]]; then
+                # Avoid duplicates if multiple sub-packages map to the same base package
+                local already_added=0
+                for p in "${pkgs_to_compile[@]}"; do
+                    if [[ "$p" == "$pkg_name" ]]; then
+                        already_added=1
+                        break
+                    fi
+                done
+                if [[ "$already_added" -eq 0 ]]; then
+                    pkgs_to_compile+=("$pkg_name")
+                fi
+            fi
+        done <<< "$updates_available"
+
+        if [[ ${#pkgs_to_compile[@]} -gt 0 ]]; then
+            blog "==> The following packages will be manually compiled:"
+            for p in "${pkgs_to_compile[@]}"; do
+                blog "  -> $p (Repo: ${MANUAL_UPDATE_PACKAGES[$p]})"
+            done
+
+            # Then compile and install manual packages first
+            blog "==> Compiling manual packages..."
+            for p in "${pkgs_to_compile[@]}"; do
+                repo="${MANUAL_UPDATE_PACKAGES[$p]}"
+                process_package "$p" "$repo"
+            done
+
+            # Finally, update all other packages standard way
+            blog "==> Updating standard system packages..."
+            # We add --ignore for all manually compiled packages
+            ignore_args=""
+            for p in "${pkgs_to_compile[@]}"; do
+                ignore_args="$ignore_args --ignore $p"
+            done
+
+            eval "${SYSTEM_UPDATE_COMMAND} ${ignore_args}"
+
+        else
+            blog "==> No manual compile packages need updating. Running standard update..."
+            eval "${SYSTEM_UPDATE_COMMAND}"
+        fi
+    fi
+    exit 0
+fi
+
 if [[ ${#PKG_ARRAY[@]} -eq 0 && "$MODE" != "chroot" ]]; then
     blog "No packages to build."
     exit 1
 fi
 
-
-    [[ ${#PKG_ARRAY[@]} -eq 0 ]] && {
+if [[ ${#PKG_ARRAY[@]} -eq 0 ]]; then
     if [[ "$MODE" == "chroot" ]]; then
         blog "==> No packages specified, preparing/updating chroot"
         ensure_master_chroot
@@ -489,28 +694,10 @@ fi
     else
         usage
     fi
-}
+fi
 
 for pkg in "${PKG_ARRAY[@]}"; do
-(
-    prepare_repo "$pkg"
-
-    if [[ "$DOWNLOAD_ONLY" -eq 1 ]]; then
-        vlog "==> Download-only mode, skipping build for $pkg"
-    else
-        vlog "==> MODE=$MODE, building package $pkg..."
-
-        if [[ "$MODE" == "local" ]]; then
-            build_local "$pkg"
-        else
-            build_chroot "$pkg"
-        fi
-
-        if [[ "$COMPILE_ONLY" -eq 0 ]]; then
-            install_built_packages "$pkg"
-        fi
-    fi
-)
+    process_package "$pkg" ""
 done
 
 blog "==> All requested packages processed successfully"
