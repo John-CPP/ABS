@@ -20,7 +20,7 @@ mkdir -p "$PACKAGES_PATH" "$CHROOT_BASE_PATH" "$READY_MADE_PACKAGES_PATH"
 # -------------------------------------------------
 # Defaults
 # -------------------------------------------------
-MODE="local"
+MODE="" # Leave empty to use DEFAULT_BUILD_ENVIRONMENT
 DOWNLOAD_ONLY=0
 NEWBUILD=0
 CLEAN=0
@@ -33,10 +33,14 @@ COMPILE_ONLY=0
 REMOVE_CHROOT=0
 DO_FULL_CLEANING=0
 SYSTEM_UPDATE=0
-TARGET_REPO="arch" # Default repository
+FORCE_REPO_UPDATE=0
 
 # Default system update command if not set in config
 SYSTEM_UPDATE_COMMAND="${SYSTEM_UPDATE_COMMAND:-sudo pacman -Syu}"
+SYSTEM_UPDATE_WITH_REPOSITORY_REFRESH_COMMAND="${SYSTEM_UPDATE_WITH_REPOSITORY_REFRESH_COMMAND:-sudo pacman -Syu}"
+SYSTEM_UPDATE_IGNORE_FLAG="${SYSTEM_UPDATE_IGNORE_FLAG:---ignore}"
+DEFAULT_REPOSITORY="${DEFAULT_REPOSITORY:-arch}"
+DEFAULT_BUILD_ENVIRONMENT="${DEFAULT_BUILD_ENVIRONMENT:-local}"
 
 # -------------------------------------------------
 # Verbose helper
@@ -65,7 +69,7 @@ Usage: $0 [options] pkgname...
 
 Options:
   -d    Download only (no build)
-  -l    Build locally (default)
+  -l    Build locally
   -h    Build in chroot
   -o    Only compiles, doesn't install built packages
   -n    Force new build
@@ -77,8 +81,9 @@ Options:
   -u    Update pkgsums before building
   -v    Verbose mode (show script comments)
   -i    Silent Mode
-  --repo=NAME  Use a specific repository from config (default: arch)
-  -U    Perform full system update (${SYSTEM_UPDATE_COMMAND}) with manual compilation of configured packages
+  -R    Force git pull / repository refresh for all custom repositories
+  --repo=NAME  Use a specific repository from config (default: ${DEFAULT_REPOSITORY})
+  -U    Perform full system update (${SYSTEM_UPDATE_COMMAND} or ${SYSTEM_UPDATE_WITH_REPOSITORY_REFRESH_COMMAND} if -R used)
 
 Flags can be combined (e.g. -ch, -hnc).
 EOF
@@ -91,7 +96,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --) shift; break ;;
-        --repo=*) TARGET_REPO="${1#*=}" ;;
+        --repo=*) DEFAULT_REPOSITORY="${1#*=}" ;;
         --help) usage ;;
         -*)
             flags="${1#-}"
@@ -112,6 +117,7 @@ while [[ $# -gt 0 ]]; do
                     r) REMOVE_CHROOT=1 ;;
                     e) DO_FULL_CLEANING=1 ;;
                     U) SYSTEM_UPDATE=1 ;;
+                    R) FORCE_REPO_UPDATE=1 ;;
                     *) usage ;;
                 esac
             done
@@ -129,12 +135,22 @@ PKG_ARRAY=("$@")
 do_full_cleaning() {
     remove_chroot
     remove_all_cache
+    remove_abs_artifacts
     CLEAN=1;
     NEWBUILD=1;
 }
 
 remove_chroot() {
     check_sudo_removal "$MASTER_CHROOT"
+}
+
+remove_abs_artifacts() {
+    vlog "==> Removing all downloaded repositories and built packages..."
+    check_sudo_removal "$PACKAGES_PATH"
+    check_sudo_removal "$READY_MADE_PACKAGES_PATH"
+
+    # Re-create empty base paths so subsequent commands don't fail
+    mkdir -p "$PACKAGES_PATH" "$READY_MADE_PACKAGES_PATH"
 }
 
 remove_all_cache() {
@@ -244,7 +260,7 @@ fix_unknown_keys() {
         vlog "==> Running command: ${cmd[*]}"
 
         # Run the command, tee output to log
-        "${cmd[@]}" 2>&1 | tee /tmp/abs_script.log
+        eval "${cmd[@]}" 2>&1 | tee /tmp/abs_script.log
         local exit_code=${PIPESTATUS[0]}
 
         if [[ $exit_code -eq 0 ]]; then
@@ -304,16 +320,16 @@ prepare_git_repo() {
         fi
 
         if [[ -d "$PKG_DIR" ]]; then
-            vlog "==> Updating arch repo for $pkg"
+            vlog "==> Arch repo exists for $pkg. Skipping update since arch packages are updated via checkupdates"
             cd "$PKG_DIR"
-            git pull || true
+            # We don't pull here anymore as requested, just cd
         else
             vlog "==> Cloning arch repo for $pkg"
             mkdir -p "${PACKAGES_PATH}/arch"
             git clone "${repo_url}/${pkg}.git" "$PKG_DIR"
             cd "$PKG_DIR"
         fi
-        prepare_sums_pkgrel
+
         return
     fi
 
@@ -326,16 +342,23 @@ prepare_git_repo() {
     fi
 
     if [[ -d "$REPO_DIR/.git" ]]; then
-        vlog "==> Updating repo $repo_name"
-        cd "$REPO_DIR"
-        git pull --ff-only || true
+        if [[ "$FORCE_REPO_UPDATE" -eq 1 ]]; then
+            vlog "==> Updating repo $repo_name (R flag used)"
+            cd "$REPO_DIR"
+            git pull --ff-only || true
+        else
+            vlog "==> Repo $repo_name exists. Skipping update (No R flag used)"
+            cd "$REPO_DIR"
+        fi
     else
         vlog "==> Cloning repo $repo_name"
         git clone "$repo_url" "$REPO_DIR"
     fi
 
     # Locate package folder by PKGBUILD
-    PKG_DIR=$(find "$REPO_DIR" -type f -name "PKGBUILD" -exec dirname {} \; | grep -i "/$pkg$" | head -n1)
+    # Modified search: first find all PKGBUILDs, then grab their directories,
+    # then grep for an exact directory match ending in /$pkg
+    PKG_DIR=$(find "$REPO_DIR" -type f -name "PKGBUILD" -exec dirname {} \; | grep -E "/${pkg}$" | head -n1)
 
     if [[ -z "$PKG_DIR" ]]; then
         # Try finding anywhere if exact match fails
@@ -348,14 +371,22 @@ prepare_git_repo() {
     fi
 
     cd "$PKG_DIR"
-    prepare_sums_pkgrel
 }
 
 
 prepare_repo() {
     local pkg="$1"
+
+    # Custom logic to determine repo based on PACKAGE_SOURCES
+    # First check command-line --repo argument. If not DEFAULT_REPOSITORY, use it.
     local custom_repo="$2"
-    local repo_to_use="${custom_repo:-$TARGET_REPO}"
+    local repo_to_use="$DEFAULT_REPOSITORY"
+
+    if [[ -n "$custom_repo" ]]; then
+        repo_to_use="$custom_repo"
+    elif [[ -n "${PACKAGE_SOURCES[$pkg]}" ]]; then
+        repo_to_use="${PACKAGE_SOURCES[$pkg]}"
+    fi
 
     prepare_git_repo "$repo_to_use" "$pkg"
 }
@@ -377,7 +408,8 @@ update_chroot() {
 
 # ----------------- Build Helpers -----------------
 build_local() {
-    local pkg="$1"
+    local pkg_input="$1"
+    local pkg="${PACKAGE_ALIASES[$pkg_input]:-$pkg_input}"
     vlog "==> Building $pkg locally"
     export PKGDEST="$READY_MADE_PACKAGES_PATH"
 
@@ -400,12 +432,18 @@ build_local() {
     if [[ "$all_expected_exist" -eq 1 && "$NEWBUILD" -eq 0 ]]; then
         vlog "==> Package already built, skipping"
     else
-        fix_unknown_keys makepkg --syncdeps --noconfirm --needed -f
+        local build_cmd="${CUSTOM_LOCAL_BUILD_COMMANDS[$pkg_input]}"
+        if [[ -z "$build_cmd" ]]; then
+             build_cmd="makepkg --syncdeps --noconfirm --needed -f"
+        fi
+
+        fix_unknown_keys "$build_cmd"
     fi
 }
 
 build_chroot() {
-    local pkg="$1"
+    local pkg_input="$1"
+    local pkg="${PACKAGE_ALIASES[$pkg_input]:-$pkg_input}"
     vlog "==> Building $pkg in chroot"
 
     ensure_master_chroot
@@ -442,7 +480,12 @@ build_chroot() {
     # Import known keys before build
     import_keys_from_pkgbuild "${MASTER_CHROOT}/root" "$PWD"
 
-    fix_unknown_keys makechrootpkg -c -r "$MASTER_CHROOT" -d "$PWD"
+    local build_cmd="${CUSTOM_CHROOT_BUILD_COMMANDS[$pkg_input]}"
+    if [[ -z "$build_cmd" ]]; then
+         build_cmd="makechrootpkg -c -r \"$MASTER_CHROOT\" -d \"$PWD\""
+    fi
+
+    fix_unknown_keys "$build_cmd"
 }
 
 should_skip_install() {
@@ -564,7 +607,7 @@ process_package() {
     local pkg="${PACKAGE_ALIASES[$pkg_input]:-$pkg_input}"
 
     (
-        prepare_repo "$pkg" "$custom_repo"
+        prepare_repo "$pkg_input" "$custom_repo"
 
         # Execute pre-build commands if any
         if [[ -n "${PRE_UPDATE_COMMANDS[$pkg_input]}" ]]; then
@@ -572,19 +615,34 @@ process_package() {
             eval "${PRE_UPDATE_COMMANDS[$pkg_input]}"
         fi
 
+        prepare_sums_pkgrel
+
         if [[ "$DOWNLOAD_ONLY" -eq 1 ]]; then
             vlog "==> Download-only mode, skipping build for $pkg"
         else
-            vlog "==> MODE=$MODE, building package $pkg..."
+            # Determine build mode
+            local current_mode="$MODE"
+            if [[ -z "$current_mode" ]]; then
+                if [[ -n "${PACKAGE_BUILDING_ENVIRONMENT[$pkg_input]}" ]]; then
+                    current_mode="${PACKAGE_BUILDING_ENVIRONMENT[$pkg_input]}"
+                else
+                    current_mode="$DEFAULT_BUILD_ENVIRONMENT"
+                fi
+            fi
 
-            if [[ "$MODE" == "local" ]]; then
-                build_local "$pkg"
+            vlog "==> MODE=$current_mode, building package $pkg..."
+
+            if [[ "$current_mode" == "local" ]]; then
+                build_local "$pkg_input"
+            elif [[ "$current_mode" == "chroot" ]]; then
+                build_chroot "$pkg_input"
             else
-                build_chroot "$pkg"
+                echo "ERROR: Invalid build mode: $current_mode"
+                exit 1
             fi
 
             if [[ "$COMPILE_ONLY" -eq 0 ]]; then
-                install_built_packages "$pkg"
+                install_built_packages "$pkg_input"
 
                 # Execute post-build commands if any
                 if [[ -n "${POST_UPDATE_COMMANDS[$pkg_input]}" ]]; then
@@ -619,62 +677,133 @@ fi
 if [[ "$SYSTEM_UPDATE" -eq 1 ]]; then
     blog "==> Checking for system updates..."
 
+    # Determine command to use based on R flag
+    cmd_to_use="$SYSTEM_UPDATE_COMMAND"
+    if [[ "$FORCE_REPO_UPDATE" -eq 1 ]]; then
+        cmd_to_use="$SYSTEM_UPDATE_WITH_REPOSITORY_REFRESH_COMMAND"
+    fi
+
     # Get list of packages that need updating (from arch repos)
     # CheckUpdates returns non-zero if no updates, so we ignore failures
     updates_available=$(checkupdates 2>/dev/null || true)
 
-    if [[ -z "$updates_available" ]]; then
-        blog "==> System is up to date."
-    else
-        # Collect manual packages that are in the update list
-        declare -a pkgs_to_compile=()
+    declare -a pkgs_to_compile=()
 
+    if [[ -n "$updates_available" ]]; then
         while read -r update_line; do
             pkg_name=$(echo "$update_line" | awk '{print $1}')
 
             # Check if this package is in our manual update list
-            if [[ -n "${MANUAL_UPDATE_PACKAGES[$pkg_name]}" ]]; then
-                # Avoid duplicates if multiple sub-packages map to the same base package
-                local already_added=0
-                for p in "${pkgs_to_compile[@]}"; do
-                    if [[ "$p" == "$pkg_name" ]]; then
-                        already_added=1
-                        break
+            for manual_pkg in "${MANUAL_UPDATE_PACKAGES[@]}"; do
+                if [[ "$pkg_name" == "$manual_pkg" ]]; then
+                    # Avoid duplicates
+                    already_added=0
+                    for p in "${pkgs_to_compile[@]}"; do
+                        if [[ "$p" == "$pkg_name" ]]; then
+                            already_added=1
+                            break
+                        fi
+                    done
+                    if [[ "$already_added" -eq 0 ]]; then
+                        pkgs_to_compile+=("$pkg_name")
                     fi
-                done
-                if [[ "$already_added" -eq 0 ]]; then
-                    pkgs_to_compile+=("$pkg_name")
+                    break
+                fi
+            done
+        done <<< "$updates_available"
+    fi
+
+    # If -R is passed, check custom repositories for updates
+    if [[ "$FORCE_REPO_UPDATE" -eq 1 ]]; then
+        for manual_pkg in "${MANUAL_UPDATE_PACKAGES[@]}"; do
+            already_added=0
+            for p in "${pkgs_to_compile[@]}"; do
+                if [[ "$p" == "$manual_pkg" ]]; then
+                    already_added=1
+                    break
+                fi
+            done
+            [[ "$already_added" -eq 1 ]] && continue
+
+            repo_to_use="${PACKAGE_SOURCES[$manual_pkg]:-$DEFAULT_REPOSITORY}"
+
+            if [[ "$repo_to_use" != "arch" ]]; then
+                blog "==> Checking custom repository ($repo_to_use) for $manual_pkg updates..."
+
+                needs_update=0
+                if (
+                    prepare_repo "$manual_pkg"
+                    if [[ -f PKGBUILD ]]; then
+                        source PKGBUILD >/dev/null 2>&1 || true
+                        full_ver=""
+                        [[ -n "$epoch" ]] && full_ver="${epoch}:"
+
+                        # Fallback for missing pkgver/pkgrel which shouldn't happen but keeps shellcheck quiet
+                        safe_pkgver="${pkgver:-1.0}"
+                        safe_pkgrel="${pkgrel:-1}"
+                        full_ver="${full_ver}${safe_pkgver}-${safe_pkgrel}"
+
+                        pkg_base="${PACKAGE_ALIASES[$manual_pkg]:-$manual_pkg}"
+
+                        inst_ver=$(pacman -Q "$pkg_base" 2>/dev/null | awk '{print $2}' || true)
+
+                        if [[ -z "$inst_ver" ]] || [[ $(vercmp "$full_ver" "$inst_ver") -gt 0 ]]; then
+                            exit 100
+                        fi
+                    fi
+                    exit 0
+                ); then
+                    needs_update=0
+                else
+                    if [[ $? -eq 100 ]]; then
+                        needs_update=1
+                    fi
+                fi
+
+                if [[ "$needs_update" -eq 1 ]]; then
+                    pkgs_to_compile+=("$manual_pkg")
                 fi
             fi
-        done <<< "$updates_available"
+        done
+    fi
 
-        if [[ ${#pkgs_to_compile[@]} -gt 0 ]]; then
-            blog "==> The following packages will be manually compiled:"
-            for p in "${pkgs_to_compile[@]}"; do
-                blog "  -> $p (Repo: ${MANUAL_UPDATE_PACKAGES[$p]})"
-            done
+    if [[ ${#pkgs_to_compile[@]} -gt 0 ]]; then
+        blog "==> The following packages will be manually compiled:"
+        for p in "${pkgs_to_compile[@]}"; do
+            blog "  -> $p"
+        done
 
-            # Then compile and install manual packages first
-            blog "==> Compiling manual packages..."
-            for p in "${pkgs_to_compile[@]}"; do
-                repo="${MANUAL_UPDATE_PACKAGES[$p]}"
-                process_package "$p" "$repo"
-            done
+        # Then compile and install manual packages first
+        blog "==> Compiling manual packages..."
+        for p in "${pkgs_to_compile[@]}"; do
+            process_package "$p" ""
+        done
 
-            # Finally, update all other packages standard way
-            blog "==> Updating standard system packages..."
-            # We add --ignore for all manually compiled packages
-            ignore_args=""
-            for p in "${pkgs_to_compile[@]}"; do
-                ignore_args="$ignore_args --ignore $p"
-            done
+        # Finally, update all other packages standard way
+        blog "==> Updating standard system packages..."
 
-            eval "${SYSTEM_UPDATE_COMMAND} ${ignore_args}"
+        # 1. We add the configured ignore flag for all manually compiled packages
+        ignore_args=""
+        for p in "${pkgs_to_compile[@]}"; do
+            ignore_args="$ignore_args ${SYSTEM_UPDATE_IGNORE_FLAG} $p"
+        done
 
-        else
-            blog "==> No manual compile packages need updating. Running standard update..."
-            eval "${SYSTEM_UPDATE_COMMAND}"
-        fi
+        # 2. We add the configured ignore flag for all explicitly ignored packages from config
+        for p in "${SYSTEM_UPDATE_IGNORE_PACKAGES[@]}"; do
+            ignore_args="$ignore_args ${SYSTEM_UPDATE_IGNORE_FLAG} $p"
+        done
+
+        eval "${cmd_to_use} ${ignore_args}"
+
+    else
+        blog "==> No manual compile packages need updating. Running standard update..."
+        # Apply configured ignore packages even if no manual compilations were done
+        ignore_args=""
+        for p in "${SYSTEM_UPDATE_IGNORE_PACKAGES[@]}"; do
+            ignore_args="$ignore_args ${SYSTEM_UPDATE_IGNORE_FLAG} $p"
+        done
+
+        eval "${cmd_to_use} ${ignore_args}"
     fi
     exit 0
 fi
