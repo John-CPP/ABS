@@ -535,7 +535,25 @@ install_built_packages() {
         fi
     done
 
-    if [[ ${#valid_files[@]} -eq 0 ]]; then
+    # Skip prompt if there's only 1 valid file
+    if [[ ${#valid_files[@]} -eq 1 ]]; then
+        echo "==> Only 1 package available: $(basename "${valid_files[0]}")"
+        while true; do
+            read -rp "Install it? [Y/n] " yn
+            case "$yn" in
+                [Yy]*|"")
+                    sudo pacman -U "${valid_files[0]}" || sudo pacman -U "${valid_files[0]}"
+                    break
+                    ;;
+                [Nn]*)
+                    echo "Skipping installation."
+                    break
+                    ;;
+                *) echo "Answer Y or N" ;;
+            esac
+        done
+        return
+    elif [[ ${#valid_files[@]} -eq 0 ]]; then
         return
     fi
 
