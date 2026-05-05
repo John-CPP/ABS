@@ -2,9 +2,9 @@
 
 <div align="center">
 
-### Arch Build Script
+### Arch Building System
 
-Lightweight helper for building Arch Linux packages from multiple repositories, managing chroots, and handling system updates.
+Lightweight helper for building Arch Linux/CachyOS packages from multiple repositories, managing chroots, and handling system updates.
 
 ![Shell](https://img.shields.io/badge/bash-script-121011?style=for-the-badge&logo=gnu-bash)
 ![Arch Linux](https://img.shields.io/badge/arch-linux-1793D1?style=for-the-badge&logo=arch-linux&logoColor=white)
