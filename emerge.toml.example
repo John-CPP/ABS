@@ -1,0 +1,65 @@
+# arch-emerge example config. Copy to ~/.config/arch-emerge/emerge.toml,
+# /etc/arch-emerge/emerge.toml, or ./emerge.toml and set [paths] for your system.
+# Demo paths use /tmp/arch-emerge-demo/...
+
+manual_update_packages = ["systemd", "qemu-full", "mesa", "lib32-mesa"]
+skip_install_packages = [
+    "systemd-tests",
+    "qemu-user-static-binfmt",
+    "qemu-user-static",
+    "qemu-guest-agent",
+]
+
+[paths]
+packages_path = "/tmp/arch-emerge-demo/sources"
+chroot_base_path = "/tmp/arch-emerge-demo/chroot"
+ready_made_packages_path = "/tmp/arch-emerge-demo/emerge_ready"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command = "yay -Su"
+command_with_refresh = "yay -Syu"
+ignore_flag = "--ignore"
+ignore_packages = ["firefox", "firefox-pure"]
+
+[repositories]
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+cachyos = "https://github.com/CachyOS/CachyOS-PKGBUILDS.git"
+ventureoo = "https://github.com/ventureoo/PKGBUILDs.git"
+venomo = "https://github.com/Ven0m0/PKG.git"
+default = "arch"
+
+[packages]
+
+[packages.systemd]
+source = "arch"
+build_env = "local"
+tests = false
+
+[packages.qemu-full]
+source = "arch"
+build_env = "local"
+tests = true
+alias = "qemu"
+
+[packages.firefox-pure]
+source = "ventureoo"
+build_env = "local"
+tests = true
+
+[packages.vim]
+source = "arch"
+build_env = "local"
+tests = false
+
+[packages.mesa]
+source = "cachyos"
+build_env = "local"
+tests = true
+
+[packages.lib32-mesa]
+source = "cachyos"
+build_env = "local"
+tests = true
