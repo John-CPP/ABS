@@ -36,6 +36,59 @@ impl<'a> Drop for PkgbuildGuard<'a> {
     }
 }
 
+/// Ensure `<chrootdir>/root` exists for `makechrootpkg -r <chrootdir>` (see makechrootpkg(1)).
+fn ensure_devtools_chroot(chrootdir: &Path) -> Result<(), String> {
+    let rootfs = chrootdir.join("root");
+
+    if rootfs.is_dir() {
+        return Ok(());
+    }
+    if rootfs.exists() {
+        return Err(format!(
+            "{} exists but is not a directory; remove it or change chroot_base_path.",
+            rootfs.display()
+        ));
+    }
+
+    // Older ABS called `mkarchroot` on `.../base` instead of `.../base/root`, which breaks
+    // makechrootpkg (it syncs `root` -> `$USER` and expects `root/etc/makepkg.conf`).
+    if chrootdir.is_dir() && chrootdir.join("etc").is_dir() && !rootfs.is_dir() {
+        return Err(format!(
+            "Incompatible chroot layout at {} (rootfs was created at 'base/' instead of 'base/root/'). \
+             Remove it and retry, for example: sudo rm -rf {}",
+            chrootdir.display(),
+            chrootdir.display(),
+        ));
+    }
+
+    blog!(
+        "Chroot rootfs missing at {}; creating with mkarchroot (first run may take a while)...",
+        rootfs.display()
+    );
+
+    run_command(
+        "sudo",
+        &["mkdir", "-p", &chrootdir.to_string_lossy()],
+        None::<&str>,
+    )?;
+
+    let dest = rootfs.to_string_lossy();
+    run_command(
+        "sudo",
+        &["mkarchroot", dest.as_ref(), "base-devel"],
+        None::<&str>,
+    )?;
+
+    if !rootfs.is_dir() {
+        return Err(format!(
+            "mkarchroot finished but {} is not a usable directory",
+            rootfs.display()
+        ));
+    }
+
+    Ok(())
+}
+
 fn run_build_with_key_retry(build_cmd: &str, repo_dir: &Path, verbose: bool) -> Result<(), String> {
     let key_re = Regex::new(r"(?i)unknown public key ([0-9A-F]+)")
         .map_err(|e| format!("Failed to compile missing-key regex: {}", e))?;
@@ -488,11 +541,20 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
             }
         } else {
             blog!("Building in chroot with makechrootpkg...");
-            let master_chroot = PathBuf::from(&config.paths.chroot_base_path).join("base");
+            // `makechrootpkg -r <dir>` expects `<dir>/root` (see mkarchroot / makechrootpkg man pages).
+            let chrootdir = PathBuf::from(&config.paths.chroot_base_path).join("base");
+            if let Err(e) = ensure_devtools_chroot(&chrootdir) {
+                if config.build.ignore_compilation_failures {
+                    ewarn!("Chroot setup failed for {}: {}", pkg, e);
+                    restore_pkgbuild(repo_dir);
+                    return false;
+                }
+                die!("Chroot setup failed for {}: {}", pkg, e);
+            }
             let mut build_cmd = format!(
                 "PKGDEST=\"{}\" makechrootpkg -c -r \"{}\" -d \"{}\"",
                 config.paths.ready_made_packages_path,
-                master_chroot.to_string_lossy(),
+                chrootdir.to_string_lossy(),
                 repo_dir.to_string_lossy()
             );
             if skip_tests {

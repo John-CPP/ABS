@@ -107,7 +107,7 @@ Full **local build** (longer; compiles dependencies as `makepkg` would):
 ./target/release/abs -l vim
 ```
 
-**Chroot** build (requires a devtools chroot under `chroot_base_path` from your config):
+**Chroot** build (`makechrootpkg`): if `{chroot_base_path}/base/root` is missing, `abs` runs `sudo mkarchroot …/base/root base-devel` on first use (install the `devtools` package first; layout matches makechrootpkg(1)).
 
 ```bash
 ./target/release/abs -h vim

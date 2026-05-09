@@ -37,3 +37,4 @@ default = "arch"
 # build_env = "local"
 # tests = true
 # pre_update_command = "rm -rf mozbuild"
+# post_update_command = ""

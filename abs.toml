@@ -56,8 +56,6 @@ alias = "qemu"
 source = "ventureoo"
 build_env = "local"
 tests = true
-# Mozilla PKGBUILDs: leftover `mozbuild/` makes `prepare()` fail with "File exists".
-pre_update_command = "rm -rf mozbuild"
 
 [packages.vim]
 source = "arch"
