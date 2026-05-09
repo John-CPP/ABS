@@ -1,4 +1,4 @@
-# Arch-Emerge
+# Arch-Emerge (Alpha version. Currently very buggy. New version in progress, soon.)
 
 <div align="center">
 
