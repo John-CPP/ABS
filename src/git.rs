@@ -1,10 +1,32 @@
 use crate::utils::{check_sudo_removal, run_command};
 use crate::{blog, die, ewarn};
 use colored::Colorize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// One `abs` process may call `prepare_repo(..., force_update: true)` many times for the same
+/// shared clone (e.g. several `manual_update_packages` on `cachyos`). Skip redundant `git pull`s.
+static SHARED_REPO_REMOTE_UP_TO_DATE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn shared_repo_remote_cache() -> &'static Mutex<HashSet<PathBuf>> {
+    SHARED_REPO_REMOTE_UP_TO_DATE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn shared_repo_remote_already_updated(repo_dir: &Path) -> bool {
+    shared_repo_remote_cache()
+        .lock()
+        .map(|g| g.contains(repo_dir))
+        .unwrap_or(false)
+}
+
+fn shared_repo_remote_note_updated(repo_dir: &Path) {
+    if let Ok(mut g) = shared_repo_remote_cache().lock() {
+        g.insert(repo_dir.to_path_buf());
+    }
+}
 
 /// Caches `collect_pkgbuild_dirs` per shared repo root so scanning a large tree (e.g. CachyOS)
 /// happens once per `report_manual_update_versions` pass, not once per package.
@@ -111,10 +133,17 @@ pub fn prepare_repo(
             ) {
                 die!("Failed to clone repository {}: {}", clone_url, e);
             }
-        } else if force_update && repo_dir.join(".git").exists() {
+            shared_repo_remote_note_updated(&repo_dir);
+        } else if force_update
+            && repo_dir.join(".git").exists()
+            && !shared_repo_remote_already_updated(&repo_dir)
+        {
             blog!("Updating arch package repo {}...", base_pkg_name);
-            if let Err(e) = run_command("git", &["pull", "--ff-only"], Some(&repo_dir)) {
-                ewarn!("git pull failed for {}: {}", base_pkg_name, e);
+            match run_command("git", &["pull", "--ff-only"], Some(&repo_dir)) {
+                Ok(()) => shared_repo_remote_note_updated(&repo_dir),
+                Err(e) => {
+                    ewarn!("git pull failed for {}: {}", base_pkg_name, e);
+                }
             }
         }
         return repo_dir;
@@ -137,10 +166,11 @@ pub fn prepare_repo(
         ) {
             die!("Failed to clone repository {}: {}", repo_url, e);
         }
-    } else if force_update {
-        blog!("Updating repo for {} (R flag used)", repo_name);
+        shared_repo_remote_note_updated(&repo_dir);
+    } else if force_update && !shared_repo_remote_already_updated(&repo_dir) {
         loop {
             if run_command("git", &["pull", "--ff-only"], Some(&repo_dir)).is_ok() {
+                shared_repo_remote_note_updated(&repo_dir);
                 break;
             }
 
@@ -176,6 +206,7 @@ pub fn prepare_repo(
                     ) {
                         die!("Failed to clone repository {}: {}", repo_url, e);
                     }
+                    shared_repo_remote_note_updated(&repo_dir);
                     break;
                 }
                 "a" => {

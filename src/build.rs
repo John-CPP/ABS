@@ -191,6 +191,7 @@ fn resolve_pkg_repo(pkg: &str, cli: &Cli, config: &Config) -> (String, String, S
 fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Result<bool, String> {
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config);
     let repo_url = repo_url_string.as_str();
+    // Callers that pass `-R` with `-U` run `sync_manual_repo_remotes` first; only read the tree here.
     let pkg_dir = prepare_repo(
         pkg,
         &base_pkg,
@@ -198,7 +199,7 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
         repo_url,
         &config.paths.packages_path,
         false,
-        cli.force_repo_update,
+        false,
         None,
     );
     let src_ver = read_pkg_full_version_from_dir(pkg_dir.as_path())?;
@@ -210,8 +211,10 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
 
 /// `-U` manual list: `helpers_match` is a line in `checkupdates`/`yay -Qu`. For `arch` that is
 /// enough. For other repos, `-R` runs `git pull` then compares PKGBUILD / `.SRCINFO` version to `pacman -Q`.
-/// `git pull` (or clone) for every `manual_update_packages` entry (arch: per package; others:
-/// deduped per repo key). Does not compile; callers run report / system update / builds.
+/// `git pull` (or clone) for each distinct remote: **arch** uses one clone per package
+/// (`arch:<base_pkg>`); **other repositories** run at most once per `repo_name` no matter how many
+/// `manual_update_packages` share it. [`crate::git::prepare_repo`] also skips a second `git pull`
+/// on the same clone path in one process. Does not compile; callers run report / builds / update.
 pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
     blog!("Syncing git remotes for manual_update_packages...");
     if config.manual_update_packages.is_empty() {
@@ -424,6 +427,8 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
         return true;
     }
 
+    // With `-RU`, git remotes are refreshed once in `main` before manual builds — avoid a second pull per package.
+    let refresh_remote = cli.force_repo_update && !cli.system_update;
     // Actual build flow
     let repo_dir_path = prepare_repo(
         pkg,
@@ -432,7 +437,7 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
         repo_url,
         &config.paths.packages_path,
         cli.clean,
-        cli.force_repo_update,
+        refresh_remote,
         None,
     );
     let repo_dir = repo_dir_path.as_path();

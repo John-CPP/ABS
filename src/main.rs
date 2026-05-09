@@ -243,11 +243,6 @@ fn main() {
                 if !build::process_package(pkg, &cli, &config, defer_install_pass) {
                     skipped_install_after_compile_fail.insert(pkg.clone());
                 }
-            } else {
-                blog!(
-                    "No build scheduled for manual package '{}'. Skipping compile...",
-                    pkg
-                );
             }
         }
 
