@@ -1,0 +1,77 @@
+# ABS — local paths (edit [paths] for your machine).
+config_version = 1
+
+manual_update_packages = [
+    "systemd",
+    "qemu-full",
+    "mesa",
+    "lib32-mesa",
+    "firefox-pure",
+]
+skip_install_packages = [
+    "systemd-tests",
+    "qemu-user-static-binfmt",
+    "qemu-user-static",
+    "qemu-guest-agent",
+]
+
+[paths]
+packages_path = "/media/storage/packages/abs/packages"
+chroot_base_path = "/media/storage/packages/abs/chroot"
+ready_made_packages_path = "/media/storage/packages/abs/ready"
+
+[build]
+default_environment = "local"
+ignore_compilation_failures = false
+compile_first_install_after = false
+clean_install_by_default = false
+
+[system_update]
+command_to_update_repositories = "yay -Sy"
+command_to_perform_system_update = "yay -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+cachyos = "https://github.com/CachyOS/CachyOS-PKGBUILDS.git"
+ventureoo = "https://github.com/ventureoo/PKGBUILDs.git"
+venomo = "https://github.com/Ven0m0/PKG.git"
+default = "arch"
+
+[packages]
+
+[packages.systemd]
+source = "arch"
+build_env = "local"
+tests = false
+
+[packages.qemu-full]
+source = "arch"
+build_env = "local"
+tests = true
+alias = "qemu"
+
+[packages.firefox-pure]
+source = "ventureoo"
+build_env = "local"
+tests = true
+# Mozilla PKGBUILDs: leftover `mozbuild/` makes `prepare()` fail with "File exists".
+pre_update_command = "rm -rf mozbuild"
+
+[packages.vim]
+source = "arch"
+build_env = "local"
+tests = false
+
+[packages.mesa]
+source = "cachyos"
+build_env = "local"
+tests = true
+custom_local_build_command = "export CC=clang; export CXX=clang++; makepkg --syncdeps --noconfirm --needed -f"
+
+[packages.lib32-mesa]
+source = "cachyos"
+build_env = "local"
+tests = true
+custom_local_build_command = "export CC=clang; export CXX=clang++; makepkg --syncdeps --noconfirm --needed -f"

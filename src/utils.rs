@@ -101,8 +101,8 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(cwd: P, shell_body: &str) -> Re
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let inner_path = tmp.join(format!("arch_emerge_build_{}_inner.sh", stamp));
-    let log_path = tmp.join(format!("arch_emerge_build_{}.log", stamp));
+    let inner_path = tmp.join(format!("abs_build_{}_inner.sh", stamp));
+    let log_path = tmp.join(format!("abs_build_{}.log", stamp));
 
     let cwd_q = sh_single_quote(&cwd.as_ref().to_string_lossy());
     let inner_contents = format!("#!/bin/bash\nset -e\ncd {}\n{}\n", cwd_q, shell_body);

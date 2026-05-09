@@ -95,7 +95,7 @@ fn resolve_pkg_repo(pkg: &str, cli: &Cli, config: &Config) -> (String, String, S
         .get("default")
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            die!("Missing [repositories] entry: default = \"<repo-key>\" (see emerge.toml.example)")
+            die!("Missing [repositories] entry: default = \"<repo-key>\" (see abs.toml.example)")
         });
     if let Some(r) = &cli.repo {
         repo_name = r.to_string();

@@ -1,9 +1,9 @@
 use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
-#[command(name = "arch-emerge")]
+#[command(name = "abs")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "A smart wrapper for Arch Linux package building and system updates", long_about = None)]
+#[command(about = "ABS: package building and system updates", long_about = None)]
 #[command(disable_help_flag = true)]
 pub struct Cli {
     /// Download package sources only. Do not build.

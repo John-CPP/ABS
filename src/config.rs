@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
     pub paths: PathsConfig,
     pub build: BuildConfig,
     pub system_update: SystemUpdateConfig,
@@ -14,6 +16,10 @@ pub struct Config {
     pub manual_update_packages: Vec<String>,
     pub skip_install_packages: Vec<String>,
     pub packages: HashMap<String, PackageConfig>,
+}
+
+fn default_config_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,20 +70,16 @@ pub struct PackageConfig {
 
 impl Config {
     pub fn load_config() -> Config {
-        // Same order as README: XDG config dir, then /etc, then ./emerge.toml (cwd).
-        let xdg_config = dirs::config_dir().map(|d| d.join("arch-emerge").join("emerge.toml"));
-        let etc_config = PathBuf::from("/etc/arch-emerge/emerge.toml");
-        let cwd_config = PathBuf::from("emerge.toml");
+        // Same order as README: XDG config dir, then /etc.
+        let xdg_config = dirs::config_dir().map(|d| d.join("abs").join("abs.toml"));
+        let etc_config = PathBuf::from("/etc/abs/abs.toml");
 
         let config_path = match xdg_config {
             Some(p) if p.exists() => p,
-            _ => {
-                if etc_config.exists() {
-                    etc_config
-                } else {
-                    cwd_config
-                }
-            }
+            _ if etc_config.exists() => etc_config,
+            _ => die!(
+                "No config found. Expected one of: ~/.config/abs/abs.toml or /etc/abs/abs.toml"
+            ),
         };
 
         let config_content = match fs::read_to_string(&config_path) {
@@ -98,6 +100,9 @@ impl Config {
     }
 
     fn validate(&self) {
+        if self.config_version == 0 {
+            die!("Invalid config_version: 0 (expected >= 1)");
+        }
         let env = self.build.default_environment.as_str();
         if env != "local" && env != "chroot" {
             die!(
@@ -120,8 +125,9 @@ impl Config {
     }
 
     pub fn print_human_readable(&self) {
-        println!("{}", "Arch-Emerge Configuration".blue().bold());
+        println!("{}", "ABS Configuration".blue().bold());
         println!("{}", "-------------------------".blue());
+        println!("config_version: {}", self.config_version);
 
         println!("\n{}", "Paths".green().bold());
         println!("  packages_path: {}", self.paths.packages_path);

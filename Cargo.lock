@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "abs"
+version = "1.1.1"
+dependencies = [
+ "clap",
+ "colored",
+ "dirs",
+ "regex",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,18 +71,6 @@ dependencies = [
  "anstyle",
  "once_cell_polyfill",
  "windows-sys",
-]
-
-[[package]]
-name = "arch_emerge"
-version = "0.1.0"
-dependencies = [
- "clap",
- "colored",
- "dirs",
- "regex",
- "serde",
- "toml",
 ]
 
 [[package]]
