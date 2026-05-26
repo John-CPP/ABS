@@ -93,10 +93,14 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub list: bool,
 
+    /// Open the config file in an editor ($EDITOR by default)
+    #[arg(long, value_name = "EDITOR", num_args = 0..=1, default_missing_value = "")]
+    pub configure: Option<String>,
+
     /// Show help information
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
 
-    /// Packages to build
+    /// Packages to build. Per-package options: `pkg[repo=aur,pkgver=1.0,pkgrel=2,local,chroot,nocheck]`
     pub packages: Vec<String>,
 }

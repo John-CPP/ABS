@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod git;
 mod install;
+mod package_spec;
 mod pkgbuild;
 mod system;
 mod utils;
@@ -10,6 +11,7 @@ mod utils;
 use clap::Parser;
 use cli::Cli;
 use colored::Colorize;
+use package_spec::parse_package_specs;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -186,6 +188,11 @@ fn main() {
     set_verbosity(v);
     set_dry_run_mode(cli.dry_run);
 
+    if cli.configure.is_some() {
+        config::Config::open_in_editor(cli.configure.as_deref().filter(|s| !s.is_empty()));
+        return;
+    }
+
     let config = config::Config::load_config();
 
     if cli.list {
@@ -220,7 +227,7 @@ fn main() {
     if cli.packages.is_empty()
         && !cli.system_update
         && !cli.force_repo_update
-        && (cli.install_keys || cli.remove_chroot || cli.clean_all)
+        && (cli.install_keys || cli.remove_chroot || cli.clean_all || cli.configure.is_some())
     {
         return;
     }
@@ -244,6 +251,10 @@ fn main() {
 
     if cli.system_update {
         blog!("Starting system update mode...");
+        let cli_package_names: HashSet<String> = parse_package_specs(&cli.packages)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
 
         if cli.force_repo_update {
             blog!("Refreshing git remotes for manual_update_packages (-R)...");
@@ -257,13 +268,13 @@ fn main() {
         let mut skipped_install_after_compile_fail = HashSet::<String>::new();
 
         for pkg in &config.manual_update_packages {
-            if cli.packages.contains(pkg) {
+            if cli_package_names.contains(pkg) {
                 continue;
             }
 
             if build::should_run_manual_prebuild(pkg, &cli, &config) {
                 vlog!("Manual update package: {}", pkg);
-                if !build::process_package(pkg, &cli, &config, defer_install_pass) {
+                if !build::process_package(&package_spec::PackageSpec::plain(pkg), &cli, &config, defer_install_pass) {
                     skipped_install_after_compile_fail.insert(pkg.clone());
                 }
             }
@@ -272,14 +283,18 @@ fn main() {
         if defer_install_pass {
             vlog!("Install phase (compile-first: all scheduled builds finished)...");
             for pkg in &config.manual_update_packages {
-                if cli.packages.contains(pkg) {
+                if cli_package_names.contains(pkg) {
                     continue;
                 }
                 if skipped_install_after_compile_fail.contains(pkg) {
                     continue;
                 }
                 if build::should_run_manual_prebuild(pkg, &cli, &config) {
-                    build::install_package_phase(pkg, &cli, &config);
+                    build::install_package_phase(
+                        &package_spec::PackageSpec::plain(pkg),
+                        &cli,
+                        &config,
+                    );
                 }
             }
         }
@@ -287,26 +302,28 @@ fn main() {
         let use_refresh = cli.force_repo_update;
         system::run_system_update(&config, use_refresh);
     } else {
-        if cli.packages.is_empty() {
+        let package_specs = parse_package_specs(&cli.packages);
+
+        if package_specs.is_empty() {
             die!("No packages specified.");
         }
 
         let mut skipped_install_after_compile_fail = HashSet::<String>::new();
 
-        for pkg in &cli.packages {
-            blog!("Processing package: {}", pkg);
-            if !build::process_package(pkg, &cli, &config, defer_install_pass) {
-                skipped_install_after_compile_fail.insert(pkg.clone());
+        for spec in &package_specs {
+            blog!("Processing package: {}", spec.name);
+            if !build::process_package(spec, &cli, &config, defer_install_pass) {
+                skipped_install_after_compile_fail.insert(spec.name.clone());
             }
         }
 
         if defer_install_pass {
             vlog!("Install phase (compile-first: all scheduled builds finished)...");
-            for pkg in &cli.packages {
-                if skipped_install_after_compile_fail.contains(pkg) {
+            for spec in &package_specs {
+                if skipped_install_after_compile_fail.contains(&spec.name) {
                     continue;
                 }
-                build::install_package_phase(pkg, &cli, &config);
+                build::install_package_phase(spec, &cli, &config);
             }
         }
     }

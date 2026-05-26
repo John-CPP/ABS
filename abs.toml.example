@@ -26,14 +26,15 @@ ignore_packages = []
 
 [repositories]
 arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+aur = "https://aur.archlinux.org"
 cachyos = "https://github.com/CachyOS/CachyOS-PKGBUILDS.git"
 default = "arch"
 
 [packages]
 
-# Example: Firefox-like PKGBUILDs need a clean `mozbuild/` before each build.
-# [packages.firefox-pure]
-# source = "ventureoo"
+# Example: build an AUR package (or use `abs --repo=aur xray` without config entry).
+# [packages.xray]
+# source = "aur"
 # build_env = "local"
 # tests = true
 # pre_update_command = "rm -rf mozbuild"

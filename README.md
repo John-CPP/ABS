@@ -31,10 +31,18 @@ ABS reads one TOML file (first match wins):
 1. `$XDG_CONFIG_HOME/abs/abs.toml`
 2. `/etc/abs/abs.toml`
 
+On first run, if neither file exists, ABS creates `~/.config/abs/abs.toml` from
+[`abs.toml.example`](abs.toml.example) and prints:
+
+```
+ABS config has been created from the example. Please configure using --configure
+```
+
+Edit the config with:
+
 ```bash
-mkdir -p ~/.config/abs
-cp abs.toml.example ~/.config/abs/abs.toml
-$EDITOR ~/.config/abs/abs.toml
+abs --configure              # uses $EDITOR (then $VISUAL, then vi)
+abs --configure=kate         # uses a specific editor
 ```
 
 See [`abs.toml.example`](abs.toml.example) for all available keys.
@@ -67,11 +75,31 @@ abs [FLAGS] [PACKAGE...]
 | `-R`              | Refresh all git remotes, print PKGBUILD vs installed report, no compile |
 | `-U`              | Print pending updates, pre-build manuals, run system update             |
 | `-RU`             | `-R` + compile qualifying manuals, then run system update               |
-| `--repo`          | Override repository for this run                                        |
+| `--repo`          | Default repository for packages without `[repo=...]` (e.g. `--repo=aur`) |
 | `--install-only`  | Install existing packages from `ready_made_packages_path`               |
 | `--clean-install` | Remove `src/` and `pkg/` before compile                                 |
 | `--dry-run`       | Print without executing                                                 |
 | `--list`          | Dump resolved config                                                    |
+| `--configure`     | Open user config in `$EDITOR`                                           |
+| `--configure=EDITOR` | Open user config in the given editor (e.g. `--configure=kate`)       |
+
+### Per-package overrides
+
+Put options in square brackets after the package name (quote the argument in the shell when it contains `[`):
+
+```bash
+abs -h xray[repo=aur,pkgver=26.5.9,pkgrel=2] 'mesa[repo=cachyos]'
+abs --repo=aur xray[pkgver=26.5.9,pkgrel=2] mesa[repo=cachyos]
+```
+
+| Bracket key | Effect |
+| ----------- | ------ |
+| `repo=NAME` | Repository for this package only (overrides `--repo`) |
+| `pkgver=`, `pkgrel=`, `epoch=`, … | Replace or append that PKGBUILD assignment before build |
+| `local`, `chroot`, `build=local\|chroot` | Build environment for this package only |
+| `nocheck` | Skip tests for this package only |
+
+Use `,` or `/` between bracket options. When `pkgrel` is set explicitly, automatic pkgrel bump is skipped for that build. Any PKGBUILD override triggers `updpkgsums` before compile (same as `-u`).
 
 ### `[build]` config keys
 

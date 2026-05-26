@@ -1,9 +1,10 @@
 use crate::die;
+use crate::utils::{run_command, sh_single_quote};
 use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -68,18 +69,78 @@ pub struct PackageConfig {
     pub post_update_command: Option<String>,
 }
 
+const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
+
+fn user_config_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("abs").join("abs.toml"))
+        .unwrap_or_else(|| die!("Could not determine config directory ($XDG_CONFIG_HOME)"))
+}
+
+fn ensure_user_config_exists() -> PathBuf {
+    let path = user_config_path();
+    if path.exists() {
+        return path;
+    }
+
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        die!("Failed to create config directory '{}': {}", parent.display(), e);
+    }
+
+    if let Err(e) = fs::write(&path, CONFIG_TEMPLATE) {
+        die!("Failed to write config file '{}': {}", path.display(), e);
+    }
+
+    path
+}
+
+fn resolve_editor(explicit: Option<&str>) -> String {
+    if let Some(editor) = explicit.filter(|s| !s.is_empty()) {
+        return editor.to_string();
+    }
+
+    std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string())
+}
+
+fn run_editor(editor: &str, path: &Path) {
+    let path_str = path.to_string_lossy();
+    let result = if editor.chars().any(char::is_whitespace) {
+        let script = format!("{} {}", editor, sh_single_quote(&path_str));
+        run_command("sh", &["-c", &script], None::<&str>)
+    } else {
+        run_command(editor, &[&path_str], None::<&str>)
+    };
+
+    if let Err(e) = result {
+        die!("Failed to open config in editor: {}", e);
+    }
+}
+
 impl Config {
+    pub fn open_in_editor(editor: Option<&str>) {
+        let path = ensure_user_config_exists();
+        run_editor(&resolve_editor(editor), &path);
+    }
+
     pub fn load_config() -> Config {
         // Same order as README: XDG config dir, then /etc.
-        let xdg_config = dirs::config_dir().map(|d| d.join("abs").join("abs.toml"));
+        let user_config = user_config_path();
         let etc_config = PathBuf::from("/etc/abs/abs.toml");
 
-        let config_path = match xdg_config {
-            Some(p) if p.exists() => p,
-            _ if etc_config.exists() => etc_config,
-            _ => die!(
-                "No config found. Expected one of: ~/.config/abs/abs.toml or /etc/abs/abs.toml"
-            ),
+        let config_path = if user_config.exists() {
+            user_config
+        } else if etc_config.exists() {
+            etc_config
+        } else {
+            let path = ensure_user_config_exists();
+            println!(
+                "ABS config has been created from the example. Please configure using --configure"
+            );
+            path
         };
 
         let config_content = match fs::read_to_string(&config_path) {

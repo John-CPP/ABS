@@ -101,6 +101,18 @@ pub fn find_pkg_dir_cached(
     find_pkg_dir_in_list(dirs, pkg_name)
 }
 
+/// Repositories where each package lives in its own git clone (`{base}/{repo}/{pkg}.git`).
+pub fn is_per_package_repo(repo_name: &str) -> bool {
+    matches!(
+        repo_name.to_ascii_lowercase().as_str(),
+        "arch" | "aur"
+    )
+}
+
+fn per_package_repo_key(repo_name: &str) -> String {
+    repo_name.to_ascii_lowercase()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_repo(
     pkg_name: &str,
@@ -119,9 +131,10 @@ pub fn prepare_repo(
             run_command_quiet(c, a, d)
         }
     };
-    if repo_name == "arch" {
+    if is_per_package_repo(repo_name) {
+        let repo_key = per_package_repo_key(repo_name);
         let repo_dir = PathBuf::from(packages_path)
-            .join("arch")
+            .join(&repo_key)
             .join(base_pkg_name);
         if clean && repo_dir.exists() {
             vlog!("Cleaning old repository directory for {}", base_pkg_name);
@@ -132,7 +145,11 @@ pub fn prepare_repo(
 
         if !repo_dir.exists() {
             let clone_url = format!("{}/{}.git", repo_url.trim_end_matches('/'), base_pkg_name);
-            vlog!("Cloning arch package repo {}...", base_pkg_name);
+            vlog!(
+                "Cloning {} package repo {}...",
+                repo_key.to_uppercase(),
+                base_pkg_name
+            );
             if let Err(e) = git_run(
                 "git",
                 &["clone", &clone_url, repo_dir.to_string_lossy().as_ref()],
@@ -145,7 +162,11 @@ pub fn prepare_repo(
             && repo_dir.join(".git").exists()
             && !shared_repo_remote_already_updated(&repo_dir)
         {
-            vlog!("Updating arch package repo {}...", base_pkg_name);
+            vlog!(
+                "Updating {} package repo {}...",
+                repo_key.to_uppercase(),
+                base_pkg_name
+            );
             match git_run("git", &["pull", "--ff-only"], Some(repo_dir.as_path())) {
                 Ok(()) => shared_repo_remote_note_updated(&repo_dir),
                 Err(e) => {

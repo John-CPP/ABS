@@ -1,7 +1,10 @@
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::git::{prepare_repo, PkgbuildDirCache};
-use crate::pkgbuild::{backup_pkgbuild, bump_pkgrel, restore_pkgbuild, update_pkgsums};
+use crate::git::{is_per_package_repo, prepare_repo, PkgbuildDirCache};
+use crate::package_spec::PackageSpec;
+use crate::pkgbuild::{
+    apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, restore_pkgbuild, update_pkgsums,
+};
 use crate::utils::{
     pacman_query_version, read_pkg_full_version_from_dir, remove_src_pkg_workdirs,
     remove_stale_pkgs_in_pkgdest, run_command, run_shell_in_dir_with_tee, vercmp,
@@ -11,6 +14,18 @@ use colored::Colorize;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+fn normalize_repo_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// Built-in repository URLs used when `[repositories]` has no entry (e.g. `abs --repo=aur`).
+fn known_repository_url(repo_name: &str) -> Option<String> {
+    match normalize_repo_name(repo_name).as_str() {
+        "aur" => Some("https://aur.archlinux.org".to_string()),
+        _ => None,
+    }
+}
 
 /// Resolve a `[repositories]` entry to a clone URL. Values may be a URL, or another key
 /// (e.g. `default = "arch"` then `arch = "https://..."`).
@@ -140,7 +155,12 @@ fn run_build_with_key_retry(build_cmd: &str, repo_dir: &Path) -> Result<(), Stri
     }
 }
 
-fn resolve_pkg_repo(pkg: &str, cli: &Cli, config: &Config) -> (String, String, String) {
+fn resolve_pkg_repo(
+    pkg: &str,
+    cli: &Cli,
+    config: &Config,
+    spec: Option<&PackageSpec>,
+) -> (String, String, String) {
     let pkg_config = config.packages.get(pkg);
 
     let mut repo_name = config
@@ -150,17 +170,17 @@ fn resolve_pkg_repo(pkg: &str, cli: &Cli, config: &Config) -> (String, String, S
         .unwrap_or_else(|| {
             die!("Missing [repositories] entry: default = \"<repo-key>\" (see abs.toml.example)")
         });
-    if let Some(r) = &cli.repo {
-        repo_name = r.to_string();
+    if let Some(r) = spec.and_then(|s| s.repo.as_deref()).or(cli.repo.as_deref()) {
+        repo_name = normalize_repo_name(r);
     } else if let Some(pc) = pkg_config
         && let Some(src) = &pc.source
     {
-        repo_name = src.to_string();
+        repo_name = normalize_repo_name(src);
     }
 
-    let repo_url_string = match repository_url(&config.repositories, &repo_name) {
-        Some(url) => url,
-        None => {
+    let repo_url_string = repository_url(&config.repositories, &repo_name)
+        .or_else(|| known_repository_url(&repo_name))
+        .unwrap_or_else(|| {
             ewarn!(
                 "Repository '{}' not found in config. Using default.",
                 repo_name
@@ -176,8 +196,7 @@ fn resolve_pkg_repo(pkg: &str, cli: &Cli, config: &Config) -> (String, String, S
                     repo_name
                 )
             })
-        }
-    };
+        });
 
     let base_pkg = pkg_config
         .and_then(|pc| pc.alias.as_deref())
@@ -189,7 +208,7 @@ fn resolve_pkg_repo(pkg: &str, cli: &Cli, config: &Config) -> (String, String, S
 
 /// After `git pull` on a shared repo (`-R`), decide if PKGBUILD versions are newer than installed.
 fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Result<bool, String> {
-    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config);
+    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
     let repo_url = repo_url_string.as_str();
     // Callers that pass `-R` with `-U` run `sync_manual_repo_remotes` first; only read the tree here.
     let pkg_dir = prepare_repo(
@@ -209,8 +228,8 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
     Ok(vercmp(&src_ver, &inst_ver)? > 0)
 }
 
-/// `git pull` (or clone) for each distinct remote: **arch** uses one clone per package
-/// (`arch:<base_pkg>`); **other repositories** run at most once per `repo_name` no matter how many
+/// `git pull` (or clone) for each distinct remote: **arch** / **aur** use one clone per package
+/// (`arch:<base_pkg>`, `aur:<base_pkg>`); **other repositories** run at most once per `repo_name` no matter how many
 /// `manual_update_packages` share it. [`crate::git::prepare_repo`] also skips a second `git pull`
 /// on the same clone path in one process. Does not compile; callers run report / builds / update.
 pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
@@ -221,9 +240,9 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
     }
     let mut seen = HashSet::new();
     for pkg in &config.manual_update_packages {
-        let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config);
-        let key = if repo_name == "arch" {
-            format!("arch:{base_pkg}")
+        let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
+        let key = if is_per_package_repo(&repo_name) {
+            format!("{}:{base_pkg}", normalize_repo_name(&repo_name))
         } else {
             repo_name.clone()
         };
@@ -255,7 +274,7 @@ fn classify_manual_pkg_version(
     config: &Config,
     pkgbuild_cache: &mut PkgbuildDirCache,
 ) -> Result<ManualPkgVersionLine, String> {
-    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config);
+    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
     let pkg_dir = prepare_repo(
         pkg,
         &base_pkg,
@@ -341,15 +360,62 @@ pub fn should_run_manual_prebuild(
     }
 }
 
-/// Install prompts and `pacman -U` for `pkg`, using `makepkg --packagelist` from the prepared repo.
+fn effective_build_env(
+    spec: &PackageSpec,
+    cli: &Cli,
+    config: &Config,
+    pkg_config: Option<&crate::config::PackageConfig>,
+) -> String {
+    if spec.chroot_build == Some(true) {
+        return "chroot".to_string();
+    }
+    if spec.local_build == Some(true) {
+        return "local".to_string();
+    }
+    if cli.local_build {
+        return "local".to_string();
+    }
+    if cli.chroot_build {
+        return "chroot".to_string();
+    }
+    if let Some(pc) = pkg_config
+        && let Some(env) = &pc.build_env
+    {
+        return env.clone();
+    }
+    config.build.default_environment.clone()
+}
+
+fn effective_skip_tests(
+    spec: &PackageSpec,
+    cli: &Cli,
+    pkg_config: Option<&crate::config::PackageConfig>,
+) -> bool {
+    if spec.no_check == Some(true) {
+        return true;
+    }
+    if cli.no_check {
+        return true;
+    }
+    if let Some(pc) = pkg_config
+        && let Some(t) = pc.tests
+        && !t
+    {
+        return true;
+    }
+    false
+}
+
+/// Install prompts and `pacman -U` for `spec`, using `makepkg --packagelist` from the prepared repo.
 /// Used after [`process_package`] when **`compile_first_install_after`** deferred the install pass.
-pub fn install_package_phase(pkg: &str, cli: &Cli, config: &Config) {
+pub fn install_package_phase(spec: &PackageSpec, cli: &Cli, config: &Config) {
     if cli.compile_only || cli.install_only || cli.download_only {
         return;
     }
 
+    let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
-    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config);
+    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
     let repo_dir_path = prepare_repo(
         pkg,
         base_pkg.as_str(),
@@ -382,9 +448,10 @@ pub fn install_package_phase(pkg: &str, cli: &Cli, config: &Config) {
 /// `defer_install`: when true (compile-first mode), build only; caller runs [`install_package_phase`] later.
 ///
 /// Returns **`false`** if the build failed and **`ignore_compilation_failures`** is set (caller continues).
-pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: bool) -> bool {
+pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_install: bool) -> bool {
+    let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
-    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config);
+    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
     let repo_url = repo_url_string.as_str();
     let base_pkg_name = base_pkg.as_str();
 
@@ -451,11 +518,18 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
         }
     }
 
-    // Match Bash `prepare_sums_pkgrel`: `prepare_pkgsums` (updpkgsums only if -u), then always `bump_pkgrel`.
-    if cli.update_sums && !update_pkgsums(repo_dir) {
+    if !spec.pkgbuild_overrides.is_empty() {
+        blog!("Applying PKGBUILD overrides for {}...", pkg);
+        apply_pkgbuild_overrides(repo_dir, &spec.pkgbuild_overrides);
+    }
+
+    // Run updpkgsums when `-u` is set or when CLI overrides changed PKGBUILD fields (e.g. pkgver).
+    if (cli.update_sums || !spec.pkgbuild_overrides.is_empty()) && !update_pkgsums(repo_dir) {
         ewarn!("updpkgsums failed, continuing...");
     }
-    bump_pkgrel(repo_dir);
+    if !spec.pkgbuild_overrides.contains_key("pkgrel") {
+        bump_pkgrel(repo_dir);
+    }
 
     // Drop older PKGDEST artifacts for this base name so install prompts do not list stale builds.
     remove_stale_pkgs_in_pkgdest(
@@ -463,18 +537,8 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
         base_pkg_name,
     );
 
-    let mut build_env = config.build.default_environment.clone();
-    if let Some(pc) = pkg_config
-        && let Some(env) = &pc.build_env
-    {
-        build_env = env.to_string();
-    }
-
-    if cli.local_build {
-        build_env = "local".to_string();
-    } else if cli.chroot_build {
-        build_env = "chroot".to_string();
-    }
+    let build_env = effective_build_env(spec, cli, config, pkg_config);
+    let skip_tests = effective_skip_tests(spec, cli, pkg_config);
 
     let mut custom_cmd = None;
     if let Some(pc) = pkg_config {
@@ -495,67 +559,57 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
             }
             die!("Custom build command failed: {}", e);
         }
-    } else {
-        let mut tests_enabled = true;
-        if let Some(pc) = pkg_config
-            && let Some(t) = pc.tests
-        {
-            tests_enabled = t;
+    } else if build_env == "local" {
+        blog!("Building locally with makepkg...");
+
+        let mut build_cmd = format!(
+            "PKGDEST=\"{}\" makepkg --syncdeps --noconfirm --needed -f",
+            config.paths.ready_made_packages_path
+        );
+        if cli.clean {
+            build_cmd.push_str(" -c");
         }
-        let skip_tests = cli.no_check || !tests_enabled;
 
-        if build_env == "local" {
-            blog!("Building locally with makepkg...");
+        if skip_tests {
+            build_cmd.push_str(" --nocheck");
+        }
 
-            let mut build_cmd = format!(
-                "PKGDEST=\"{}\" makepkg --syncdeps --noconfirm --needed -f",
-                config.paths.ready_made_packages_path
-            );
-            if cli.clean {
-                build_cmd.push_str(" -c");
+        if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir) {
+            if config.build.ignore_compilation_failures {
+                ewarn!("makepkg failed for {}: {}", pkg, e);
+                restore_pkgbuild(repo_dir);
+                return false;
             }
-
-            if skip_tests {
-                build_cmd.push_str(" --nocheck");
+            die!("makepkg failed for {}: {}", pkg, e);
+        }
+    } else {
+        blog!("Building in chroot with makechrootpkg...");
+        // `makechrootpkg -r <dir>` expects `<dir>/root` (see mkarchroot / makechrootpkg man pages).
+        let chrootdir = PathBuf::from(&config.paths.chroot_base_path).join("base");
+        if let Err(e) = ensure_devtools_chroot(&chrootdir) {
+            if config.build.ignore_compilation_failures {
+                ewarn!("Chroot setup failed for {}: {}", pkg, e);
+                restore_pkgbuild(repo_dir);
+                return false;
             }
-
-            if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir) {
-                if config.build.ignore_compilation_failures {
-                    ewarn!("makepkg failed for {}: {}", pkg, e);
-                    restore_pkgbuild(repo_dir);
-                    return false;
-                }
-                die!("makepkg failed for {}: {}", pkg, e);
+            die!("Chroot setup failed for {}: {}", pkg, e);
+        }
+        let mut build_cmd = format!(
+            "PKGDEST=\"{}\" makechrootpkg -c -r \"{}\" -d \"{}\"",
+            config.paths.ready_made_packages_path,
+            chrootdir.to_string_lossy(),
+            repo_dir.to_string_lossy()
+        );
+        if skip_tests {
+            build_cmd.push_str(" -- --nocheck");
+        }
+        if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir) {
+            if config.build.ignore_compilation_failures {
+                ewarn!("makechrootpkg failed for {}: {}", pkg, e);
+                restore_pkgbuild(repo_dir);
+                return false;
             }
-        } else {
-            blog!("Building in chroot with makechrootpkg...");
-            // `makechrootpkg -r <dir>` expects `<dir>/root` (see mkarchroot / makechrootpkg man pages).
-            let chrootdir = PathBuf::from(&config.paths.chroot_base_path).join("base");
-            if let Err(e) = ensure_devtools_chroot(&chrootdir) {
-                if config.build.ignore_compilation_failures {
-                    ewarn!("Chroot setup failed for {}: {}", pkg, e);
-                    restore_pkgbuild(repo_dir);
-                    return false;
-                }
-                die!("Chroot setup failed for {}: {}", pkg, e);
-            }
-            let mut build_cmd = format!(
-                "PKGDEST=\"{}\" makechrootpkg -c -r \"{}\" -d \"{}\"",
-                config.paths.ready_made_packages_path,
-                chrootdir.to_string_lossy(),
-                repo_dir.to_string_lossy()
-            );
-            if skip_tests {
-                build_cmd.push_str(" -- --nocheck");
-            }
-            if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir) {
-                if config.build.ignore_compilation_failures {
-                    ewarn!("makechrootpkg failed for {}: {}", pkg, e);
-                    restore_pkgbuild(repo_dir);
-                    return false;
-                }
-                die!("makechrootpkg failed for {}: {}", pkg, e);
-            }
+            die!("makechrootpkg failed for {}: {}", pkg, e);
         }
     }
 
@@ -582,7 +636,7 @@ pub fn process_package(pkg: &str, cli: &Cli, config: &Config, defer_install: boo
 
 #[cfg(test)]
 mod tests {
-    use super::repository_url;
+    use super::{known_repository_url, repository_url};
     use std::collections::HashMap;
 
     fn sample_repos() -> HashMap<String, String> {
@@ -628,5 +682,17 @@ mod tests {
     fn repository_url_unknown_returns_none() {
         let m = sample_repos();
         assert!(repository_url(&m, "missing").is_none());
+    }
+
+    #[test]
+    fn known_repository_url_aur() {
+        assert_eq!(
+            known_repository_url("aur").as_deref(),
+            Some("https://aur.archlinux.org")
+        );
+        assert_eq!(
+            known_repository_url("AUR").as_deref(),
+            Some("https://aur.archlinux.org")
+        );
     }
 }

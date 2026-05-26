@@ -37,10 +37,47 @@ fn compute_next_pkgrel(baseline: &str) -> String {
 
 /// Apply `pkgrel={next}` to live PKGBUILD text (same line replacement as Bash `sed`).
 fn replace_all_pkgrel_lines(content: &str, next: &str) -> String {
-    let replace_re = Regex::new(r"(?m)^pkgrel=.*$").unwrap();
-    replace_re
-        .replace_all(content, format!("pkgrel={}", next))
-        .to_string()
+    replace_pkgbuild_field(content, "pkgrel", next)
+}
+
+/// Replace the first `^key=...` line or append `key=value` when missing.
+pub fn replace_pkgbuild_field(content: &str, key: &str, value: &str) -> String {
+    let replace_re = Regex::new(&format!(r"(?m)^{}=.*$", regex::escape(key))).unwrap();
+    if replace_re.is_match(content) {
+        replace_re
+            .replace_all(content, format!("{key}={value}"))
+            .to_string()
+    } else {
+        let mut out = content.to_string();
+        if !out.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{key}={value}\n"));
+        out
+    }
+}
+
+/// Apply CLI `[key=value,...]` overrides to the working `PKGBUILD`.
+pub fn apply_pkgbuild_overrides(repo_dir: &Path, overrides: &std::collections::HashMap<String, String>) {
+    if overrides.is_empty() {
+        return;
+    }
+
+    let pkgbuild_path = repo_dir.join("PKGBUILD");
+    if !pkgbuild_path.exists() {
+        vlog!("PKGBUILD not found, skipping overrides");
+        return;
+    }
+
+    let mut content = fs::read_to_string(&pkgbuild_path).unwrap_or_default();
+    for (key, value) in overrides {
+        content = replace_pkgbuild_field(&content, key, value);
+        vlog!("PKGBUILD override: {}={}", key, value);
+    }
+
+    if let Err(e) = fs::write(&pkgbuild_path, content) {
+        vlog!("Failed to apply PKGBUILD overrides: {}", e);
+    }
 }
 
 /// Bump `pkgrel` in the working `PKGBUILD`.
