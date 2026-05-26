@@ -33,8 +33,11 @@ default = "arch"
 [packages]
 
 # Example: build an AUR package (or use `abs --repo=aur xray` without config entry).
+# Optional: on `-RU`, check GitHub for newer (including pre-)releases and bump PKGBUILD before build.
 # [packages.xray]
 # source = "aur"
+# upstream_github = "xtls/xray-core"
+# upstream_prereleases = true
 # build_env = "local"
 # tests = true
 # pre_update_command = "rm -rf mozbuild"

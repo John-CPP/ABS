@@ -206,6 +206,15 @@ fn resolve_pkg_repo(
     (repo_name, repo_url_string, base_pkg)
 }
 
+/// Public wrapper for manual-update paths (`-R`/`-RU`) without a CLI [`PackageSpec`].
+pub fn resolve_pkg_repo_for_manual(
+    pkg: &str,
+    cli: &Cli,
+    config: &Config,
+) -> (String, String, String) {
+    resolve_pkg_repo(pkg, cli, config, None)
+}
+
 /// After `git pull` on a shared repo (`-R`), decide if PKGBUILD versions are newer than installed.
 fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Result<bool, String> {
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
@@ -523,8 +532,18 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
         apply_pkgbuild_overrides(repo_dir, &spec.pkgbuild_overrides);
     }
 
-    // Run updpkgsums when `-u` is set or when CLI overrides changed PKGBUILD fields (e.g. pkgver).
-    if (cli.update_sums || !spec.pkgbuild_overrides.is_empty()) && !update_pkgsums(repo_dir) {
+    let is_upgrade = if let Ok(src_ver) = read_pkg_full_version_from_dir(repo_dir) {
+        if let Ok(Some(inst_ver)) = pacman_query_version(base_pkg_name) {
+            vercmp(&src_ver, &inst_ver).ok().is_some_and(|c| c > 0)
+        } else {
+            true // Not installed
+        }
+    } else {
+        false
+    };
+
+    // Run updpkgsums when `-u` is set, when CLI overrides changed PKGBUILD fields (e.g. pkgver), or when it's an upgrade.
+    if (cli.update_sums || !spec.pkgbuild_overrides.is_empty() || is_upgrade) && !update_pkgsums(repo_dir) {
         ewarn!("updpkgsums failed, continuing...");
     }
     if !spec.pkgbuild_overrides.contains_key("pkgrel") {

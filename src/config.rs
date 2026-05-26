@@ -67,6 +67,13 @@ pub struct PackageConfig {
     pub custom_chroot_build_command: Option<String>,
     pub pre_update_command: Option<String>,
     pub post_update_command: Option<String>,
+    /// GitHub `owner/repo` (or `https://github.com/owner/repo`) checked on **`-R`** / **`-RU`** when
+    /// the AUR (or other) PKGBUILD lags behind upstream releases.
+    #[serde(default)]
+    pub upstream_github: Option<String>,
+    /// When true, consider GitHub prereleases when choosing the newest upstream version.
+    #[serde(default)]
+    pub upstream_prereleases: bool,
 }
 
 const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
@@ -292,6 +299,12 @@ impl Config {
             }
             if let Some(cmd) = &cfg.post_update_command {
                 println!("    post_update_command: {}", cmd);
+            }
+            if let Some(repo) = &cfg.upstream_github {
+                println!(
+                    "    upstream_github: {} (prereleases: {})",
+                    repo, cfg.upstream_prereleases
+                );
             }
         }
     }

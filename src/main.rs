@@ -6,6 +6,7 @@ mod install;
 mod package_spec;
 mod pkgbuild;
 mod system;
+mod upstream;
 mod utils;
 
 use clap::Parser;
@@ -236,6 +237,7 @@ fn main() {
         if cli.force_repo_update && !cli.system_update && cli.packages.is_empty() {
             blog!("Repository refresh (manual_update_packages) and system update...");
             build::sync_manual_repo_remotes(&config, &cli);
+            upstream::sync_upstream_pkgbuilds(&config, &cli);
             if !is_silent_mode() {
                 println!();
             }
@@ -259,6 +261,7 @@ fn main() {
         if cli.force_repo_update {
             blog!("Refreshing git remotes for manual_update_packages (-R)...");
             build::sync_manual_repo_remotes(&config, &cli);
+            upstream::sync_upstream_pkgbuilds(&config, &cli);
             if !is_silent_mode() {
                 println!();
             }

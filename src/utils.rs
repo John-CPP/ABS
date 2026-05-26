@@ -412,7 +412,23 @@ pub fn read_pkg_full_version_from_dir(pkg_dir: &Path) -> Result<String, String> 
         return Err("dry-run".into());
     }
     let srcinfo_path = pkg_dir.join(".SRCINFO");
-    if srcinfo_path.is_file() {
+    let pkgbuild_path = pkg_dir.join("PKGBUILD");
+
+    let use_srcinfo = if srcinfo_path.is_file() {
+        if let (Ok(src_meta), Ok(pkg_meta)) = (fs::metadata(&srcinfo_path), fs::metadata(&pkgbuild_path)) {
+            if let (Ok(src_time), Ok(pkg_time)) = (src_meta.modified(), pkg_meta.modified()) {
+                pkg_time <= src_time
+            } else {
+                true
+            }
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    if use_srcinfo {
         let text = fs::read_to_string(&srcinfo_path)
             .map_err(|e| format!("read {}: {}", srcinfo_path.display(), e))?;
         return parse_srcinfo_full_version(&text);

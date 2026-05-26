@@ -101,6 +101,23 @@ abs --repo=aur xray[pkgver=26.5.9,pkgrel=2] mesa[repo=cachyos]
 
 Use `,` or `/` between bracket options. When `pkgrel` is set explicitly, automatic pkgrel bump is skipped for that build. Any PKGBUILD override triggers `updpkgsums` before compile (same as `-u`).
 
+### `-RU` and AUR packages
+
+Add AUR packages to `manual_update_packages` with `source = "aur"` in `[packages]`. On **`-R`** / **`-RU`**, ABS pulls each AUR git clone (same as official `arch` packages), compares PKGBUILD versions to installed, and rebuilds when newer.
+
+Optional **upstream GitHub** tracking for packages that lag behind upstream (e.g. AUR only ships stable):
+
+```toml
+manual_update_packages = ["xray"]
+
+[packages.xray]
+source = "aur"
+upstream_github = "xtls/xray-core"   # or https://github.com/xtls/xray-core
+upstream_prereleases = true          # include GitHub prereleases (default: false)
+```
+
+On **`-R`** / **`-RU`**, after syncing the AUR clone, ABS queries the GitHub API (via `curl`). If upstream is newer than `pkgver` in the PKGBUILD, it sets `pkgver`, resets `pkgrel=1`, runs `updpkgsums`, then continues the normal version report / build flow. Requires network access and `curl`.
+
 ### `[build]` config keys
 
 | Key                           | Description                                                         |
