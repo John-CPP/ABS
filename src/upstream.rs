@@ -188,6 +188,13 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
 
     vlog!("Checking optional upstream_github sources...");
 
+    struct UpstreamTask {
+        pkg: String,
+        github: String,
+        upstream_prereleases: bool,
+    }
+
+    let mut tasks = Vec::new();
     for pkg in &config.manual_update_packages {
         let Some(pc) = config.packages.get(pkg) else {
             continue;
@@ -195,41 +202,71 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
         let Some(github) = pc.upstream_github.as_deref() else {
             continue;
         };
-
-        let (repo_name, repo_url_string, base_pkg) =
-            crate::build::resolve_pkg_repo_for_manual(pkg, cli, config);
-        let pkg_dir = prepare_repo(
-            pkg,
-            &base_pkg,
-            &repo_name,
-            repo_url_string.as_str(),
-            &config.paths.packages_path,
-            false,
-            false,
-            None,
-        );
-
-        let upstream_pkgver = match fetch_github_latest_version(github, pc.upstream_prereleases) {
-            Ok(v) => v,
-            Err(e) => {
-                ewarn!("{}: upstream check failed: {}", pkg, e);
-                continue;
-            }
-        };
-
-        if crate::is_dry_run_mode() {
-            println!(
-                "[DRY RUN] {}: would set pkgver={} from GitHub {}",
-                pkg, upstream_pkgver, github
-            );
-            continue;
-        }
-
-        if let Err(e) = maybe_bump_pkgbuild_to_upstream(pkg, pkg_dir.as_path(), &upstream_pkgver)
-        {
-            ewarn!("{}: failed to apply upstream version: {}", pkg, e);
-        }
+        tasks.push(UpstreamTask {
+            pkg: pkg.clone(),
+            github: github.to_string(),
+            upstream_prereleases: pc.upstream_prereleases,
+        });
     }
+
+    if tasks.is_empty() {
+        return;
+    }
+
+    tasks.reverse();
+
+    let tasks_mutex = std::sync::Mutex::new(tasks);
+    let concurrency_limit = config.build.concurrent_repos_downloads_limit.max(1);
+
+    std::thread::scope(|s| {
+        for _ in 0..concurrency_limit {
+            s.spawn(|| {
+                loop {
+                    let task = {
+                        let mut guard = tasks_mutex.lock().unwrap();
+                        guard.pop()
+                    };
+                    let Some(task) = task else {
+                        break;
+                    };
+
+                    let (repo_name, repo_url_string, base_pkg) =
+                        crate::build::resolve_pkg_repo_for_manual(&task.pkg, cli, config);
+                    let pkg_dir = prepare_repo(
+                        &task.pkg,
+                        &base_pkg,
+                        &repo_name,
+                        repo_url_string.as_str(),
+                        &config.paths.packages_path,
+                        false,
+                        false,
+                        None,
+                    );
+
+                    let upstream_pkgver = match fetch_github_latest_version(&task.github, task.upstream_prereleases) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            ewarn!("{}: upstream check failed: {}", task.pkg, e);
+                            continue;
+                        }
+                    };
+
+                    if crate::is_dry_run_mode() {
+                        println!(
+                            "[DRY RUN] {}: would set pkgver={} from GitHub {}",
+                            task.pkg, upstream_pkgver, task.github
+                        );
+                        continue;
+                    }
+
+                    if let Err(e) = maybe_bump_pkgbuild_to_upstream(&task.pkg, pkg_dir.as_path(), &upstream_pkgver)
+                    {
+                        ewarn!("{}: failed to apply upstream version: {}", task.pkg, e);
+                    }
+                }
+            });
+        }
+    });
 }
 
 #[cfg(test)]

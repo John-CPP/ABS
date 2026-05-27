@@ -5,9 +5,12 @@ mod git;
 mod install;
 mod package_spec;
 mod pkgbuild;
+mod self_update;
 mod system;
 mod upstream;
 mod utils;
+
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use cli::Cli;
@@ -196,6 +199,52 @@ fn main() {
 
     let config = config::Config::load_config();
 
+    if cli.check_update {
+        match self_update::check_for_update(&config.self_update_raw_url) {
+            Ok((true, latest)) => {
+                println!(
+                    "{} A new version of ABS is available: {} (current: {}). Run 'abs --self-update' to update!",
+                    "==>".yellow(),
+                    latest.green(),
+                    env!("CARGO_PKG_VERSION").yellow()
+                );
+            }
+            Ok((false, _)) => {
+                blog!("ABS is up-to-date (current version: {}).", env!("CARGO_PKG_VERSION").green());
+            }
+            Err(e) => {
+                die!("Update check failed: {}", e);
+            }
+        }
+        return;
+    }
+
+    if cli.self_update {
+        if let Err(e) = self_update::run_self_update(&config, false) {
+            die!("{}", e);
+        }
+        return;
+    }
+
+    // Handle auto-update on startup
+    if config.auto_update_on_startup && !cli.dry_run {
+        let _ = self_update::run_self_update(&config, true);
+    }
+
+    // Handle background update check on startup
+    let update_notifier = Arc::new(Mutex::new(None));
+    let update_notifier_clone = Arc::clone(&update_notifier);
+    let raw_url = config.self_update_raw_url.clone();
+    if config.check_for_update_on_startup {
+        std::thread::spawn(move || {
+            if let Ok((true, latest)) = self_update::check_for_update(&raw_url) {
+                if let Ok(mut guard) = update_notifier_clone.lock() {
+                    *guard = Some(latest);
+                }
+            }
+        });
+    }
+
     if cli.list {
         config.print_human_readable();
         return;
@@ -328,6 +377,17 @@ fn main() {
                 }
                 build::install_package_phase(spec, &cli, &config);
             }
+        }
+    }
+
+    if let Ok(guard) = update_notifier.lock() {
+        if let Some(latest) = &*guard {
+            println!(
+                "{} A new version of ABS is available: {} (current: {}). Run 'abs --self-update' to update!",
+                "==>".yellow(),
+                latest.green(),
+                env!("CARGO_PKG_VERSION").yellow()
+            );
         }
     }
 }

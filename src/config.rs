@@ -17,10 +17,40 @@ pub struct Config {
     pub manual_update_packages: Vec<String>,
     pub skip_install_packages: Vec<String>,
     pub packages: HashMap<String, PackageConfig>,
+    #[serde(default = "default_check_for_update_on_startup")]
+    pub check_for_update_on_startup: bool,
+    #[serde(default = "default_auto_update_on_startup")]
+    pub auto_update_on_startup: bool,
+    #[serde(default = "default_self_update_github_url")]
+    pub self_update_github_url: String,
+    #[serde(default = "default_self_update_raw_url")]
+    pub self_update_raw_url: String,
+    #[serde(default = "default_self_update_install_path")]
+    pub self_update_install_path: String,
 }
 
 fn default_config_version() -> u32 {
     1
+}
+
+fn default_check_for_update_on_startup() -> bool {
+    true
+}
+
+fn default_auto_update_on_startup() -> bool {
+    false
+}
+
+fn default_self_update_github_url() -> String {
+    "https://github.com/John-CPP/ABS".to_string()
+}
+
+fn default_self_update_install_path() -> String {
+    "/usr/bin/abs".to_string()
+}
+
+fn default_self_update_raw_url() -> String {
+    "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +58,10 @@ pub struct PathsConfig {
     pub packages_path: String,
     pub chroot_base_path: String,
     pub ready_made_packages_path: String,
+}
+
+fn default_concurrent_repos_downloads_limit() -> usize {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +76,9 @@ pub struct BuildConfig {
     /// Before **`makepkg`**, remove **`src/`** and **`pkg/`** in the package directory. **`--clean-install`** enables the same for that invocation even when this is false.
     #[serde(default)]
     pub clean_install_by_default: bool,
+    /// Maximum number of repository directories to sync concurrently.
+    #[serde(default = "default_concurrent_repos_downloads_limit")]
+    pub concurrent_repos_downloads_limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +256,10 @@ impl Config {
             "  clean_install_by_default: {}",
             self.build.clean_install_by_default
         );
+        println!(
+            "  concurrent_repos_downloads_limit: {}",
+            self.build.concurrent_repos_downloads_limit
+        );
 
         println!("\n{}", "System Update".green().bold());
         println!(
@@ -270,6 +311,13 @@ impl Config {
                 println!("  - {}", pkg);
             }
         }
+
+        println!("\n{}", "Self-Updates".green().bold());
+        println!("  check_for_update_on_startup: {}", self.check_for_update_on_startup);
+        println!("  auto_update_on_startup: {}", self.auto_update_on_startup);
+        println!("  self_update_github_url: {}", self.self_update_github_url);
+        println!("  self_update_raw_url: {}", self.self_update_raw_url);
+        println!("  self_update_install_path: {}", self.self_update_install_path);
 
         println!("\n{}", "Package Profiles".green().bold());
         let mut pkg_entries: Vec<_> = self.packages.iter().collect();

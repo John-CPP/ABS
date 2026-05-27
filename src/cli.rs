@@ -97,6 +97,14 @@ pub struct Cli {
     #[arg(long, value_name = "EDITOR", num_args = 0..=1, default_missing_value = "")]
     pub configure: Option<String>,
 
+    /// Check for new versions of ABS from GitHub
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub check_update: bool,
+
+    /// Check for new versions of ABS and update if available
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub self_update: bool,
+
     /// Show help information
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,

@@ -247,7 +247,17 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
         vlog!("manual_update_packages is empty; nothing to sync.");
         return;
     }
+
+    struct SyncTask {
+        pkg: String,
+        base_pkg: String,
+        repo_name: String,
+        repo_url_string: String,
+    }
+
     let mut seen = HashSet::new();
+    let mut tasks = Vec::new();
+
     for pkg in &config.manual_update_packages {
         let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
         let key = if is_per_package_repo(&repo_name) {
@@ -258,18 +268,50 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
         if !seen.insert(key) {
             continue;
         }
-        let _ = prepare_repo(
-            pkg,
-            &base_pkg,
-            &repo_name,
-            repo_url_string.as_str(),
-            &config.paths.packages_path,
-            false,
-            true,
-            None,
-        );
-        vlog!("Synced {} (repo {})", pkg, repo_name);
+        tasks.push(SyncTask {
+            pkg: pkg.clone(),
+            base_pkg,
+            repo_name,
+            repo_url_string,
+        });
     }
+
+    if tasks.is_empty() {
+        return;
+    }
+
+    tasks.reverse();
+
+    let tasks_mutex = std::sync::Mutex::new(tasks);
+    let concurrency_limit = config.build.concurrent_repos_downloads_limit.max(1);
+
+    std::thread::scope(|s| {
+        for _ in 0..concurrency_limit {
+            s.spawn(|| {
+                loop {
+                    let task = {
+                        let mut guard = tasks_mutex.lock().unwrap();
+                        guard.pop()
+                    };
+                    let Some(task) = task else {
+                        break;
+                    };
+
+                    let _ = prepare_repo(
+                        &task.pkg,
+                        &task.base_pkg,
+                        &task.repo_name,
+                        task.repo_url_string.as_str(),
+                        &config.paths.packages_path,
+                        false,
+                        true,
+                        None,
+                    );
+                    vlog!("Synced {} (repo {})", task.pkg, task.repo_name);
+                }
+            });
+        }
+    });
 }
 
 enum ManualPkgVersionLine {
