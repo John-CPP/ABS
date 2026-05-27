@@ -29,6 +29,8 @@ pub struct Config {
     pub self_update_install_path: String,
     #[serde(default = "default_self_update_at_updates")]
     pub self_update_at_updates: bool,
+    #[serde(default = "default_install_testing_phase_archlinux_packages")]
+    pub install_testing_phase_archlinux_packages: bool,
 }
 
 fn default_config_version() -> u32 {
@@ -44,6 +46,10 @@ fn default_auto_update_on_startup() -> bool {
 }
 
 fn default_self_update_at_updates() -> bool {
+    false
+}
+
+fn default_install_testing_phase_archlinux_packages() -> bool {
     false
 }
 
@@ -109,6 +115,7 @@ pub struct BuildConfig {
     pub self_update_github_url: Option<String>,
     pub self_update_raw_url: Option<String>,
     pub self_update_install_path: Option<String>,
+    pub install_testing_phase_archlinux_packages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +191,13 @@ fn run_editor(editor: &str, path: &Path) {
     let path_str = path.to_string_lossy();
     let editor_trimmed = editor.trim();
     let cmd_name = editor_trimmed.split_whitespace().next().unwrap_or(editor_trimmed);
+
+    if cmd_name == "kate" {
+        // Spawn a background instance of Kate to guarantee a running instance exists.
+        // If an instance is already running, this is a fast no-op.
+        let _ = std::process::Command::new("kate").spawn();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 
     let result = if editor.chars().any(char::is_whitespace) {
         let script = format!("{} {}", editor, sh_single_quote(&path_str));
@@ -308,6 +322,9 @@ impl Config {
         }
         if let Some(val) = &config.build.self_update_install_path {
             config.self_update_install_path = val.clone();
+        }
+        if let Some(val) = config.build.install_testing_phase_archlinux_packages {
+            config.install_testing_phase_archlinux_packages = val;
         }
 
         config.validate();
@@ -441,6 +458,10 @@ impl Config {
         println!("  self_update_github_url: {}", self.self_update_github_url);
         println!("  self_update_raw_url: {}", self.self_update_raw_url);
         println!("  self_update_install_path: {}", self.self_update_install_path);
+        println!(
+            "  install_testing_phase_archlinux_packages: {}",
+            self.install_testing_phase_archlinux_packages
+        );
 
         println!("\n{}", "Package Profiles".green().bold());
         let mut pkg_entries: Vec<_> = self.packages.iter().collect();
@@ -480,3 +501,45 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn test_parse_install_testing_packages_under_build() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+install_testing_phase_archlinux_packages = true
+
+[system_update]
+command_to_update_repositories = "pacman -Su"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let mut config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.install_testing_phase_archlinux_packages, false);
+        if let Some(val) = config.build.install_testing_phase_archlinux_packages {
+            config.install_testing_phase_archlinux_packages = val;
+        }
+        assert_eq!(config.install_testing_phase_archlinux_packages, true);
+    }
+}
+

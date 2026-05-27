@@ -9,6 +9,8 @@ config_version = 1
 # self_update_github_url = "https://github.com/John-CPP/ABS"
 # self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"
 # self_update_install_path = "/usr/bin/abs"
+# If false, checks for newer versions of Arch Linux or CachyOS packages using stable pacman sync databases instead of git.
+# install_testing_phase_archlinux_packages = false
 
 manual_update_packages = [
 ]

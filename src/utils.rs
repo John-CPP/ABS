@@ -511,9 +511,64 @@ pub fn vercmp(a: &str, b: &str) -> Result<i32, String> {
     }
 }
 
+fn parse_pacman_si_output(out: &str) -> Option<String> {
+    #[derive(Debug, Default)]
+    struct PacmanSiEntry {
+        repository: String,
+        version: String,
+    }
+
+    let mut entries = Vec::new();
+    let mut current_entry = PacmanSiEntry::default();
+
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some((key, val)) = line.split_once(':') {
+            let key = key.trim();
+            let val = val.trim();
+            if key == "Repository" {
+                if !current_entry.repository.is_empty() && !current_entry.version.is_empty() {
+                    entries.push(current_entry);
+                }
+                current_entry = PacmanSiEntry {
+                    repository: val.to_string(),
+                    version: String::new(),
+                };
+            } else if key == "Version" {
+                current_entry.version = val.to_string();
+            }
+        }
+    }
+    if !current_entry.repository.is_empty() && !current_entry.version.is_empty() {
+        entries.push(current_entry);
+    }
+
+    // Filter out -testing, -staging, and unstable repositories
+    let is_stable_repo = |repo: &str| {
+        let r = repo.to_lowercase();
+        !r.contains("testing") && !r.contains("staging") && !r.contains("unstable")
+    };
+
+    entries
+        .into_iter()
+        .find(|entry| is_stable_repo(&entry.repository))
+        .map(|entry| entry.version)
+}
+
+/// Sync database version from `pacman -Si` (without package name) for stable repos, or `None` if not found.
+pub fn pacman_sync_version(pkg: &str) -> Result<Option<String>, String> {
+    if crate::is_dry_run_mode() {
+        return Err("dry-run".into());
+    }
+    match run_command_with_output("pacman", &["-Si", "--noconfirm", pkg], None::<&str>) {
+        Ok(out) => Ok(parse_pacman_si_output(&out)),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod version_tests {
-    use super::parse_srcinfo_full_version;
+    use super::{parse_pacman_si_output, parse_srcinfo_full_version};
 
     #[test]
     fn parse_srcinfo_with_epoch() {
@@ -525,5 +580,39 @@ mod version_tests {
     fn parse_srcinfo_no_epoch() {
         let s = "pkgver=1.0\npkgrel=3\n";
         assert_eq!(parse_srcinfo_full_version(s).unwrap(), "1.0-3");
+    }
+
+    #[test]
+    fn test_parse_pacman_si_output() {
+        let sample = "\
+Repository      : core
+Name            : systemd
+Version         : 260.1-2
+Description     : system and service manager
+
+Repository      : core-testing
+Name            : systemd
+Version         : 261-1
+Description     : system and service manager
+";
+        assert_eq!(parse_pacman_si_output(sample), Some("260.1-2".to_string()));
+
+        let sample_only_testing = "\
+Repository      : core-testing
+Name            : systemd
+Version         : 261-1
+";
+        assert_eq!(parse_pacman_si_output(sample_only_testing), None);
+
+        let sample_with_staging = "\
+Repository      : extra-staging
+Name            : systemd
+Version         : 261-2
+
+Repository      : extra
+Name            : systemd
+Version         : 260.1-3
+";
+        assert_eq!(parse_pacman_si_output(sample_with_staging), Some("260.1-3".to_string()));
     }
 }

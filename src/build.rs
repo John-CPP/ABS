@@ -6,8 +6,9 @@ use crate::pkgbuild::{
     apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, restore_pkgbuild, update_pkgsums,
 };
 use crate::utils::{
-    pacman_query_version, read_pkg_full_version_from_dir, remove_src_pkg_workdirs,
-    remove_stale_pkgs_in_pkgdest, run_command, run_shell_in_dir_with_tee, vercmp,
+    pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
+    remove_src_pkg_workdirs, remove_stale_pkgs_in_pkgdest, run_command,
+    run_shell_in_dir_with_tee, vercmp,
 };
 use crate::{blog, die, ewarn, vlog};
 use colored::Colorize;
@@ -238,12 +239,42 @@ pub fn is_aur_package_up_to_date(pkg: &str) -> bool {
     }
 }
 
+static STABLE_UP_TO_DATE_PACKAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn stable_up_to_date_cache() -> &'static Mutex<HashSet<String>> {
+    STABLE_UP_TO_DATE_PACKAGES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn mark_stable_package_up_to_date(pkg: &str) {
+    if let Ok(mut cache) = stable_up_to_date_cache().lock() {
+        cache.insert(pkg.to_string());
+    }
+}
+
+pub fn is_stable_package_up_to_date(pkg: &str) -> bool {
+    if let Ok(cache) = stable_up_to_date_cache().lock() {
+        cache.contains(pkg)
+    } else {
+        false
+    }
+}
+
 /// After `git pull` on a shared repo (`-R`), decide if PKGBUILD versions are newer than installed.
 fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Result<bool, String> {
-    if is_aur_package_up_to_date(pkg) {
+    if is_aur_package_up_to_date(pkg) || is_stable_package_up_to_date(pkg) {
         return Ok(false);
     }
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
+    if !config.install_testing_phase_archlinux_packages
+        && (repo_name == "arch" || repo_name == "cachyos")
+    {
+        if let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
+            let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
+                return Ok(true);
+            };
+            return Ok(vercmp(&sync_ver, &inst_ver)? > 0);
+        }
+    }
     let repo_url = repo_url_string.as_str();
     // Callers that pass `-R` with `-U` run `sync_manual_repo_remotes` first; only read the tree here.
     let pkg_dir = prepare_repo(
@@ -310,6 +341,36 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
         }
     }
 
+    if !config.install_testing_phase_archlinux_packages {
+        for pkg in &config.manual_update_packages {
+            let (repo_name, _, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
+            if repo_name == "arch" || repo_name == "cachyos" {
+                if let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
+                    if let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg) {
+                        if let Ok(c) = vercmp(&sync_ver, &inst_ver) {
+                            if c <= 0 {
+                                vlog!(
+                                    "Stable Repo Check: {} is up-to-date in stable (sync: {}, installed: {}). Skipping git pull.",
+                                    pkg,
+                                    sync_ver,
+                                    inst_ver
+                                );
+                                mark_stable_package_up_to_date(pkg);
+                            } else {
+                                vlog!(
+                                    "Stable Repo Check: {} requires update in stable (sync: {}, installed: {}).",
+                                    pkg,
+                                    sync_ver,
+                                    inst_ver
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     struct SyncTask {
         pkg: String,
         base_pkg: String,
@@ -321,7 +382,7 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
     let mut tasks = Vec::new();
 
     for pkg in &config.manual_update_packages {
-        if is_aur_package_up_to_date(pkg) {
+        if is_aur_package_up_to_date(pkg) || is_stable_package_up_to_date(pkg) {
             continue;
         }
         let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
@@ -392,9 +453,30 @@ fn classify_manual_pkg_version(
     pkgbuild_cache: &mut PkgbuildDirCache,
 ) -> Result<ManualPkgVersionLine, String> {
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
-    if is_aur_package_up_to_date(pkg) {
+    if is_aur_package_up_to_date(pkg) || is_stable_package_up_to_date(pkg) {
         if let Ok(Some(inst)) = pacman_query_version(&base_pkg) {
             return Ok(ManualPkgVersionLine::UpToDate { current: inst });
+        }
+    }
+    if !config.install_testing_phase_archlinux_packages
+        && (repo_name == "arch" || repo_name == "cachyos")
+    {
+        if let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
+            let inst = pacman_query_version(&base_pkg)?;
+            let Some(inst_ver) = inst else {
+                return Ok(ManualPkgVersionLine::Upgrade {
+                    current: "not installed".to_string(),
+                    new: sync_ver,
+                });
+            };
+            if vercmp(&sync_ver, &inst_ver)? > 0 {
+                return Ok(ManualPkgVersionLine::Upgrade {
+                    current: inst_ver,
+                    new: sync_ver,
+                });
+            } else {
+                return Ok(ManualPkgVersionLine::UpToDate { current: inst_ver });
+            }
         }
     }
     let pkg_dir = prepare_repo(
