@@ -82,6 +82,8 @@ abs [FLAGS] [PACKAGE...]
 | `--list`          | Dump resolved config                                                    |
 | `--configure`     | Open user config in `$EDITOR`                                           |
 | `--configure=EDITOR` | Open user config in the given editor (e.g. `--configure=kate`)       |
+| `--check-update`  | Query latest remote version of ABS and check against local version      |
+| `--self-update`   | Fetch, compile, and install the latest remote version of ABS            |
 
 ### Per-package overrides
 
@@ -120,12 +122,26 @@ On **`-R`** / **`-RU`**, after syncing the AUR clone, ABS queries the GitHub API
 
 ### `[build]` config keys
 
-| Key                           | Description                                                         |
-| ----------------------------- | ------------------------------------------------------------------- |
-| `default_environment`         | `local` or `chroot`                                                 |
-| `ignore_compilation_failures` | Log warning and continue on build failure instead of aborting       |
-| `compile_first_install_after` | Build all packages first, then install — useful for unattended runs |
-| `clean_install_by_default`    | Remove `src/` and `pkg/` before every compile                       |
+| Key                                  | Description                                                         |
+| ------------------------------------ | ------------------------------------------------------------------- |
+| `default_environment`                | `local` or `chroot`                                                 |
+| `ignore_compilation_failures`        | Log warning and continue on build failure instead of aborting       |
+| `compile_first_install_after`        | Build all packages first, then install — useful for unattended runs |
+| `clean_install_by_default`           | Remove `src/` and `pkg/` before every compile                       |
+| `concurrent_repos_downloads_limit`   | Maximum number of repository clones/updates to sync concurrently (default: `10`) |
+
+### Self-Updates config keys
+
+These are root-level properties (but are also parsed under the `[build]` section for backwards compatibility):
+
+| Key                           | Description                                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `check_for_update_on_startup` | Check for newer ABS versions silently in the background at startup, notifying at exit if newer (default: `true`) |
+| `auto_update_on_startup`      | Check for newer ABS versions and automatically self-update synchronously at startup (default: `false`)         |
+| `self_update_at_updates`      | Check for newer ABS versions synchronously when `-U` is used and update before system packages (default: `false`)|
+| `self_update_github_url`      | The repository URL used to clone when self-updating (default: `"https://github.com/John-CPP/ABS"`)             |
+| `self_update_raw_url`         | The raw Cargo.toml URL used to parse the latest version (default: `"https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"`) |
+| `self_update_install_path`    | Destination path where the compiled binary will be installed (default: `"/usr/bin/abs"`)                      |
 
 ---
 
