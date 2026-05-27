@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::utils::{run_command, run_command_with_output};
+use crate::utils::{run_command, run_command_quiet, run_command_with_output};
 use crate::{blog, vlog};
 use colored::Colorize;
 use regex::Regex;
@@ -37,7 +37,7 @@ pub fn check_for_update(raw_url: &str) -> Result<(bool, String), String> {
 }
 
 /// Run self update (explicitly called by CLI or auto-update on startup)
-pub fn run_self_update(config: &Config, is_auto: bool) -> Result<(), String> {
+pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
     if !is_auto {
         blog!("Checking for updates...");
     }
@@ -46,7 +46,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<(), String> {
         Ok(res) => res,
         Err(e) => {
             if is_auto {
-                return Ok(()); // Fail silently on auto-update
+                return Ok(false); // Fail silently on auto-update
             } else {
                 return Err(format!("Update check failed: {}", e));
             }
@@ -57,7 +57,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<(), String> {
         if !is_auto {
             blog!("ABS is up-to-date (current version: {}).", env!("CARGO_PKG_VERSION").green());
         }
-        return Ok(());
+        return Ok(false);
     }
 
     blog!(
@@ -68,33 +68,47 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<(), String> {
 
 
 
-    let tmp_dir = std::env::temp_dir().join(format!("abs_self_update_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()));
-    if tmp_dir.exists() {
-        let _ = fs::remove_dir_all(&tmp_dir);
-    }
-    fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create temporary directory: {}", e))?;
+    let abs_dir = std::path::PathBuf::from(&config.paths.packages_path).join("abs");
 
-    blog!("Cloning latest repository source from {}...", config.self_update_github_url);
-    run_command(
-        "git",
-        &[
-            "clone",
-            "--depth=1",
-            &format!("{}.git", config.self_update_github_url),
-            tmp_dir.to_str().unwrap(),
-        ],
-        None::<&str>,
-    )?;
+    let mut repo_ok = false;
+    if abs_dir.exists() && abs_dir.join(".git").exists() {
+        blog!("Updating ABS repository in {}...", abs_dir.display());
+        if run_command("git", &["fetch", "--depth=1"], Some(&abs_dir)).is_ok()
+            && run_command("git", &["reset", "--hard", "origin/master"], Some(&abs_dir)).is_ok()
+        {
+            repo_ok = true;
+        } else {
+            vlog!("Failed to update existing repository. Cleaning up for a fresh clone...");
+            let _ = fs::remove_dir_all(&abs_dir);
+        }
+    } else if abs_dir.exists() {
+        let _ = fs::remove_dir_all(&abs_dir);
+    }
+
+    if !repo_ok {
+        blog!("Cloning latest repository source from {}...", config.self_update_github_url);
+        fs::create_dir_all(&config.paths.packages_path)
+            .map_err(|e| format!("Failed to create packages directory: {}", e))?;
+        run_command(
+            "git",
+            &[
+                "clone",
+                "--depth=1",
+                &format!("{}.git", config.self_update_github_url),
+                abs_dir.to_str().unwrap(),
+            ],
+            None::<&str>,
+        )?;
+    }
 
     blog!("Compiling latest release...");
     run_command(
         "cargo",
         &["build", "--release"],
-        Some(&tmp_dir),
+        Some(&abs_dir),
     )?;
 
-    let new_binary = tmp_dir.join("target").join("release").join("abs");
+    let new_binary = abs_dir.join("target").join("release").join("abs");
     if !new_binary.exists() {
         return Err("Compiled binary not found in target/release/abs".into());
     }
@@ -103,7 +117,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<(), String> {
     blog!("Installing executable to {}...", install_path);
 
     let new_str = new_binary.to_string_lossy();
-    let install_res = run_command(
+    let install_res = run_command_quiet(
         "install",
         &["-Dm755", new_str.as_ref(), install_path.as_ref()],
         None::<&str>,
@@ -118,9 +132,6 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<(), String> {
         )?;
     }
 
-    // Clean up
-    let _ = fs::remove_dir_all(&tmp_dir);
-
     blog!("ABS successfully updated to version {}!", latest.green());
-    Ok(())
+    Ok(true)
 }

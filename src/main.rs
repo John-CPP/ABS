@@ -301,6 +301,20 @@ fn main() {
         && !cli.download_only;
 
     if cli.system_update {
+        if config.self_update_at_updates && !cli.dry_run {
+            vlog!("self_update_at_updates is enabled, checking for update before system update...");
+            match self_update::run_self_update(&config, true) {
+                Ok(true) => {
+                    blog!("ABS successfully updated. Please re-run the command.");
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    ewarn!("Self update check failed before system update: {}", e);
+                }
+            }
+        }
+
         blog!("Starting system update mode...");
         let cli_package_names: HashSet<String> = parse_package_specs(&cli.packages)
             .into_iter()

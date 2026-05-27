@@ -2,6 +2,14 @@ config_version = 1
 
 # ABS example config. Copy to ~/.config/abs/abs.toml or /etc/abs/abs.toml.
 
+# Self-Updates (Root-level configurations)
+# check_for_update_on_startup = true
+# auto_update_on_startup = false
+# self_update_at_updates = false
+# self_update_github_url = "https://github.com/John-CPP/ABS"
+# self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"
+# self_update_install_path = "/usr/bin/abs"
+
 manual_update_packages = [
 ]
 skip_install_packages = [
@@ -18,13 +26,6 @@ ignore_compilation_failures = false
 compile_first_install_after = false
 clean_install_by_default = false
 concurrent_repos_downloads_limit = 10
-
-# Self-Updates
-# check_for_update_on_startup = true
-# auto_update_on_startup = false
-# self_update_github_url = "https://github.com/John-CPP/ABS"
-# self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"
-# self_update_install_path = "/usr/bin/abs"
 
 [system_update]
 command_to_update_repositories = "pacman -Su"

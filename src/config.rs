@@ -27,6 +27,8 @@ pub struct Config {
     pub self_update_raw_url: String,
     #[serde(default = "default_self_update_install_path")]
     pub self_update_install_path: String,
+    #[serde(default = "default_self_update_at_updates")]
+    pub self_update_at_updates: bool,
 }
 
 fn default_config_version() -> u32 {
@@ -38,6 +40,10 @@ fn default_check_for_update_on_startup() -> bool {
 }
 
 fn default_auto_update_on_startup() -> bool {
+    false
+}
+
+fn default_self_update_at_updates() -> bool {
     false
 }
 
@@ -79,6 +85,14 @@ pub struct BuildConfig {
     /// Maximum number of repository directories to sync concurrently.
     #[serde(default = "default_concurrent_repos_downloads_limit")]
     pub concurrent_repos_downloads_limit: usize,
+
+    // Optional self-update fields for backwards-compatibility/placement under [build]
+    pub check_for_update_on_startup: Option<bool>,
+    pub auto_update_on_startup: Option<bool>,
+    pub self_update_at_updates: Option<bool>,
+    pub self_update_github_url: Option<String>,
+    pub self_update_raw_url: Option<String>,
+    pub self_update_install_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,12 +208,33 @@ impl Config {
             }
         };
 
-        let config: Config = match toml::from_str(&config_content) {
+        let mut config: Config = match toml::from_str(&config_content) {
             Ok(c) => c,
             Err(e) => {
                 die!("Failed to parse config '{:?}': {}", config_path, e);
             }
         };
+
+        // Merge self-update settings parsed under [build] for backwards-compatibility
+        if let Some(val) = config.build.check_for_update_on_startup {
+            config.check_for_update_on_startup = val;
+        }
+        if let Some(val) = config.build.auto_update_on_startup {
+            config.auto_update_on_startup = val;
+        }
+        if let Some(val) = config.build.self_update_at_updates {
+            config.self_update_at_updates = val;
+        }
+        if let Some(val) = &config.build.self_update_github_url {
+            config.self_update_github_url = val.clone();
+        }
+        if let Some(val) = &config.build.self_update_raw_url {
+            config.self_update_raw_url = val.clone();
+        }
+        if let Some(val) = &config.build.self_update_install_path {
+            config.self_update_install_path = val.clone();
+        }
+
         config.validate();
         config
     }
@@ -315,6 +350,7 @@ impl Config {
         println!("\n{}", "Self-Updates".green().bold());
         println!("  check_for_update_on_startup: {}", self.check_for_update_on_startup);
         println!("  auto_update_on_startup: {}", self.auto_update_on_startup);
+        println!("  self_update_at_updates: {}", self.self_update_at_updates);
         println!("  self_update_github_url: {}", self.self_update_github_url);
         println!("  self_update_raw_url: {}", self.self_update_raw_url);
         println!("  self_update_install_path: {}", self.self_update_install_path);
