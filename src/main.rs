@@ -235,7 +235,9 @@ fn main() {
     let update_notifier = Arc::new(Mutex::new(None));
     let update_notifier_clone = Arc::clone(&update_notifier);
     let raw_url = config.self_update_raw_url.clone();
-    if config.check_for_update_on_startup {
+    // Skip redundant background update checks if we are running synchronous auto-updates
+    let skip_background = config.auto_update_on_startup || (config.self_update_at_updates && cli.system_update);
+    if config.check_for_update_on_startup && !skip_background {
         std::thread::spawn(move || {
             if let Ok((true, latest)) = self_update::check_for_update(&raw_url) {
                 if let Ok(mut guard) = update_notifier_clone.lock() {

@@ -15,15 +15,18 @@ fn parse_cargo_toml_version(text: &str) -> Option<String> {
 /// Fetch the latest version from raw GitHub Cargo.toml
 fn fetch_latest_version(raw_url: &str) -> Result<String, String> {
     vlog!("Fetching latest version from {}...", raw_url);
+    let start = std::time::Instant::now();
     let out = run_command_with_output(
         "curl",
         &[
             "-fsSL",
+            "--compressed",
             "-m", "5", // 5 seconds timeout
             raw_url,
         ],
         None::<&str>,
     )?;
+    vlog!("Fetched latest version in {:?}", start.elapsed());
     parse_cargo_toml_version(&out)
         .ok_or_else(|| "Failed to parse version from remote Cargo.toml".to_string())
 }

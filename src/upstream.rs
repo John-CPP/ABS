@@ -71,10 +71,12 @@ fn read_pkgver_from_dir(pkg_dir: &Path) -> Result<String, String> {
 fn github_api_get(path: &str) -> Result<String, String> {
     let url = format!("https://api.github.com{}", path);
     vlog!("Fetching {}", url);
+    let start = std::time::Instant::now();
     let out = run_command_with_output(
         "curl",
         &[
             "-fsSL",
+            "--compressed",
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
@@ -83,6 +85,7 @@ fn github_api_get(path: &str) -> Result<String, String> {
         ],
         None::<&str>,
     )?;
+    vlog!("Fetched {} in {:?}", url, start.elapsed());
     Ok(out)
 }
 
@@ -117,7 +120,7 @@ pub fn fetch_github_latest_version(
     let repo = normalize_github_repo(repo_slug)?;
 
     if include_prereleases {
-        let body = github_api_get(&format!("/repos/{}/releases?per_page=30", repo))?;
+        let body = github_api_get(&format!("/repos/{}/releases?per_page=10", repo))?;
         let releases: Vec<GhRelease> = serde_json::from_str(&body)
             .map_err(|e| format!("parse GitHub releases JSON for {}: {}", repo, e))?;
         pick_best_release_tag(&releases, true)

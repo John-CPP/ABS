@@ -297,6 +297,7 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                         break;
                     };
 
+                    let start = std::time::Instant::now();
                     let _ = prepare_repo(
                         &task.pkg,
                         &task.base_pkg,
@@ -307,7 +308,7 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                         true,
                         None,
                     );
-                    vlog!("Synced {} (repo {})", task.pkg, task.repo_name);
+                    vlog!("Synced {} (repo {}) in {:?}", task.pkg, task.repo_name, start.elapsed());
                 }
             });
         }
