@@ -200,3 +200,54 @@ pub fn update_pkgsums(repo_dir: &Path) -> bool {
         true
     }
 }
+
+fn extract_base_package_name(dep: &str) -> String {
+    let dep = dep.trim();
+    let cleaned = dep.split(|c| c == '<' || c == '>' || c == '=' || c == ':').next().unwrap_or(dep).trim();
+    cleaned.to_string()
+}
+
+pub fn parse_pkg_dependencies(pkg_dir: &Path) -> Vec<String> {
+    use crate::utils::run_command_with_output;
+    let mut deps = Vec::new();
+    let srcinfo_path = pkg_dir.join(".SRCINFO");
+    let srcinfo_text = if srcinfo_path.is_file() {
+        fs::read_to_string(&srcinfo_path).ok()
+    } else {
+        run_command_with_output("makepkg", &["--printsrcinfo"], Some(pkg_dir)).ok()
+    };
+
+    if let Some(text) = srcinfo_text {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some((key, value)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if key == "depends" || key == "makedepends" {
+                    let dep_name = extract_base_package_name(value);
+                    if !dep_name.is_empty() {
+                        deps.push(dep_name);
+                    }
+                }
+            }
+        }
+    } else {
+        let pkgbuild_path = pkg_dir.join("PKGBUILD");
+        if let Ok(content) = fs::read_to_string(&pkgbuild_path) {
+            let dep_array_re = Regex::new(r#"(?s)(depends|makedepends)=\((.*?)\)"#).unwrap();
+            for caps in dep_array_re.captures_iter(&content) {
+                let array_content = &caps[2];
+                for word in array_content.split_whitespace() {
+                    let clean_word = word.trim_matches(|c| c == '\'' || c == '"');
+                    let dep_name = extract_base_package_name(clean_word);
+                    if !dep_name.is_empty() {
+                        deps.push(dep_name);
+                    }
+                }
+            }
+        }
+    }
+
+    deps.sort();
+    deps.dedup();
+    deps
+}

@@ -215,8 +215,34 @@ pub fn resolve_pkg_repo_for_manual(
     resolve_pkg_repo(pkg, cli, config, None)
 }
 
+use std::sync::OnceLock;
+use std::sync::Mutex;
+
+static AUR_UP_TO_DATE_PACKAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn aur_up_to_date_cache() -> &'static Mutex<HashSet<String>> {
+    AUR_UP_TO_DATE_PACKAGES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn mark_aur_package_up_to_date(pkg: &str) {
+    if let Ok(mut cache) = aur_up_to_date_cache().lock() {
+        cache.insert(pkg.to_string());
+    }
+}
+
+pub fn is_aur_package_up_to_date(pkg: &str) -> bool {
+    if let Ok(cache) = aur_up_to_date_cache().lock() {
+        cache.contains(pkg)
+    } else {
+        false
+    }
+}
+
 /// After `git pull` on a shared repo (`-R`), decide if PKGBUILD versions are newer than installed.
 fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Result<bool, String> {
+    if is_aur_package_up_to_date(pkg) {
+        return Ok(false);
+    }
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
     let repo_url = repo_url_string.as_str();
     // Callers that pass `-R` with `-U` run `sync_manual_repo_remotes` first; only read the tree here.
@@ -248,6 +274,42 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
         return;
     }
 
+    if config.build.fast_aur_rpc_update_checks {
+        let mut aur_packages = Vec::new();
+        for pkg in &config.manual_update_packages {
+            let (repo_name, _, _) = resolve_pkg_repo(pkg, cli, config, None);
+            if repo_name == "aur" {
+                aur_packages.push(pkg.clone());
+            }
+        }
+
+        if !aur_packages.is_empty() {
+            vlog!("AUR RPC: checking update status for: {:?}", aur_packages);
+            match crate::aur_rpc::fetch_aur_packages_info(&aur_packages) {
+                Ok(versions) => {
+                    for pkg in &aur_packages {
+                        let (_, _, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
+                        if let Some(remote_ver) = versions.get(pkg) {
+                            if let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg) {
+                                if let Ok(c) = vercmp(remote_ver, &inst_ver) {
+                                    if c <= 0 {
+                                        vlog!("AUR RPC: {} is up-to-date (remote: {}, installed: {}). Skipping git pull.", pkg, remote_ver, inst_ver);
+                                        mark_aur_package_up_to_date(pkg);
+                                    } else {
+                                        vlog!("AUR RPC: {} requires update (remote: {}, installed: {}).", pkg, remote_ver, inst_ver);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    ewarn!("AUR RPC check failed: {}; falling back to standard Git update checks", e);
+                }
+            }
+        }
+    }
+
     struct SyncTask {
         pkg: String,
         base_pkg: String,
@@ -259,6 +321,9 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
     let mut tasks = Vec::new();
 
     for pkg in &config.manual_update_packages {
+        if is_aur_package_up_to_date(pkg) {
+            continue;
+        }
         let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
         let key = if is_per_package_repo(&repo_name) {
             format!("{}:{base_pkg}", normalize_repo_name(&repo_name))
@@ -327,6 +392,11 @@ fn classify_manual_pkg_version(
     pkgbuild_cache: &mut PkgbuildDirCache,
 ) -> Result<ManualPkgVersionLine, String> {
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
+    if is_aur_package_up_to_date(pkg) {
+        if let Ok(Some(inst)) = pacman_query_version(&base_pkg) {
+            return Ok(ManualPkgVersionLine::UpToDate { current: inst });
+        }
+    }
     let pkg_dir = prepare_repo(
         pkg,
         &base_pkg,
@@ -497,6 +567,36 @@ pub fn install_package_phase(spec: &PackageSpec, cli: &Cli, config: &Config) {
     }
 }
 
+fn inject_chroot_makepkg_conf(chrootdir: &Path, config: &Config) -> Result<(), String> {
+    if let Some(custom_conf) = &config.paths.chroot_makepkg_conf {
+        let custom_conf_path = Path::new(custom_conf);
+        if !custom_conf_path.exists() {
+            return Err(format!(
+                "Custom chroot makepkg.conf path does not exist: {}",
+                custom_conf
+            ));
+        }
+
+        let target_conf = chrootdir.join("root").join("etc").join("makepkg.conf");
+        vlog!(
+            "Injecting custom makepkg.conf '{}' into chroot '{}'...",
+            custom_conf,
+            target_conf.display()
+        );
+
+        run_command(
+            "sudo",
+            &[
+                "cp",
+                custom_conf_path.to_str().unwrap(),
+                target_conf.to_str().unwrap(),
+            ],
+            None::<&str>,
+        )?;
+    }
+    Ok(())
+}
+
 /// `defer_install`: when true (compile-first mode), build only; caller runs [`install_package_phase`] later.
 ///
 /// Returns **`false`** if the build failed and **`ignore_compilation_failures`** is set (caller continues).
@@ -648,7 +748,7 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
         blog!("Building in chroot with makechrootpkg...");
         // `makechrootpkg -r <dir>` expects `<dir>/root` (see mkarchroot / makechrootpkg man pages).
         let chrootdir = PathBuf::from(&config.paths.chroot_base_path).join("base");
-        if let Err(e) = ensure_devtools_chroot(&chrootdir) {
+        if let Err(e) = ensure_devtools_chroot(&chrootdir).and_then(|_| inject_chroot_makepkg_conf(&chrootdir, config)) {
             if config.build.ignore_compilation_failures {
                 ewarn!("Chroot setup failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);

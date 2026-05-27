@@ -43,8 +43,36 @@ fn format_command_error(
     message
 }
 
+fn is_readonly_command(cmd: &str, args: &[&str]) -> bool {
+    if cmd == "pacman" {
+        return args.get(0).map_or(false, |a| *a == "-Q" || *a == "--query");
+    }
+    if cmd == "vercmp" {
+        return true;
+    }
+    if cmd == "makepkg" {
+        return args.contains(&"--printsrcinfo");
+    }
+    if cmd == "bsdtar" {
+        return args.contains(&"-xOf") || args.contains(&"-xO");
+    }
+    if cmd == "bash" {
+        if args.contains(&"-c") {
+            if let Some(script) = args.last() {
+                if script.contains("source PKGBUILD") && script.contains("pkgver") {
+                    return true;
+                }
+            }
+        }
+    }
+    if cmd == "curl" {
+        return true;
+    }
+    false
+}
+
 pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> Result<(), String> {
-    if crate::is_dry_run_mode() {
+    if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
         let rendered_cmd = if args.is_empty() {
             cmd.to_string()
         } else {
@@ -88,7 +116,7 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
 /// Like [`run_command`], but captures stdout and stderr instead of inheriting them.
 /// Use this when you want to suppress output in non-verbose mode.
 pub fn run_command_quiet<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> Result<(), String> {
-    if crate::is_dry_run_mode() {
+    if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
         let rendered_cmd = if args.is_empty() {
             cmd.to_string()
         } else {
@@ -248,7 +276,7 @@ pub fn run_command_with_output<P: AsRef<Path>>(
     args: &[&str],
     cwd: Option<P>,
 ) -> Result<String, String> {
-    if crate::is_dry_run_mode() {
+    if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
         let rendered_cmd = if args.is_empty() {
             cmd.to_string()
         } else {
@@ -289,7 +317,7 @@ pub fn run_command_with_output_env<P: AsRef<Path>>(
     cwd: Option<P>,
     env: &[(&str, &str)],
 ) -> Result<String, String> {
-    if crate::is_dry_run_mode() {
+    if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
         let rendered_cmd = if args.is_empty() {
             cmd.to_string()
         } else {

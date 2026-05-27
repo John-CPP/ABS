@@ -64,10 +64,20 @@ pub struct PathsConfig {
     pub packages_path: String,
     pub chroot_base_path: String,
     pub ready_made_packages_path: String,
+    #[serde(default)]
+    pub chroot_makepkg_conf: Option<String>,
 }
 
 fn default_concurrent_repos_downloads_limit() -> usize {
     10
+}
+
+fn default_concurrent_compilations_limit() -> usize {
+    1
+}
+
+fn default_fast_aur_rpc_update_checks() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +95,12 @@ pub struct BuildConfig {
     /// Maximum number of repository directories to sync concurrently.
     #[serde(default = "default_concurrent_repos_downloads_limit")]
     pub concurrent_repos_downloads_limit: usize,
+    /// Maximum number of clean chroot compilations to run concurrently.
+    #[serde(default = "default_concurrent_compilations_limit")]
+    pub concurrent_compilations_limit: usize,
+    /// Whether to check AUR package versions using the AUR RPC API in batch.
+    #[serde(default = "default_fast_aur_rpc_update_checks")]
+    pub fast_aur_rpc_update_checks: bool,
 
     // Optional self-update fields for backwards-compatibility/placement under [build]
     pub check_for_update_on_startup: Option<bool>,
@@ -180,8 +196,44 @@ fn run_editor(editor: &str, path: &Path) {
 
 impl Config {
     pub fn open_in_editor(editor: Option<&str>) {
+        use std::io::{self, Write};
         let path = ensure_user_config_exists();
-        run_editor(&resolve_editor(editor), &path);
+        let editor_str = resolve_editor(editor);
+        loop {
+            run_editor(&editor_str, &path);
+            let config_content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => {
+                    println!("==> ERROR: Failed to read config file for validation.");
+                    break;
+                }
+            };
+            match toml::from_str::<Config>(&config_content) {
+                Ok(config) => {
+                    let env = config.build.default_environment.as_str();
+                    if env != "local" && env != "chroot" {
+                        println!("{} Invalid [build] default_environment: {:?} (expected \"local\" or \"chroot\")", "==> ERROR:".red(), env);
+                    } else {
+                        println!("{}", "==> Configuration validated successfully!".green());
+                        break;
+                    }
+                }
+                Err(e) => {
+                    println!("{} Failed to parse configuration file: {}", "==> ERROR:".red(), e);
+                }
+            }
+
+            print!("Would you like to re-open the editor to fix the configuration? [Y/n]: ");
+            let _ = io::stdout().flush();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() {
+                break;
+            }
+            let v = input.trim().to_lowercase();
+            if v == "n" || v == "no" {
+                break;
+            }
+        }
     }
 
     pub fn load_config() -> Config {
@@ -276,6 +328,10 @@ impl Config {
             "  ready_made_packages_path: {}",
             self.paths.ready_made_packages_path
         );
+        println!(
+            "  chroot_makepkg_conf: {}",
+            self.paths.chroot_makepkg_conf.as_deref().unwrap_or("(none)")
+        );
 
         println!("\n{}", "Build".green().bold());
         println!("  default_environment: {}", self.build.default_environment);
@@ -294,6 +350,14 @@ impl Config {
         println!(
             "  concurrent_repos_downloads_limit: {}",
             self.build.concurrent_repos_downloads_limit
+        );
+        println!(
+            "  concurrent_compilations_limit: {}",
+            self.build.concurrent_compilations_limit
+        );
+        println!(
+            "  fast_aur_rpc_update_checks: {}",
+            self.build.fast_aur_rpc_update_checks
         );
 
         println!("\n{}", "System Update".green().bold());

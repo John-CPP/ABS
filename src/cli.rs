@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "abs")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "ABS: package building and system updates", long_about = None)]

@@ -1,6 +1,8 @@
+mod aur_rpc;
 mod build;
 mod cli;
 mod config;
+mod dep_graph;
 mod git;
 mod install;
 mod package_spec;
@@ -333,20 +335,17 @@ fn main() {
             build::report_manual_update_versions(&config, &cli);
         }
 
-        let mut skipped_install_after_compile_fail = HashSet::<String>::new();
-
+        let mut system_specs = Vec::new();
         for pkg in &config.manual_update_packages {
             if cli_package_names.contains(pkg) {
                 continue;
             }
-
             if build::should_run_manual_prebuild(pkg, &cli, &config) {
-                vlog!("Manual update package: {}", pkg);
-                if !build::process_package(&package_spec::PackageSpec::plain(pkg), &cli, &config, defer_install_pass) {
-                    skipped_install_after_compile_fail.insert(pkg.clone());
-                }
+                system_specs.push(package_spec::PackageSpec::plain(pkg));
             }
         }
+
+        let skipped_install_after_compile_fail = run_compilations(system_specs, &cli, &config, defer_install_pass);
 
         if defer_install_pass {
             vlog!("Install phase (compile-first: all scheduled builds finished)...");
@@ -376,22 +375,31 @@ fn main() {
             die!("No packages specified.");
         }
 
-        let mut skipped_install_after_compile_fail = HashSet::<String>::new();
-
-        for spec in &package_specs {
-            blog!("Processing package: {}", spec.name);
-            if !build::process_package(spec, &cli, &config, defer_install_pass) {
-                skipped_install_after_compile_fail.insert(spec.name.clone());
-            }
-        }
+        let skipped_install_after_compile_fail = run_compilations(package_specs, &cli, &config, defer_install_pass);
 
         if defer_install_pass {
             vlog!("Install phase (compile-first: all scheduled builds finished)...");
-            for spec in &package_specs {
-                if skipped_install_after_compile_fail.contains(&spec.name) {
-                    continue;
+            let mut base_to_spec = std::collections::HashMap::new();
+            for spec in parse_package_specs(&cli.packages) {
+                let (_, _, base) = build::resolve_pkg_repo_for_manual(&spec.name, &cli, &config);
+                base_to_spec.insert(base, spec);
+            }
+            
+            // Re-sort the install phase using the same order
+            if let Ok(sorted) = dep_graph::sort_packages_topologically(&parse_package_specs(&cli.packages), &cli, &config) {
+                for spec in &sorted {
+                    if skipped_install_after_compile_fail.contains(&spec.name) {
+                        continue;
+                    }
+                    build::install_package_phase(spec, &cli, &config);
                 }
-                build::install_package_phase(spec, &cli, &config);
+            } else {
+                for spec in parse_package_specs(&cli.packages) {
+                    if skipped_install_after_compile_fail.contains(&spec.name) {
+                        continue;
+                    }
+                    build::install_package_phase(&spec, &cli, &config);
+                }
             }
         }
     }
@@ -406,4 +414,176 @@ fn main() {
             );
         }
     }
+}
+
+fn run_compilations(
+    specs: Vec<package_spec::PackageSpec>,
+    cli: &Cli,
+    config: &config::Config,
+    defer_install_pass: bool,
+) -> HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Mutex, Condvar};
+
+    let mut skipped_install = HashSet::new();
+    if specs.is_empty() {
+        return skipped_install;
+    }
+
+    let sorted_specs = match dep_graph::sort_packages_topologically(&specs, cli, config) {
+        Ok(sorted) => sorted,
+        Err(e) => {
+            ewarn!("Dependency sort failed: {}. Falling back to default order.", e);
+            specs.clone()
+        }
+    };
+
+    let concurrency_limit = config.build.concurrent_compilations_limit.max(1);
+
+    if concurrency_limit <= 1 || !defer_install_pass {
+        for spec in &sorted_specs {
+            blog!("Processing package: {}", spec.name);
+            if !build::process_package(spec, cli, config, defer_install_pass) {
+                skipped_install.insert(spec.name.clone());
+            }
+        }
+        return skipped_install;
+    }
+
+    vlog!("Starting parallel compilations (concurrency limit: {})...", concurrency_limit);
+
+    let mut spec_map = HashMap::new();
+    let mut base_to_name = HashMap::new();
+    let mut name_to_base = HashMap::new();
+    let mut deps_map = HashMap::new();
+
+    for spec in &sorted_specs {
+        let (_, _, base) = build::resolve_pkg_repo_for_manual(&spec.name, cli, config);
+        spec_map.insert(base.clone(), spec.clone());
+        base_to_name.insert(base.clone(), spec.name.clone());
+        name_to_base.insert(spec.name.clone(), base.clone());
+    }
+
+    for (base, spec) in &spec_map {
+        let (repo_name, repo_url_string, base_pkg) = build::resolve_pkg_repo_for_manual(&spec.name, cli, config);
+        let pkg_dir = git::prepare_repo(
+            &spec.name,
+            &base_pkg,
+            &repo_name,
+            &repo_url_string,
+            &config.paths.packages_path,
+            false,
+            false,
+            None,
+        );
+        let all_deps = pkgbuild::parse_pkg_dependencies(pkg_dir.as_path());
+        let mut filtered_deps = HashSet::new();
+        for dep in all_deps {
+            if spec_map.contains_key(&dep) && dep != *base {
+                filtered_deps.insert(dep);
+            }
+        }
+        deps_map.insert(base.clone(), filtered_deps);
+    }
+
+    use std::sync::Arc;
+
+    let deps_map = Arc::new(deps_map);
+    let spec_map = Arc::new(spec_map);
+    let state = Arc::new(Mutex::new((
+        sorted_specs.iter().map(|s| name_to_base.get(&s.name).unwrap().clone()).collect::<HashSet<String>>(),
+        HashSet::<String>::new(),
+        HashSet::<String>::new(),
+        HashSet::<String>::new(),
+    )));
+    let cvar = Arc::new(Condvar::new());
+
+    std::thread::scope(|scope| {
+        for worker_id in 0..concurrency_limit {
+            let state = Arc::clone(&state);
+            let cvar = Arc::clone(&cvar);
+            let deps_map = Arc::clone(&deps_map);
+            let spec_map = Arc::clone(&spec_map);
+            scope.spawn(move || {
+                loop {
+                    let mut task_to_run = None;
+
+                    {
+                        let mut guard = state.lock().unwrap();
+                        loop {
+                            let (ref mut pending, ref mut compiling, ref mut finished, ref mut failed) = *guard;
+
+                            if pending.is_empty() && compiling.is_empty() {
+                                return;
+                            }
+
+                            let mut found_task = None;
+                            for pending_task in pending.iter() {
+                                let deps = deps_map.get(pending_task).unwrap();
+                                let all_finished = deps.iter().all(|d| finished.contains(d));
+                                let any_failed = deps.iter().any(|d| failed.contains(d));
+
+                                if any_failed {
+                                    found_task = Some((pending_task.clone(), true));
+                                    break;
+                                } else if all_finished {
+                                    found_task = Some((pending_task.clone(), false));
+                                    break;
+                                }
+                            }
+
+                            if let Some((task, is_blocked)) = found_task {
+                                pending.remove(&task);
+                                if is_blocked {
+                                    vlog!("Parallel compile: Skipping {} because its dependency failed.", task);
+                                    failed.insert(task);
+                                } else {
+                                    compiling.insert(task.clone());
+                                    task_to_run = Some(task);
+                                }
+                                break;
+                            }
+
+                            if !compiling.is_empty() {
+                                guard = cvar.wait(guard).unwrap();
+                            } else {
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Some(base_name) = task_to_run {
+                        let spec = spec_map.get(&base_name).unwrap();
+                        blog!("Processing package [Worker {}]: {}", worker_id, spec.name);
+
+                        let success = build::process_package(spec, cli, config, true);
+
+                        {
+                            let mut guard = state.lock().unwrap();
+                            let (_, ref mut compiling, ref mut finished, ref mut failed) = *guard;
+                            compiling.remove(&base_name);
+                            if success {
+                                finished.insert(base_name.clone());
+                            } else {
+                                failed.insert(base_name.clone());
+                            }
+                            cvar.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    {
+        let guard = state.lock().unwrap();
+        let (_, _, _, ref failed) = *guard;
+        for base in failed {
+            if let Some(name) = base_to_name.get(base) {
+                skipped_install.insert(name.clone());
+            }
+        }
+    }
+
+    skipped_install
 }

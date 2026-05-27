@@ -19,6 +19,8 @@ skip_install_packages = [
 packages_path = "$XDG_CONFIG_HOME/.cache/abs/packages"
 chroot_base_path = "$XDG_CONFIG_HOME/.cache/abs/chroot"
 ready_made_packages_path = "$XDG_CONFIG_HOME/.cache/abs/ready"
+# Optional: path to a custom makepkg.conf file to inject into the chroot container
+# chroot_makepkg_conf = "~/.config/abs/makepkg.conf"
 
 [build]
 default_environment = "local"
@@ -26,6 +28,10 @@ ignore_compilation_failures = false
 compile_first_install_after = false
 clean_install_by_default = false
 concurrent_repos_downloads_limit = 10
+# Maximum number of clean chroot compilations to run concurrently
+concurrent_compilations_limit = 1
+# Check AUR package versions using the AUR RPC API in batch
+fast_aur_rpc_update_checks = true
 
 [system_update]
 command_to_update_repositories = "pacman -Su"
