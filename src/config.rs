@@ -182,11 +182,21 @@ fn resolve_editor(explicit: Option<&str>) -> String {
 
 fn run_editor(editor: &str, path: &Path) {
     let path_str = path.to_string_lossy();
+    let editor_trimmed = editor.trim();
+    let cmd_name = editor_trimmed.split_whitespace().next().unwrap_or(editor_trimmed);
+
     let result = if editor.chars().any(char::is_whitespace) {
         let script = format!("{} {}", editor, sh_single_quote(&path_str));
         run_command("sh", &["-c", &script], None::<&str>)
     } else {
-        run_command(editor, &[&path_str], None::<&str>)
+        let mut args = Vec::new();
+        if cmd_name == "kate" {
+            args.push("-b");
+        } else if cmd_name == "code" || cmd_name == "subl" || cmd_name == "gedit" || cmd_name == "atom" {
+            args.push("-w");
+        }
+        args.push(path_str.as_ref());
+        run_command(editor, &args, None::<&str>)
     };
 
     if let Err(e) = result {
