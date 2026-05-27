@@ -192,7 +192,19 @@ fn run_editor(editor: &str, path: &Path) {
         let mut args = Vec::new();
         if cmd_name == "kate" {
             args.push("-b");
-        } else if cmd_name == "code" || cmd_name == "subl" || cmd_name == "gedit" || cmd_name == "atom" {
+        } else if cmd_name == "code"
+            || cmd_name == "vscode"
+            || cmd_name == "codium"
+            || cmd_name == "vscodium"
+            || cmd_name == "cursor"
+            || cmd_name == "subl"
+            || cmd_name == "sublime-text"
+            || cmd_name == "gedit"
+            || cmd_name == "pluma"
+            || cmd_name == "xed"
+            || cmd_name == "atom"
+            || cmd_name == "lumiere"
+        {
             args.push("-w");
         }
         args.push(path_str.as_ref());
@@ -211,6 +223,7 @@ impl Config {
         let editor_str = resolve_editor(editor);
         loop {
             run_editor(&editor_str, &path);
+
             let config_content = match fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => {
