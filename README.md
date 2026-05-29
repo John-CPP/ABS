@@ -2,6 +2,7 @@
 
 Arch Linux / CachyOS package builder. Maybe works with other arch-based distros.
 Main idea of ABS is add gentoo-emerge like functionality to arch-like systems.
+Current code in repo is already a stable version so no releases necessary.
 
 ---
 
