@@ -289,7 +289,7 @@ fn main() {
     // `-R` without `-U`: sync all manual repos, report PKGBUILD vs installed, then `command` (not refresh).
         if cli.force_repo_update && !cli.system_update && cli.packages.is_empty() {
             blog!("Repository refresh (manual_update_packages) and system update...");
-            system::run_system_update(&config, false);
+            system::run_system_update(&config, system::SystemUpdateMode::UpdateRepositories);
             build::sync_manual_repo_remotes(&config, &cli);
             upstream::sync_upstream_pkgbuilds(&config, &cli);
             if !is_silent_mode() {
@@ -327,7 +327,7 @@ fn main() {
 
         if cli.force_repo_update {
             blog!("Refreshing git remotes for manual_update_packages (-R)...");
-            system::run_system_update(&config, false);
+            system::run_system_update(&config, system::SystemUpdateMode::UpdateRepositories);
             build::sync_manual_repo_remotes(&config, &cli);
             upstream::sync_upstream_pkgbuilds(&config, &cli);
             if !is_silent_mode() {
@@ -367,8 +367,12 @@ fn main() {
             }
         }
 
-        let use_refresh = cli.force_repo_update;
-        system::run_system_update(&config, use_refresh);
+        let mode = if cli.force_repo_update {
+            system::SystemUpdateMode::PerformUpdateNoRefresh
+        } else {
+            system::SystemUpdateMode::PerformUpdateWithRefresh
+        };
+        system::run_system_update(&config, mode);
     } else {
         let package_specs = parse_package_specs(&cli.packages);
 

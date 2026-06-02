@@ -29,6 +29,7 @@ clean_install_by_default = false
 [system_update]
 command_to_update_repositories = "yay -Sy"
 command_to_perform_system_update = "yay -Syu"
+command_to_perform_system_update_no_refresh = "yay -Su"
 ignore_flag = "--ignore"
 ignore_packages = []
 

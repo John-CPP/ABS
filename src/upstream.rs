@@ -254,6 +254,17 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
                         }
                     };
 
+                    // If the upstream GitHub version is newer than the installed version,
+                    // the package needs an update regardless of whether the PKGBUILD itself
+                    // needs to be bumped or has already been bumped.
+                    if let Ok(Some(inst_ver)) = crate::utils::pacman_query_version(&base_pkg) {
+                        if let Ok(c) = vercmp(&upstream_pkgver, &inst_ver) {
+                            if c > 0 {
+                                crate::build::unmark_aur_package_up_to_date(&task.pkg);
+                            }
+                        }
+                    }
+
                     if crate::is_dry_run_mode() {
                         println!(
                             "[DRY RUN] {}: would set pkgver={} from GitHub {}",
@@ -262,9 +273,18 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
                         continue;
                     }
 
-                    if let Err(e) = maybe_bump_pkgbuild_to_upstream(&task.pkg, pkg_dir.as_path(), &upstream_pkgver)
+                    match maybe_bump_pkgbuild_to_upstream(&task.pkg, pkg_dir.as_path(), &upstream_pkgver)
                     {
-                        ewarn!("{}: failed to apply upstream version: {}", task.pkg, e);
+                        Ok(true) => {
+                            // The PKGBUILD now has a newer version than what AUR RPC reported;
+                            // clear the "up-to-date" flag so version checks and compilation
+                            // decisions see the bumped PKGBUILD instead of short-circuiting.
+                            crate::build::unmark_aur_package_up_to_date(&task.pkg);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            ewarn!("{}: failed to apply upstream version: {}", task.pkg, e);
+                        }
                     }
                 }
             });

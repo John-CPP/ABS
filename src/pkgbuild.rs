@@ -191,6 +191,26 @@ pub fn restore_pkgbuild(repo_dir: &Path) {
     }
 }
 
+pub fn inject_compiler_env(repo_dir: &Path, cc: &str, cxx: &str) -> Result<(), String> {
+    let pkgbuild_path = repo_dir.join("PKGBUILD");
+    if !pkgbuild_path.exists() {
+        return Err("PKGBUILD not found".to_string());
+    }
+    let original = fs::read_to_string(&pkgbuild_path)
+        .map_err(|e| format!("Failed to read PKGBUILD: {}", e))?;
+
+    let mut modified = format!(
+        "export CC={}\nexport CXX={}\n",
+        crate::utils::sh_single_quote(cc),
+        crate::utils::sh_single_quote(cxx)
+    );
+    modified.push_str(&original);
+
+    fs::write(&pkgbuild_path, modified)
+        .map_err(|e| format!("Failed to write PKGBUILD: {}", e))?;
+    Ok(())
+}
+
 pub fn update_pkgsums(repo_dir: &Path) -> bool {
     vlog!("==> Updating checksums (updpkgsums)...");
     if let Err(e) = crate::utils::run_command("updpkgsums", &[], Some(repo_dir)) {
@@ -250,4 +270,26 @@ pub fn parse_pkg_dependencies(pkg_dir: &Path) -> Vec<String> {
     deps.sort();
     deps.dedup();
     deps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_inject_compiler_env() {
+        let temp = std::env::temp_dir().join(format!("abs_test_pkgbuild_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&temp).unwrap();
+        let pkgbuild = temp.join("PKGBUILD");
+        fs::write(&pkgbuild, "pkgname=foo\nbuild() {\n  make\n}\n").unwrap();
+
+        inject_compiler_env(&temp, "clang", "clang++").unwrap();
+
+        let content = fs::read_to_string(&pkgbuild).unwrap();
+        assert!(content.contains("export CC='clang'\nexport CXX='clang++'\n"));
+        assert!(content.contains("pkgname=foo\n"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
 }

@@ -36,8 +36,9 @@ concurrent_compilations_limit = 1
 fast_aur_rpc_update_checks = true
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
-command_to_perform_system_update = "pacman -Syu"
+command_to_update_repositories = "sudo pacman -Sy"
+command_to_perform_system_update = "sudo pacman -Syu"
+command_to_perform_system_update_no_refresh = "sudo pacman -Su"
 ignore_flag = "--ignore"
 ignore_packages = []
 

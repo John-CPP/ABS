@@ -4,6 +4,7 @@ use crate::git::{is_per_package_repo, prepare_repo, PkgbuildDirCache};
 use crate::package_spec::PackageSpec;
 use crate::pkgbuild::{
     apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, restore_pkgbuild, update_pkgsums,
+    inject_compiler_env,
 };
 use crate::utils::{
     pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
@@ -236,6 +237,12 @@ pub fn is_aur_package_up_to_date(pkg: &str) -> bool {
         cache.contains(pkg)
     } else {
         false
+    }
+}
+
+pub fn unmark_aur_package_up_to_date(pkg: &str) {
+    if let Ok(mut cache) = aur_up_to_date_cache().lock() {
+        cache.remove(pkg);
     }
 }
 
@@ -736,6 +743,22 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
     backup_pkgbuild(repo_dir);
     let _guard = PkgbuildGuard { repo_dir };
 
+    // Resolve and inject custom compiler if specified
+    let resolved_compiler = spec.compiler.as_deref()
+        .or_else(|| pkg_config.and_then(|pc| pc.compiler.as_deref()))
+        .or_else(|| config.build.default_compiler.as_deref());
+
+    if let Some(comp_key) = resolved_compiler {
+        if let Some(comp_cfg) = config.compilers.get(comp_key) {
+            blog!("Compiling with custom compiler '{}': cc={} cxx={}", comp_key, comp_cfg.cc, comp_cfg.cxx);
+            if let Err(e) = inject_compiler_env(repo_dir, &comp_cfg.cc, &comp_cfg.cxx) {
+                die!("Failed to configure custom compiler: {}", e);
+            }
+        } else {
+            die!("Custom compiler '{}' is not defined in the [compilers] configuration section", comp_key);
+        }
+    }
+
     if cli.clean_install || config.build.clean_install_by_default {
         blog!("Clean install: removing src/ and pkg/...");
         if let Err(e) = remove_src_pkg_workdirs(repo_dir) {
@@ -938,5 +961,21 @@ mod tests {
             known_repository_url("AUR").as_deref(),
             Some("https://aur.archlinux.org")
         );
+    }
+
+    #[test]
+    fn test_aur_up_to_date_cache() {
+        let pkg = "test_pkg_cache";
+        // Ensure starting state is false
+        super::unmark_aur_package_up_to_date(pkg);
+        assert!(!super::is_aur_package_up_to_date(pkg));
+
+        // Mark it as up to date and check
+        super::mark_aur_package_up_to_date(pkg);
+        assert!(super::is_aur_package_up_to_date(pkg));
+
+        // Unmark it and check
+        super::unmark_aur_package_up_to_date(pkg);
+        assert!(!super::is_aur_package_up_to_date(pkg));
     }
 }

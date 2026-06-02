@@ -31,6 +31,14 @@ pub struct Config {
     pub self_update_at_updates: bool,
     #[serde(default = "default_install_testing_phase_archlinux_packages")]
     pub install_testing_phase_archlinux_packages: bool,
+    #[serde(default)]
+    pub compilers: HashMap<String, CompilerConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CompilerConfig {
+    pub cc: String,
+    pub cxx: String,
 }
 
 fn default_config_version() -> u32 {
@@ -107,6 +115,8 @@ pub struct BuildConfig {
     /// Whether to check AUR package versions using the AUR RPC API in batch.
     #[serde(default = "default_fast_aur_rpc_update_checks")]
     pub fast_aur_rpc_update_checks: bool,
+    #[serde(default)]
+    pub default_compiler: Option<String>,
 
     // Optional self-update fields for backwards-compatibility/placement under [build]
     pub check_for_update_on_startup: Option<bool>,
@@ -127,8 +137,29 @@ pub struct SystemUpdateConfig {
     /// Shown with **`-RU`**. TOML key: `command_to_perform_system_update` (alias: `command_with_refresh`).
     #[serde(alias = "command_with_refresh")]
     pub command_to_perform_system_update: String,
+    /// Shown with **`-RU`** (after initial refresh has run). TOML key: `command_to_perform_system_update_no_refresh` (alias: `command_no_refresh`).
+    #[serde(default)]
+    #[serde(alias = "command_no_refresh")]
+    pub command_to_perform_system_update_no_refresh: Option<String>,
     pub ignore_flag: String,
     pub ignore_packages: Vec<String>,
+}
+
+impl SystemUpdateConfig {
+    pub fn get_command_to_perform_system_update_no_refresh(&self) -> String {
+        if let Some(cmd) = &self.command_to_perform_system_update_no_refresh {
+            cmd.clone()
+        } else {
+            let with_refresh = &self.command_to_perform_system_update;
+            if with_refresh.contains("-Syu") {
+                with_refresh.replace("-Syu", "-Su")
+            } else if with_refresh.contains("-Sy") {
+                with_refresh.replace("-Sy", "-S")
+            } else {
+                with_refresh.clone()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -148,6 +179,7 @@ pub struct PackageConfig {
     /// When true, consider GitHub prereleases when choosing the newest upstream version.
     #[serde(default)]
     pub upstream_prereleases: bool,
+    pub compiler: Option<String>,
 }
 
 const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
@@ -399,6 +431,10 @@ impl Config {
             "  fast_aur_rpc_update_checks: {}",
             self.build.fast_aur_rpc_update_checks
         );
+        println!(
+            "  default_compiler: {}",
+            self.build.default_compiler.as_deref().unwrap_or("(none)")
+        );
 
         println!("\n{}", "System Update".green().bold());
         println!(
@@ -408,6 +444,10 @@ impl Config {
         println!(
             "  command_to_perform_system_update: {}",
             self.system_update.command_to_perform_system_update
+        );
+        println!(
+            "  command_to_perform_system_update_no_refresh: {}",
+            self.system_update.get_command_to_perform_system_update_no_refresh()
         );
         println!("  ignore_flag: {}", self.system_update.ignore_flag);
         if self.system_update.ignore_packages.is_empty() {
@@ -448,6 +488,17 @@ impl Config {
         } else {
             for pkg in &self.skip_install_packages {
                 println!("  - {}", pkg);
+            }
+        }
+
+        println!("\n{}", "Compilers".green().bold());
+        if self.compilers.is_empty() {
+            println!("  (none)");
+        } else {
+            let mut comp_entries: Vec<_> = self.compilers.iter().collect();
+            comp_entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, cfg) in comp_entries {
+                println!("  - {}: cc={} cxx={}", name, cfg.cc, cfg.cxx);
             }
         }
 
@@ -492,6 +543,9 @@ impl Config {
             if let Some(cmd) = &cfg.post_update_command {
                 println!("    post_update_command: {}", cmd);
             }
+            if let Some(comp) = &cfg.compiler {
+                println!("    compiler: {}", comp);
+            }
             if let Some(repo) = &cfg.upstream_github {
                 println!(
                     "    upstream_github: {} (prereleases: {})",
@@ -525,6 +579,7 @@ install_testing_phase_archlinux_packages = true
 [system_update]
 command_to_update_repositories = "pacman -Su"
 command_to_perform_system_update = "pacman -Syu"
+command_to_perform_system_update_no_refresh = "pacman -Su"
 ignore_flag = "--ignore"
 ignore_packages = []
 
@@ -540,6 +595,37 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
             config.install_testing_phase_archlinux_packages = val;
         }
         assert_eq!(config.install_testing_phase_archlinux_packages, true);
+    }
+
+    #[test]
+    fn test_get_command_to_perform_system_update_no_refresh() {
+        let mut sys_update = super::SystemUpdateConfig {
+            command_to_update_repositories: "yay -Sy".into(),
+            command_to_perform_system_update: "yay -Syu --quiet".into(),
+            command_to_perform_system_update_no_refresh: None,
+            ignore_flag: "--ignore".into(),
+            ignore_packages: vec![],
+        };
+
+        // Derives from command_to_perform_system_update (replacing -Syu with -Su)
+        assert_eq!(
+            sys_update.get_command_to_perform_system_update_no_refresh(),
+            "yay -Su --quiet"
+        );
+
+        // Derives from command_to_perform_system_update (replacing -Sy with -S)
+        sys_update.command_to_perform_system_update = "pacman -Sy".into();
+        assert_eq!(
+            sys_update.get_command_to_perform_system_update_no_refresh(),
+            "pacman -S"
+        );
+
+        // Obeys explicit override if present
+        sys_update.command_to_perform_system_update_no_refresh = Some("custom_command".into());
+        assert_eq!(
+            sys_update.get_command_to_perform_system_update_no_refresh(),
+            "custom_command"
+        );
     }
 }
 

@@ -11,6 +11,7 @@ pub struct PackageSpec {
     pub local_build: Option<bool>,
     pub chroot_build: Option<bool>,
     pub no_check: Option<bool>,
+    pub compiler: Option<String>,
 }
 
 impl PackageSpec {
@@ -22,6 +23,7 @@ impl PackageSpec {
             local_build: None,
             chroot_build: None,
             no_check: None,
+            compiler: None,
         }
     }
 }
@@ -74,6 +76,12 @@ fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
             ),
         },
         "nocheck" | "no_check" => spec.no_check = Some(parse_bool_flag(value)),
+        "compiler" => {
+            if value.is_empty() {
+                die!("Package '{}': [compiler] requires a value (e.g. compiler=llvm)", spec.name);
+            }
+            spec.compiler = Some(value.to_string());
+        }
         _ => {
             if value.is_empty() {
                 die!(
@@ -176,5 +184,13 @@ mod tests {
         assert_eq!(spec.repo.as_deref(), Some("aur"));
         assert_eq!(spec.chroot_build, Some(true));
         assert_eq!(spec.pkgbuild_overrides.get("pkgver").map(String::as_str), Some("1.0"));
+    }
+
+    #[test]
+    fn parse_compiler_override() {
+        let spec = parse_package_spec("mesa[compiler=llvm17]");
+        assert_eq!(spec.name, "mesa");
+        assert_eq!(spec.compiler.as_deref(), Some("llvm17"));
+        assert!(spec.pkgbuild_overrides.is_empty());
     }
 }
