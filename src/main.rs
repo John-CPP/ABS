@@ -325,9 +325,16 @@ fn main() {
             .map(|s| s.name)
             .collect();
 
+        if config.build.system_update_first {
+            blog!("Performing system update before compilation...");
+            system::run_system_update(&config, system::SystemUpdateMode::PerformUpdateWithRefresh);
+        }
+
         if cli.force_repo_update {
             blog!("Refreshing git remotes for manual_update_packages (-R)...");
-            system::run_system_update(&config, system::SystemUpdateMode::UpdateRepositories);
+            if !config.build.system_update_first {
+                system::run_system_update(&config, system::SystemUpdateMode::UpdateRepositories);
+            }
             build::sync_manual_repo_remotes(&config, &cli);
             upstream::sync_upstream_pkgbuilds(&config, &cli);
             if !is_silent_mode() {
@@ -367,12 +374,14 @@ fn main() {
             }
         }
 
-        let mode = if cli.force_repo_update {
-            system::SystemUpdateMode::PerformUpdateNoRefresh
-        } else {
-            system::SystemUpdateMode::PerformUpdateWithRefresh
-        };
-        system::run_system_update(&config, mode);
+        if !config.build.system_update_first {
+            let mode = if cli.force_repo_update {
+                system::SystemUpdateMode::PerformUpdateNoRefresh
+            } else {
+                system::SystemUpdateMode::PerformUpdateWithRefresh
+            };
+            system::run_system_update(&config, mode);
+        }
     } else {
         let package_specs = parse_package_specs(&cli.packages);
 

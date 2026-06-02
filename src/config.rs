@@ -94,6 +94,10 @@ fn default_fast_aur_rpc_update_checks() -> bool {
     true
 }
 
+fn default_system_update_first() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BuildConfig {
     pub default_environment: String,
@@ -117,6 +121,9 @@ pub struct BuildConfig {
     pub fast_aur_rpc_update_checks: bool,
     #[serde(default)]
     pub default_compiler: Option<String>,
+    /// Perform system update before compiling packages (highly recommended to prevent broken shared libraries).
+    #[serde(default = "default_system_update_first")]
+    pub system_update_first: bool,
 
     // Optional self-update fields for backwards-compatibility/placement under [build]
     pub check_for_update_on_startup: Option<bool>,
@@ -435,6 +442,10 @@ impl Config {
             "  default_compiler: {}",
             self.build.default_compiler.as_deref().unwrap_or("(none)")
         );
+        println!(
+            "  system_update_first: {}",
+            self.build.system_update_first
+        );
 
         println!("\n{}", "System Update".green().bold());
         println!(
@@ -590,6 +601,7 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
 [packages]
 "#;
         let mut config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.build.system_update_first, true);
         assert_eq!(config.install_testing_phase_archlinux_packages, false);
         if let Some(val) = config.build.install_testing_phase_archlinux_packages {
             config.install_testing_phase_archlinux_packages = val;

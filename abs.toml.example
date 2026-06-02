@@ -34,6 +34,8 @@ concurrent_repos_downloads_limit = 10
 concurrent_compilations_limit = 1
 # Check AUR package versions using the AUR RPC API in batch
 fast_aur_rpc_update_checks = true
+# Perform system update before compiling packages (highly recommended to prevent broken shared libraries)
+system_update_first = true
 
 [system_update]
 command_to_update_repositories = "sudo pacman -Sy"
