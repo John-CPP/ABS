@@ -16,6 +16,22 @@ struct AurRpcResponse {
     results: Vec<AurRpcResult>,
 }
 
+/// Basic URL encoder for package names
+fn url_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    out
+}
+
 /// Fetch package details from AUR Web RPC API in batches
 pub fn fetch_aur_packages_info(packages: &[String]) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
@@ -28,7 +44,7 @@ pub fn fetch_aur_packages_info(packages: &[String]) -> Result<HashMap<String, St
         let mut url = "https://aur.archlinux.org/rpc/?v=5&type=info".to_string();
         for pkg in chunk {
             url.push_str("&arg[]=");
-            url.push_str(pkg);
+            url.push_str(&url_encode(pkg));
         }
 
         vlog!("AUR RPC: Querying versions for chunk: {:?}", chunk);

@@ -66,8 +66,13 @@ pub fn sort_packages_topologically(
                 // A depends on dep (dep must be built first)
                 // Graph stores reverse edges for Kahn's (dep -> packages depending on dep)
                 // Wait! Let's build standard: dep -> base (dep has base as successor)
-                if graph.get_mut(&dep).unwrap().insert(base.clone()) {
-                    *indegree.get_mut(base).unwrap() += 1;
+                let dep_edges = graph
+                    .get_mut(&dep)
+                    .expect("Internal error: target package missing from graph");
+                if dep_edges.insert(base.clone()) {
+                    *indegree
+                        .get_mut(base)
+                        .expect("Internal error: target package missing from indegree map") += 1;
                 }
             }
         }
@@ -86,7 +91,9 @@ pub fn sort_packages_topologically(
         sorted_base_names.push(node.clone());
         if let Some(neighbors) = graph.get(&node) {
             for neighbor in neighbors {
-                let deg = indegree.get_mut(neighbor).unwrap();
+                let deg = indegree
+                    .get_mut(neighbor)
+                    .expect("Internal error: package missing from indegree map");
                 *deg -= 1;
                 if *deg == 0 {
                     queue.push_back(neighbor.clone());

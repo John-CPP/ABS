@@ -17,6 +17,25 @@ fn package_name_from_file(pkg_file: &Path) -> Option<String> {
     output.split_whitespace().next().map(|s| s.to_string())
 }
 
+fn parse_pkgname_and_version(filename: &str) -> Option<(String, String)> {
+    // Standard format is: <pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>
+    // e.g. libntfs-3g-2026.2.25-1.2-x86_64.pkg.tar.zst
+    let base = if let Some(idx) = filename.find(".pkg.tar.") {
+        &filename[..idx]
+    } else {
+        return None;
+    };
+    let parts: Vec<&str> = base.split('-').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let len = parts.len();
+    let pkgrel = parts[len - 2];
+    let pkgver = parts[len - 3];
+    let pkgname = parts[..len - 3].join("-");
+    Some((pkgname, format!("{}-{}", pkgver, pkgrel)))
+}
+
 fn resolve_packagelist_line(
     line: &str,
     repo_dir: &Path,
@@ -39,7 +58,40 @@ fn resolve_packagelist_line(
     if under_repo.exists() {
         return Some(under_repo);
     }
-    p.exists().then_some(p)
+    if p.exists() {
+        return Some(p);
+    }
+
+    // Fuzzy matching fallback for bumped/modified versions (e.g. pkgrel bumped during build)
+    let filename = p.file_name()?.to_str()?;
+    let (target_name, _) = parse_pkgname_and_version(filename)?;
+
+    let mut best_match: Option<(PathBuf, String)> = None;
+    if let Ok(entries) = fs::read_dir(ready_packages_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some((name, ver)) = parse_pkgname_and_version(fname) {
+                    if name == target_name {
+                        if let Some((_, best_ver)) = &best_match {
+                            if let Ok(cmp) = crate::utils::vercmp(&ver, best_ver) {
+                                if cmp > 0 {
+                                    best_match = Some((path, ver));
+                                }
+                            }
+                        } else {
+                            best_match = Some((path, ver));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    best_match.map(|(path, _)| path)
 }
 
 /// Artifacts already in **`PKGDEST`** for this package (no `makepkg` subprocess).
@@ -80,12 +132,6 @@ fn collect_candidate_files(
     repo_dir: Option<&Path>,
     ready_packages_path: &str,
 ) -> Vec<PathBuf> {
-    let from_dest =
-        collect_candidate_files_from_pkgdest(pkg_input, base_pkg_name, ready_packages_path);
-    if !from_dest.is_empty() {
-        return from_dest;
-    }
-
     if let Some(dir) = repo_dir
         && let Ok(output) = run_command_with_output_env(
             "makepkg",
@@ -331,10 +377,56 @@ pub fn install_artifacts(
     }
 }
 
-pub fn install_from_ready_dir(
-    pkg_input: &str,
-    base_pkg_name: &str,
-    config: &Config,
-) {
-    install_artifacts(pkg_input, base_pkg_name, None, config);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_parse_pkgname_and_version() {
+        assert_eq!(
+            parse_pkgname_and_version("libntfs-3g-2026.2.25-1.2-x86_64.pkg.tar.zst"),
+            Some(("libntfs-3g".to_string(), "2026.2.25-1.2".to_string()))
+        );
+        assert_eq!(
+            parse_pkgname_and_version("ntfs-3g-2026.2.25-1-x86_64.pkg.tar.zst"),
+            Some(("ntfs-3g".to_string(), "2026.2.25-1".to_string()))
+        );
+        assert_eq!(
+            parse_pkgname_and_version("ntfsprogs-2026.2.25-1-x86_64.pkg.tar.zst"),
+            Some(("ntfsprogs".to_string(), "2026.2.25-1".to_string()))
+        );
+        assert_eq!(
+            parse_pkgname_and_version("invalid-file.pkg.tar"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_packagelist_line_fallback() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "abs_test_install_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let ready_dir = temp_dir.join("ready");
+        fs::create_dir_all(&ready_dir).unwrap();
+
+        let repo_dir = temp_dir.join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let built_file = ready_dir.join("libntfs-3g-2026.2.25-1.2-x86_64.pkg.tar.zst");
+        fs::write(&built_file, "fake package content").unwrap();
+
+        let line = "/media/storage/packages/abs/ready/libntfs-3g-2026.2.25-1-x86_64.pkg.tar.zst";
+
+        let resolved = resolve_packagelist_line(line, &repo_dir, ready_dir.to_str().unwrap());
+        assert_eq!(resolved, Some(built_file));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

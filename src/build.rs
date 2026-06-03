@@ -571,50 +571,56 @@ pub fn should_run_manual_prebuild(
     }
 }
 
-fn effective_build_env(
+struct EffectiveConfig {
+    build_env: String,
+    skip_tests: bool,
+    compiler: Option<String>,
+}
+
+fn resolve_effective_config(
     spec: &PackageSpec,
     cli: &Cli,
     config: &Config,
     pkg_config: Option<&crate::config::PackageConfig>,
-) -> String {
-    if spec.chroot_build == Some(true) {
-        return "chroot".to_string();
-    }
-    if spec.local_build == Some(true) {
-        return "local".to_string();
-    }
-    if cli.local_build {
-        return "local".to_string();
-    }
-    if cli.chroot_build {
-        return "chroot".to_string();
-    }
-    if let Some(pc) = pkg_config
+) -> EffectiveConfig {
+    let build_env = if spec.chroot_build == Some(true) {
+        "chroot".to_string()
+    } else if spec.local_build == Some(true) {
+        "local".to_string()
+    } else if cli.local_build {
+        "local".to_string()
+    } else if cli.chroot_build {
+        "chroot".to_string()
+    } else if let Some(pc) = pkg_config
         && let Some(env) = &pc.build_env
     {
-        return env.clone();
-    }
-    config.build.default_environment.clone()
-}
+        env.clone()
+    } else {
+        config.build.default_environment.clone()
+    };
 
-fn effective_skip_tests(
-    spec: &PackageSpec,
-    cli: &Cli,
-    pkg_config: Option<&crate::config::PackageConfig>,
-) -> bool {
-    if spec.no_check == Some(true) {
-        return true;
-    }
-    if cli.no_check {
-        return true;
-    }
-    if let Some(pc) = pkg_config
+    let skip_tests = if spec.no_check == Some(true) {
+        true
+    } else if cli.no_check {
+        true
+    } else if let Some(pc) = pkg_config
         && let Some(t) = pc.tests
         && !t
     {
-        return true;
+        true
+    } else {
+        false
+    };
+
+    let compiler = spec.compiler.clone()
+        .or_else(|| pkg_config.and_then(|pc| pc.compiler.clone()))
+        .or_else(|| config.build.default_compiler.clone());
+
+    EffectiveConfig {
+        build_env,
+        skip_tests,
+        compiler,
     }
-    false
 }
 
 /// Install prompts and `pacman -U` for `spec`, using `makepkg --packagelist` from the prepared repo.
@@ -677,8 +683,8 @@ fn inject_chroot_makepkg_conf(chrootdir: &Path, config: &Config) -> Result<(), S
             "sudo",
             &[
                 "cp",
-                custom_conf_path.to_str().unwrap(),
-                target_conf.to_str().unwrap(),
+                custom_conf_path.to_string_lossy().as_ref(),
+                target_conf.to_string_lossy().as_ref(),
             ],
             None::<&str>,
         )?;
@@ -698,7 +704,17 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
 
     if cli.install_only {
         blog!("Install-only mode, searching for existing artifacts...");
-        crate::install::install_from_ready_dir(pkg, base_pkg_name, config);
+        let repo_dir_path = prepare_repo(
+            pkg,
+            base_pkg_name,
+            &repo_name,
+            repo_url,
+            &config.paths.packages_path,
+            false,
+            false,
+            None,
+        );
+        crate::install::install_artifacts(pkg, base_pkg_name, Some(&repo_dir_path), config);
         return true;
     }
 
@@ -743,12 +759,10 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
     backup_pkgbuild(repo_dir);
     let _guard = PkgbuildGuard { repo_dir };
 
-    // Resolve and inject custom compiler if specified
-    let resolved_compiler = spec.compiler.as_deref()
-        .or_else(|| pkg_config.and_then(|pc| pc.compiler.as_deref()))
-        .or_else(|| config.build.default_compiler.as_deref());
+    let effective_cfg = resolve_effective_config(spec, cli, config, pkg_config);
 
-    if let Some(comp_key) = resolved_compiler {
+    // Resolve and inject custom compiler if specified
+    if let Some(comp_key) = &effective_cfg.compiler {
         if let Some(comp_cfg) = config.compilers.get(comp_key) {
             blog!("Compiling with custom compiler '{}': cc={} cxx={}", comp_key, comp_cfg.cc, comp_cfg.cxx);
             if let Err(e) = inject_compiler_env(repo_dir, &comp_cfg.cc, &comp_cfg.cxx) {
@@ -804,8 +818,8 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
         base_pkg_name,
     );
 
-    let build_env = effective_build_env(spec, cli, config, pkg_config);
-    let skip_tests = effective_skip_tests(spec, cli, pkg_config);
+    let build_env = effective_cfg.build_env.clone();
+    let skip_tests = effective_cfg.skip_tests;
 
     let mut custom_cmd = None;
     if let Some(pc) = pkg_config {

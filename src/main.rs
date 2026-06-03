@@ -149,6 +149,45 @@ fn run_full_cleaning(config: &config::Config) {
     blog!("Full cleaning completed.");
 }
 
+fn refresh_repositories(config: &config::Config, cli: &cli::Cli, run_system_repo_update: bool) {
+    if run_system_repo_update {
+        system::run_system_update(config, system::SystemUpdateMode::UpdateRepositories);
+    }
+    build::sync_manual_repo_remotes(config, cli);
+    upstream::sync_upstream_pkgbuilds(config, cli);
+    if !is_silent_mode() {
+        println!();
+    }
+    build::report_manual_update_versions(config, cli);
+}
+
+fn run_deferred_install_phase(
+    specs: &[package_spec::PackageSpec],
+    skipped_installs: &HashSet<String>,
+    cli: &cli::Cli,
+    config: &config::Config,
+    sort_topologically: bool,
+) {
+    vlog!("Install phase (compile-first: all scheduled builds finished)...");
+    if sort_topologically {
+        if let Ok(sorted) = dep_graph::sort_packages_topologically(specs, cli, config) {
+            for spec in &sorted {
+                if skipped_installs.contains(&spec.name) {
+                    continue;
+                }
+                build::install_package_phase(spec, cli, config);
+            }
+            return;
+        }
+    }
+    for spec in specs {
+        if skipped_installs.contains(&spec.name) {
+            continue;
+        }
+        build::install_package_phase(spec, cli, config);
+    }
+}
+
 #[macro_export]
 macro_rules! die {
     ($($arg:tt)*) => {{
@@ -289,13 +328,7 @@ fn main() {
     // `-R` without `-U`: sync all manual repos, report PKGBUILD vs installed, then `command` (not refresh).
         if cli.force_repo_update && !cli.system_update && cli.packages.is_empty() {
             blog!("Repository refresh (manual_update_packages) and system update...");
-            system::run_system_update(&config, system::SystemUpdateMode::UpdateRepositories);
-            build::sync_manual_repo_remotes(&config, &cli);
-            upstream::sync_upstream_pkgbuilds(&config, &cli);
-            if !is_silent_mode() {
-                println!();
-            }
-            build::report_manual_update_versions(&config, &cli);
+            refresh_repositories(&config, &cli, true);
             return;
         }
 
@@ -332,15 +365,7 @@ fn main() {
 
         if cli.force_repo_update {
             blog!("Refreshing git remotes for manual_update_packages (-R)...");
-            if !config.build.system_update_first {
-                system::run_system_update(&config, system::SystemUpdateMode::UpdateRepositories);
-            }
-            build::sync_manual_repo_remotes(&config, &cli);
-            upstream::sync_upstream_pkgbuilds(&config, &cli);
-            if !is_silent_mode() {
-                println!();
-            }
-            build::report_manual_update_versions(&config, &cli);
+            refresh_repositories(&config, &cli, !config.build.system_update_first);
         }
 
         let mut system_specs = Vec::new();
@@ -353,25 +378,10 @@ fn main() {
             }
         }
 
-        let skipped_install_after_compile_fail = run_compilations(system_specs, &cli, &config, defer_install_pass);
+        let skipped_install_after_compile_fail = run_compilations(system_specs.clone(), &cli, &config, defer_install_pass);
 
         if defer_install_pass {
-            vlog!("Install phase (compile-first: all scheduled builds finished)...");
-            for pkg in &config.manual_update_packages {
-                if cli_package_names.contains(pkg) {
-                    continue;
-                }
-                if skipped_install_after_compile_fail.contains(pkg) {
-                    continue;
-                }
-                if build::should_run_manual_prebuild(pkg, &cli, &config) {
-                    build::install_package_phase(
-                        &package_spec::PackageSpec::plain(pkg),
-                        &cli,
-                        &config,
-                    );
-                }
-            }
+            run_deferred_install_phase(&system_specs, &skipped_install_after_compile_fail, &cli, &config, false);
         }
 
         if !config.build.system_update_first {
@@ -389,32 +399,10 @@ fn main() {
             die!("No packages specified.");
         }
 
-        let skipped_install_after_compile_fail = run_compilations(package_specs, &cli, &config, defer_install_pass);
+        let skipped_install_after_compile_fail = run_compilations(package_specs.clone(), &cli, &config, defer_install_pass);
 
         if defer_install_pass {
-            vlog!("Install phase (compile-first: all scheduled builds finished)...");
-            let mut base_to_spec = std::collections::HashMap::new();
-            for spec in parse_package_specs(&cli.packages) {
-                let (_, _, base) = build::resolve_pkg_repo_for_manual(&spec.name, &cli, &config);
-                base_to_spec.insert(base, spec);
-            }
-            
-            // Re-sort the install phase using the same order
-            if let Ok(sorted) = dep_graph::sort_packages_topologically(&parse_package_specs(&cli.packages), &cli, &config) {
-                for spec in &sorted {
-                    if skipped_install_after_compile_fail.contains(&spec.name) {
-                        continue;
-                    }
-                    build::install_package_phase(spec, &cli, &config);
-                }
-            } else {
-                for spec in parse_package_specs(&cli.packages) {
-                    if skipped_install_after_compile_fail.contains(&spec.name) {
-                        continue;
-                    }
-                    build::install_package_phase(&spec, &cli, &config);
-                }
-            }
+            run_deferred_install_phase(&package_specs, &skipped_install_after_compile_fail, &cli, &config, true);
         }
     }
 

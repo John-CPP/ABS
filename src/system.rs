@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::utils::run_command;
+use crate::utils::{run_command, sh_single_quote};
 use crate::{die, vlog};
 use colored::Colorize;
 use std::collections::HashSet;
@@ -61,7 +61,7 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) {
         .chain(config.manual_update_packages.iter())
     {
         if seen.insert(pkg.clone()) {
-            cmd_str.push_str(&format!(" {} {}", config.system_update.ignore_flag, pkg));
+            cmd_str.push_str(&format!(" {} {}", config.system_update.ignore_flag, sh_single_quote(pkg)));
         }
     }
 
