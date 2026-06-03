@@ -393,6 +393,25 @@ impl Config {
                 }
             }
         }
+        for (key, path) in [
+            ("paths.packages_path", self.paths.packages_path.as_str()),
+            ("paths.chroot_base_path", self.paths.chroot_base_path.as_str()),
+            (
+                "paths.ready_made_packages_path",
+                self.paths.ready_made_packages_path.as_str(),
+            ),
+        ] {
+            if let Err(e) = crate::utils::validate_config_path(key, path) {
+                die!("{}", e);
+            }
+        }
+        if let Err(e) = crate::utils::init_deletable_roots(
+            &self.paths.packages_path,
+            &self.paths.chroot_base_path,
+            &self.paths.ready_made_packages_path,
+        ) {
+            die!("{}", e);
+        }
     }
 
     pub fn print_human_readable(&self) {
@@ -601,12 +620,12 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
 [packages]
 "#;
         let mut config: Config = toml::from_str(toml_content).unwrap();
-        assert_eq!(config.build.system_update_first, true);
-        assert_eq!(config.install_testing_phase_archlinux_packages, false);
+        assert!(config.build.system_update_first);
+        assert!(!config.install_testing_phase_archlinux_packages);
         if let Some(val) = config.build.install_testing_phase_archlinux_packages {
             config.install_testing_phase_archlinux_packages = val;
         }
-        assert_eq!(config.install_testing_phase_archlinux_packages, true);
+        assert!(config.install_testing_phase_archlinux_packages);
     }
 
     #[test]

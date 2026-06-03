@@ -44,8 +44,9 @@ fn replace_all_pkgrel_lines(content: &str, next: &str) -> String {
 pub fn replace_pkgbuild_field(content: &str, key: &str, value: &str) -> String {
     let replace_re = Regex::new(&format!(r"(?m)^{}=.*$", regex::escape(key))).unwrap();
     if replace_re.is_match(content) {
+        let replacement = format!("{key}={value}");
         replace_re
-            .replace_all(content, format!("{key}={value}"))
+            .replace_all(content, regex::NoExpand(&replacement))
             .to_string()
     } else {
         let mut out = content.to_string();
@@ -223,7 +224,7 @@ pub fn update_pkgsums(repo_dir: &Path) -> bool {
 
 fn extract_base_package_name(dep: &str) -> String {
     let dep = dep.trim();
-    let cleaned = dep.split(|c| c == '<' || c == '>' || c == '=' || c == ':').next().unwrap_or(dep).trim();
+    let cleaned = dep.split(['<', '>', '=', ':']).next().unwrap_or(dep).trim();
     cleaned.to_string()
 }
 
@@ -276,6 +277,13 @@ pub fn parse_pkg_dependencies(pkg_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn replace_pkgbuild_field_preserves_dollar_signs() {
+        let content = "pkgver=1.0\n";
+        let out = replace_pkgbuild_field(content, "pkgver", "foo$bar");
+        assert_eq!(out, "pkgver=foo$bar\n");
+    }
 
     #[test]
     fn test_inject_compiler_env() {

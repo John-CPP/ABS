@@ -1,6 +1,7 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 pub fn sh_single_quote(s: &str) -> String {
     let mut out = String::from('\'');
@@ -45,7 +46,7 @@ fn format_command_error(
 
 fn is_readonly_command(cmd: &str, args: &[&str]) -> bool {
     if cmd == "pacman" {
-        return args.get(0).map_or(false, |a| *a == "-Q" || *a == "--query");
+        return args.first().is_some_and(|a| *a == "-Q" || *a == "--query");
     }
     if cmd == "vercmp" {
         return true;
@@ -56,19 +57,135 @@ fn is_readonly_command(cmd: &str, args: &[&str]) -> bool {
     if cmd == "bsdtar" {
         return args.contains(&"-xOf") || args.contains(&"-xO");
     }
-    if cmd == "bash" {
-        if args.contains(&"-c") {
-            if let Some(script) = args.last() {
-                if script.contains("source PKGBUILD") && script.contains("pkgver") {
+    if cmd == "bash"
+        && args.contains(&"-c")
+            && let Some(script) = args.last()
+                && script.contains("source PKGBUILD") && script.contains("pkgver") {
                     return true;
                 }
-            }
-        }
-    }
     if cmd == "curl" {
         return true;
     }
     false
+}
+
+/// System paths that must never appear as a configured ABS root or sudo deletion target.
+const BLOCKED_DELETION_ROOTS: &[&str] = &[
+    "/", "/usr", "/etc", "/bin", "/sbin", "/home", "/root", "/var", "/lib", "/lib64", "/opt",
+    "/srv", "/boot", "/proc", "/sys", "/dev", "/run",
+];
+
+static DELETABLE_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+fn deletable_roots() -> &'static Mutex<Vec<PathBuf>> {
+    DELETABLE_ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn path_components(path: &Path) -> Vec<Component<'_>> {
+    path.components().collect()
+}
+
+/// True when `path` equals `prefix` or is a child of `prefix` (avoids `/foo` matching `/foobar`).
+pub fn path_has_prefix(prefix: &Path, path: &Path) -> bool {
+    let prefix = path_components(prefix);
+    let path = path_components(path);
+    if path.len() < prefix.len() {
+        return false;
+    }
+    path[..prefix.len()] == prefix[..]
+}
+
+fn is_blocked_deletion_root(path: &Path) -> bool {
+    BLOCKED_DELETION_ROOTS
+        .iter()
+        .any(|blocked| path == Path::new(blocked))
+}
+
+/// Resolve a path for containment checks: canonicalize when it exists, otherwise normalize to absolute.
+pub fn resolve_path_for_deletion(path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err("empty path".into());
+    }
+    if path.is_relative() {
+        return Err(format!(
+            "path must be absolute for deletion checks: {}",
+            path.display()
+        ));
+    }
+    if path.exists() {
+        fs::canonicalize(path).map_err(|e| {
+            format!("failed to canonicalize {} for deletion check: {}", path.display(), e)
+        })
+    } else {
+        std::path::absolute(path).map_err(|e| {
+            format!("failed to resolve absolute path {}: {}", path.display(), e)
+        })
+    }
+}
+
+/// Validate a configured `[paths]` entry before ABS uses it for destructive operations.
+pub fn validate_config_path(key: &str, path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{key} cannot be empty"));
+    }
+    let resolved = resolve_path_for_deletion(Path::new(trimmed))?;
+    if is_blocked_deletion_root(&resolved) {
+        return Err(format!(
+            "{key} must not point at a system directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Register canonical ABS-managed roots; all sudo removals must stay inside one of them.
+pub fn init_deletable_roots(
+    packages_path: &str,
+    chroot_base_path: &str,
+    ready_made_packages_path: &str,
+) -> Result<(), String> {
+    let roots = [packages_path, chroot_base_path, ready_made_packages_path];
+    let mut canonical = Vec::with_capacity(roots.len());
+    for path in roots {
+        let resolved = resolve_path_for_deletion(Path::new(path))?;
+        if is_blocked_deletion_root(&resolved) {
+            return Err(format!(
+                "refusing to register system directory as deletable root: {}",
+                resolved.display()
+            ));
+        }
+        canonical.push(resolved);
+    }
+    *deletable_roots().lock().unwrap() = canonical;
+    Ok(())
+}
+
+/// Refuse sudo deletion unless `path` resolves inside a registered ABS root (follows symlinks).
+pub fn validate_deletable_path(path: &Path) -> Result<(), String> {
+    let resolved = resolve_path_for_deletion(path)?;
+    if is_blocked_deletion_root(&resolved) {
+        return Err(format!(
+            "refusing to delete system path: {}",
+            resolved.display()
+        ));
+    }
+
+    let roots = deletable_roots().lock().unwrap();
+    if roots.is_empty() {
+        return Err(
+            "deletable path roots are not initialized (internal error)".into(),
+        );
+    }
+    if roots.iter().any(|root| path_has_prefix(root, &resolved)) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "refusing to delete path outside ABS-managed directories: {} (resolves to {})",
+        path.display(),
+        resolved.display()
+    ))
 }
 
 pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> Result<(), String> {
@@ -259,7 +376,20 @@ pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
         if !name.ends_with(".pkg.tar.zst") || !name.starts_with(&prefix) {
             continue;
         }
-        if fs::remove_file(&path).is_err() {
+        if let Err(e) = validate_deletable_path(&path) {
+            eprintln!(
+                "==> WARNING: Skipping stale package removal for {}: {}",
+                path.display(),
+                e
+            );
+            continue;
+        }
+        let removed = if crate::force_sudo_clean() {
+            false
+        } else {
+            fs::remove_file(&path).is_ok()
+        };
+        if !removed {
             let _ = run_command(
                 "sudo",
                 &["rm", "-f", path.to_string_lossy().as_ref()],
@@ -379,15 +509,17 @@ pub fn check_sudo_removal<P: AsRef<Path>>(path: P) -> Result<(), String> {
         return Ok(());
     }
 
-    // Try standard remove first
-    if std::fs::remove_dir_all(p).is_err() {
-        // If it fails, likely due to root permissions, try sudo
-        run_command(
-            "sudo",
-            &["rm", "-rf", p.to_string_lossy().as_ref()],
-            None::<&str>,
-        )?;
+    validate_deletable_path(p)?;
+
+    if !crate::force_sudo_clean() && std::fs::remove_dir_all(p).is_ok() {
+        return Ok(());
     }
+
+    run_command(
+        "sudo",
+        &["rm", "-rf", p.to_string_lossy().as_ref()],
+        None::<&str>,
+    )?;
 
     Ok(())
 }
@@ -485,7 +617,7 @@ pub fn pacman_query_version(pkg: &str) -> Result<Option<String>, String> {
     if crate::is_dry_run_mode() {
         return Err("dry-run".into());
     }
-    match run_command_with_output("pacman", &["-Q", "--noconfirm", pkg], None::<&str>) {
+    match run_command_with_output("pacman", &["-Q", pkg], None::<&str>) {
         Ok(out) => {
             let line = out.lines().next().unwrap_or("").trim();
             let version = line
@@ -560,7 +692,7 @@ pub fn pacman_sync_version(pkg: &str) -> Result<Option<String>, String> {
     if crate::is_dry_run_mode() {
         return Err("dry-run".into());
     }
-    match run_command_with_output("pacman", &["-Si", "--noconfirm", pkg], None::<&str>) {
+    match run_command_with_output("pacman", &["-Si", pkg], None::<&str>) {
         Ok(out) => Ok(parse_pacman_si_output(&out)),
         Err(_) => Ok(None),
     }
@@ -614,5 +746,107 @@ Name            : systemd
 Version         : 260.1-3
 ";
         assert_eq!(parse_pacman_si_output(sample_with_staging), Some("260.1-3".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn path_has_prefix_does_not_match_partial_directory_name() {
+        assert!(!path_has_prefix(
+            Path::new("/foo"),
+            Path::new("/foobar/baz")
+        ));
+        assert!(path_has_prefix(
+            Path::new("/foo"),
+            Path::new("/foo/bar")
+        ));
+        assert!(path_has_prefix(
+            Path::new("/foo/bar"),
+            Path::new("/foo/bar")
+        ));
+    }
+
+    #[test]
+    fn validate_deletable_path_rejects_outside_registered_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "abs_path_safety_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let packages = base.join("packages");
+        let chroot = base.join("chroot");
+        let ready = base.join("ready");
+        fs::create_dir_all(&packages).unwrap();
+        fs::create_dir_all(&chroot).unwrap();
+        fs::create_dir_all(&ready).unwrap();
+
+        init_deletable_roots(
+            packages.to_str().unwrap(),
+            chroot.to_str().unwrap(),
+            ready.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let inside = packages.join("aur").join("foo");
+        fs::create_dir_all(&inside).unwrap();
+        validate_deletable_path(&inside).unwrap();
+
+        let outside = std::env::temp_dir().join(format!(
+            "abs_outside_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        assert!(validate_deletable_path(&outside).is_err());
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn validate_deletable_path_rejects_symlink_escape() {
+        let base = std::env::temp_dir().join(format!(
+            "abs_symlink_safety_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let packages = base.join("packages");
+        let chroot = base.join("chroot");
+        let ready = base.join("ready");
+        let outside = base.join("outside");
+        fs::create_dir_all(&packages).unwrap();
+        fs::create_dir_all(&chroot).unwrap();
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        init_deletable_roots(
+            packages.to_str().unwrap(),
+            chroot.to_str().unwrap(),
+            ready.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let trap = packages.join("trap");
+        symlink(&outside, &trap).unwrap();
+        assert!(validate_deletable_path(&trap).is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_config_path_rejects_system_root() {
+        assert!(validate_config_path("paths.packages_path", "/").is_err());
+        assert!(validate_config_path("paths.packages_path", "/usr").is_err());
     }
 }

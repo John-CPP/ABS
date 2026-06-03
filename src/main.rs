@@ -34,6 +34,7 @@ pub enum Verbosity {
 
 static VERBOSITY: AtomicU8 = AtomicU8::new(Verbosity::Normal as u8);
 static DRY_RUN_MODE: AtomicBool = AtomicBool::new(false);
+static FORCE_SUDO_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub fn set_verbosity(v: Verbosity) {
     VERBOSITY.store(v as u8, Ordering::Relaxed);
@@ -62,6 +63,14 @@ pub fn set_dry_run_mode(value: bool) {
 
 pub fn is_dry_run_mode() -> bool {
     DRY_RUN_MODE.load(Ordering::Relaxed)
+}
+
+pub fn set_force_sudo_clean(value: bool) {
+    FORCE_SUDO_CLEAN.store(value, Ordering::Relaxed);
+}
+
+pub fn force_sudo_clean() -> bool {
+    FORCE_SUDO_CLEAN.load(Ordering::Relaxed)
 }
 
 fn install_all_keys() {
@@ -169,8 +178,8 @@ fn run_deferred_install_phase(
     sort_topologically: bool,
 ) {
     vlog!("Install phase (compile-first: all scheduled builds finished)...");
-    if sort_topologically {
-        if let Ok(sorted) = dep_graph::sort_packages_topologically(specs, cli, config) {
+    if sort_topologically
+        && let Ok(sorted) = dep_graph::sort_packages_topologically(specs, cli, config) {
             for spec in &sorted {
                 if skipped_installs.contains(&spec.name) {
                     continue;
@@ -179,7 +188,6 @@ fn run_deferred_install_phase(
             }
             return;
         }
-    }
     for spec in specs {
         if skipped_installs.contains(&spec.name) {
             continue;
@@ -232,6 +240,7 @@ fn main() {
     };
     set_verbosity(v);
     set_dry_run_mode(cli.dry_run);
+    set_force_sudo_clean(cli.use_sudo_clean);
 
     if cli.configure.is_some() {
         config::Config::open_in_editor(cli.configure.as_deref().filter(|s| !s.is_empty()));
@@ -280,11 +289,10 @@ fn main() {
     let skip_background = config.auto_update_on_startup || (config.self_update_at_updates && cli.system_update);
     if config.check_for_update_on_startup && !skip_background {
         std::thread::spawn(move || {
-            if let Ok((true, latest)) = self_update::check_for_update(&raw_url) {
-                if let Ok(mut guard) = update_notifier_clone.lock() {
+            if let Ok((true, latest)) = self_update::check_for_update(&raw_url)
+                && let Ok(mut guard) = update_notifier_clone.lock() {
                     *guard = Some(latest);
                 }
-            }
         });
     }
 
@@ -406,8 +414,8 @@ fn main() {
         }
     }
 
-    if let Ok(guard) = update_notifier.lock() {
-        if let Some(latest) = &*guard {
+    if let Ok(guard) = update_notifier.lock()
+        && let Some(latest) = &*guard {
             println!(
                 "{} A new version of ABS is available: {} (current: {}). Run 'abs --self-update' to update!",
                 "==>".yellow(),
@@ -415,7 +423,6 @@ fn main() {
                 env!("CARGO_PKG_VERSION").yellow()
             );
         }
-    }
 }
 
 fn run_compilations(
@@ -445,7 +452,7 @@ fn run_compilations(
     if concurrency_limit <= 1 || !defer_install_pass {
         for spec in &sorted_specs {
             blog!("Processing package: {}", spec.name);
-            if !build::process_package(spec, cli, config, defer_install_pass) {
+            if !build::process_package(spec, cli, config, defer_install_pass, None) {
                 skipped_install.insert(spec.name.clone());
             }
         }
@@ -558,7 +565,8 @@ fn run_compilations(
                         let spec = spec_map.get(&base_name).unwrap();
                         blog!("Processing package [Worker {}]: {}", worker_id, spec.name);
 
-                        let success = build::process_package(spec, cli, config, true);
+                        let chroot_copy = format!("abs-worker-{}", worker_id);
+                        let success = build::process_package(spec, cli, config, true, Some(&chroot_copy));
 
                         {
                             let mut guard = state.lock().unwrap();

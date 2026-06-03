@@ -73,21 +73,18 @@ fn resolve_packagelist_line(
             if !path.is_file() {
                 continue;
             }
-            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some((name, ver)) = parse_pkgname_and_version(fname) {
-                    if name == target_name {
+            if let Some(fname) = path.file_name().and_then(|n| n.to_str())
+                && let Some((name, ver)) = parse_pkgname_and_version(fname)
+                    && name == target_name {
                         if let Some((_, best_ver)) = &best_match {
-                            if let Ok(cmp) = crate::utils::vercmp(&ver, best_ver) {
-                                if cmp > 0 {
+                            if let Ok(cmp) = crate::utils::vercmp(&ver, best_ver)
+                                && cmp > 0 {
                                     best_match = Some((path, ver));
                                 }
-                            }
                         } else {
                             best_match = Some((path, ver));
                         }
                     }
-                }
-            }
         }
     }
 

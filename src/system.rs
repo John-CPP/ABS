@@ -12,13 +12,11 @@ pub enum SystemUpdateMode {
 }
 
 fn is_root() -> bool {
-    if let Ok(output) = std::process::Command::new("id").arg("-u").output() {
-        if let Ok(uid_str) = std::str::from_utf8(&output.stdout) {
-            if let Ok(uid) = uid_str.trim().parse::<u32>() {
+    if let Ok(output) = std::process::Command::new("id").arg("-u").output()
+        && let Ok(uid_str) = std::str::from_utf8(&output.stdout)
+            && let Ok(uid) = uid_str.trim().parse::<u32>() {
                 return uid == 0;
             }
-        }
-    }
     if let Ok(user) = std::env::var("USER") {
         return user == "root";
     }

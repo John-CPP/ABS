@@ -274,14 +274,12 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
     if !config.install_testing_phase_archlinux_packages
         && (repo_name == "arch" || repo_name == "cachyos")
-    {
-        if let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
+        && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
             let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
                 return Ok(true);
             };
             return Ok(vercmp(&sync_ver, &inst_ver)? > 0);
         }
-    }
     let repo_url = repo_url_string.as_str();
     // Callers that pass `-R` with `-U` run `sync_manual_repo_remotes` first; only read the tree here.
     let pkg_dir = prepare_repo(
@@ -327,9 +325,9 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                 Ok(versions) => {
                     for pkg in &aur_packages {
                         let (_, _, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
-                        if let Some(remote_ver) = versions.get(pkg) {
-                            if let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg) {
-                                if let Ok(c) = vercmp(remote_ver, &inst_ver) {
+                        if let Some(remote_ver) = versions.get(pkg)
+                            && let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg)
+                                && let Ok(c) = vercmp(remote_ver, &inst_ver) {
                                     if c <= 0 {
                                         vlog!("AUR RPC: {} is up-to-date (remote: {}, installed: {}). Skipping git pull.", pkg, remote_ver, inst_ver);
                                         mark_aur_package_up_to_date(pkg);
@@ -337,8 +335,6 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                                         vlog!("AUR RPC: {} requires update (remote: {}, installed: {}).", pkg, remote_ver, inst_ver);
                                     }
                                 }
-                            }
-                        }
                     }
                 }
                 Err(e) => {
@@ -351,10 +347,10 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
     if !config.install_testing_phase_archlinux_packages {
         for pkg in &config.manual_update_packages {
             let (repo_name, _, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
-            if repo_name == "arch" || repo_name == "cachyos" {
-                if let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
-                    if let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg) {
-                        if let Ok(c) = vercmp(&sync_ver, &inst_ver) {
+            if (repo_name == "arch" || repo_name == "cachyos")
+                && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg)
+                    && let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg)
+                        && let Ok(c) = vercmp(&sync_ver, &inst_ver) {
                             if c <= 0 {
                                 vlog!(
                                     "Stable Repo Check: {} is up-to-date in stable (sync: {}, installed: {}). Skipping git pull.",
@@ -372,9 +368,6 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                                 );
                             }
                         }
-                    }
-                }
-            }
         }
     }
 
@@ -460,15 +453,13 @@ fn classify_manual_pkg_version(
     pkgbuild_cache: &mut PkgbuildDirCache,
 ) -> Result<ManualPkgVersionLine, String> {
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
-    if is_aur_package_up_to_date(pkg) || is_stable_package_up_to_date(pkg) {
-        if let Ok(Some(inst)) = pacman_query_version(&base_pkg) {
+    if (is_aur_package_up_to_date(pkg) || is_stable_package_up_to_date(pkg))
+        && let Ok(Some(inst)) = pacman_query_version(&base_pkg) {
             return Ok(ManualPkgVersionLine::UpToDate { current: inst });
         }
-    }
     if !config.install_testing_phase_archlinux_packages
         && (repo_name == "arch" || repo_name == "cachyos")
-    {
-        if let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
+        && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
             let inst = pacman_query_version(&base_pkg)?;
             let Some(inst_ver) = inst else {
                 return Ok(ManualPkgVersionLine::Upgrade {
@@ -485,7 +476,6 @@ fn classify_manual_pkg_version(
                 return Ok(ManualPkgVersionLine::UpToDate { current: inst_ver });
             }
         }
-    }
     let pkg_dir = prepare_repo(
         pkg,
         &base_pkg,
@@ -585,9 +575,7 @@ fn resolve_effective_config(
 ) -> EffectiveConfig {
     let build_env = if spec.chroot_build == Some(true) {
         "chroot".to_string()
-    } else if spec.local_build == Some(true) {
-        "local".to_string()
-    } else if cli.local_build {
+    } else if spec.local_build == Some(true) || cli.local_build {
         "local".to_string()
     } else if cli.chroot_build {
         "chroot".to_string()
@@ -599,18 +587,9 @@ fn resolve_effective_config(
         config.build.default_environment.clone()
     };
 
-    let skip_tests = if spec.no_check == Some(true) {
-        true
-    } else if cli.no_check {
-        true
-    } else if let Some(pc) = pkg_config
-        && let Some(t) = pc.tests
-        && !t
-    {
-        true
-    } else {
-        false
-    };
+    let skip_tests = spec.no_check == Some(true)
+        || cli.no_check
+        || pkg_config.is_some_and(|pc| pc.tests.is_some_and(|t| !t));
 
     let compiler = spec.compiler.clone()
         .or_else(|| pkg_config.and_then(|pc| pc.compiler.clone()))
@@ -694,8 +673,18 @@ fn inject_chroot_makepkg_conf(chrootdir: &Path, config: &Config) -> Result<(), S
 
 /// `defer_install`: when true (compile-first mode), build only; caller runs [`install_package_phase`] later.
 ///
+/// `chroot_copy`: when set, names the per-build `makechrootpkg` working copy (`-l`). Parallel
+/// compilations **must** pass a unique name per worker, otherwise concurrent builds race on the
+/// default `<chrootdir>/$USER` copy and corrupt each other.
+///
 /// Returns **`false`** if the build failed and **`ignore_compilation_failures`** is set (caller continues).
-pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_install: bool) -> bool {
+pub fn process_package(
+    spec: &PackageSpec,
+    cli: &Cli,
+    config: &Config,
+    defer_install: bool,
+    chroot_copy: Option<&str>,
+) -> bool {
     let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
@@ -881,6 +870,11 @@ pub fn process_package(spec: &PackageSpec, cli: &Cli, config: &Config, defer_ins
             chrootdir.to_string_lossy(),
             repo_dir.to_string_lossy()
         );
+        // Give each concurrent build its own chroot working copy so parallel `makechrootpkg`
+        // invocations do not clobber the shared default `<chrootdir>/$USER` copy.
+        if let Some(copy) = chroot_copy {
+            build_cmd.push_str(&format!(" -l \"{}\"", copy));
+        }
         if skip_tests {
             build_cmd.push_str(" -- --nocheck");
         }

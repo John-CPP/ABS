@@ -126,7 +126,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         None::<&str>,
     );
 
-    if let Err(_) = install_res {
+    if install_res.is_err() {
         vlog!("Standard install failed. Retrying with sudo...");
         run_command(
             "sudo",
