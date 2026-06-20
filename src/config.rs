@@ -15,7 +15,12 @@ pub struct Config {
     pub system_update: SystemUpdateConfig,
     pub repositories: HashMap<String, String>,
     pub manual_update_packages: Vec<String>,
+    /// Packages excluded from system update commands (repo binaries).
     pub skip_install_packages: Vec<String>,
+    /// Packages excluded from `pacman -U` after manual compilation. When unset, falls back to
+    /// `skip_install_packages` for backward compatibility with older configs.
+    #[serde(default)]
+    pub skip_install_packages_after_compilation: Option<Vec<String>>,
     pub packages: HashMap<String, PackageConfig>,
     #[serde(default = "default_check_for_update_on_startup")]
     pub check_for_update_on_startup: bool,
@@ -33,6 +38,8 @@ pub struct Config {
     pub install_testing_phase_archlinux_packages: bool,
     #[serde(default)]
     pub compilers: HashMap<String, CompilerConfig>,
+    #[serde(default)]
+    pub ramdisk: RamdiskConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -73,6 +80,91 @@ fn default_self_update_raw_url() -> String {
     "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml".to_string()
 }
 
+fn default_ramdisk_enabled() -> bool {
+    false
+}
+
+fn default_ramdisk_mount_point() -> String {
+    "/run/abs-ram".to_string()
+}
+
+fn default_ramdisk_size() -> String {
+    "16G".to_string()
+}
+
+fn default_ramdisk_mode() -> String {
+    "0755".to_string()
+}
+
+fn default_ramdisk_build_workdir() -> bool {
+    false
+}
+
+fn default_ramdisk_chroot() -> bool {
+    false
+}
+
+fn default_ramdisk_min_free_ram_mb() -> u64 {
+    4096
+}
+
+fn default_ramdisk_warn_packages_ram() -> bool {
+    true
+}
+
+fn default_ramdisk_reclaim_mount_on_startup() -> bool {
+    true
+}
+
+/// Optional tmpfs/ramdisk for chroot rootfs and per-package build workdirs (`src/`, `pkg/`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RamdiskConfig {
+    #[serde(default = "default_ramdisk_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ramdisk_mount_point")]
+    pub mount_point: String,
+    #[serde(default = "default_ramdisk_size")]
+    pub size: String,
+    #[serde(default = "default_ramdisk_mode")]
+    pub mode: String,
+    #[serde(default = "default_ramdisk_build_workdir")]
+    pub build_workdir: bool,
+    #[serde(default = "default_ramdisk_chroot")]
+    pub chroot: bool,
+    #[serde(default)]
+    pub packages: bool,
+    #[serde(default)]
+    pub seed_chroot_from: Option<String>,
+    #[serde(default)]
+    pub sync_chroot_on_exit: bool,
+    #[serde(default = "default_ramdisk_min_free_ram_mb")]
+    pub min_free_ram_mb: u64,
+    #[serde(default = "default_ramdisk_warn_packages_ram")]
+    pub warn_packages_ram: bool,
+    /// Unmount `mount_point` before mounting when it is already mounted (e.g. after a crashed ABS run).
+    #[serde(default = "default_ramdisk_reclaim_mount_on_startup")]
+    pub reclaim_mount_on_startup: bool,
+}
+
+impl Default for RamdiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ramdisk_enabled(),
+            mount_point: default_ramdisk_mount_point(),
+            size: default_ramdisk_size(),
+            mode: default_ramdisk_mode(),
+            build_workdir: default_ramdisk_build_workdir(),
+            chroot: default_ramdisk_chroot(),
+            packages: false,
+            seed_chroot_from: None,
+            sync_chroot_on_exit: false,
+            min_free_ram_mb: default_ramdisk_min_free_ram_mb(),
+            warn_packages_ram: default_ramdisk_warn_packages_ram(),
+            reclaim_mount_on_startup: default_ramdisk_reclaim_mount_on_startup(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PathsConfig {
     pub packages_path: String,
@@ -95,6 +187,10 @@ fn default_fast_aur_rpc_update_checks() -> bool {
 }
 
 fn default_system_update_first() -> bool {
+    true
+}
+
+fn default_clean_chroot_after_compilation() -> bool {
     true
 }
 
@@ -124,6 +220,10 @@ pub struct BuildConfig {
     /// Perform system update before compiling packages (highly recommended to prevent broken shared libraries).
     #[serde(default = "default_system_update_first")]
     pub system_update_first: bool,
+    /// After each chroot (`makechrootpkg`) build, remove the per-build working copy and reset the
+    /// devtools chroot when no other chroot build is running (avoids unbounded chroot growth).
+    #[serde(default = "default_clean_chroot_after_compilation")]
+    pub clean_chroot_after_compilation: bool,
 
     // Optional self-update fields for backwards-compatibility/placement under [build]
     pub check_for_update_on_startup: Option<bool>,
@@ -187,6 +287,9 @@ pub struct PackageConfig {
     #[serde(default)]
     pub upstream_prereleases: bool,
     pub compiler: Option<String>,
+    /// Per-package ramdisk targets: `w` = build workdir, `c` = chroot, `p` = packages (e.g. `"wcp"`).
+    #[serde(default)]
+    pub ramdisk: Option<String>,
 }
 
 const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
@@ -270,6 +373,13 @@ fn run_editor(editor: &str, path: &Path) {
 }
 
 impl Config {
+    /// Packages to skip when offering `pacman -U` after a manual build.
+    pub fn skip_install_after_compilation(&self) -> &[String] {
+        self.skip_install_packages_after_compilation
+            .as_ref()
+            .unwrap_or(&self.skip_install_packages)
+    }
+
     pub fn open_in_editor(editor: Option<&str>) {
         use std::io::{self, Write};
         let path = ensure_user_config_exists();
@@ -392,6 +502,11 @@ impl Config {
                     );
                 }
             }
+            if let Some(code) = &pkg.ramdisk
+                && let Err(e) = crate::ramdisk::parse_ramdisk_targets(code)
+            {
+                die!("Invalid ramdisk for package {:?}: {}", pkg_name, e);
+            }
         }
         for (key, path) in [
             ("paths.packages_path", self.paths.packages_path.as_str()),
@@ -405,10 +520,32 @@ impl Config {
                 die!("{}", e);
             }
         }
+        if self.ramdisk.enabled {
+            if let Err(e) = crate::utils::validate_config_path(
+                "ramdisk.mount_point",
+                self.ramdisk.mount_point.as_str(),
+            ) {
+                die!("{}", e);
+            }
+            if self.ramdisk.size.trim().is_empty() {
+                die!("ramdisk.size cannot be empty when [ramdisk] is enabled");
+            }
+            if let Some(seed) = &self.ramdisk.seed_chroot_from {
+                if seed.trim().is_empty() {
+                    die!("ramdisk.seed_chroot_from cannot be empty when set");
+                }
+                if let Err(e) =
+                    crate::utils::validate_config_path("ramdisk.seed_chroot_from", seed.as_str())
+                {
+                    die!("{}", e);
+                }
+            }
+        }
         if let Err(e) = crate::utils::init_deletable_roots(
             &self.paths.packages_path,
             &self.paths.chroot_base_path,
             &self.paths.ready_made_packages_path,
+            &[],
         ) {
             die!("{}", e);
         }
@@ -430,6 +567,30 @@ impl Config {
             "  chroot_makepkg_conf: {}",
             self.paths.chroot_makepkg_conf.as_deref().unwrap_or("(none)")
         );
+
+        println!("\n{}", "Ramdisk".green().bold());
+        println!("  enabled: {}", self.ramdisk.enabled);
+        if self.ramdisk.enabled {
+            println!("  mount_point: {}", self.ramdisk.mount_point);
+            println!("  size: {}", self.ramdisk.size);
+            println!("  mode: {}", self.ramdisk.mode);
+            println!("  build_workdir: {}", self.ramdisk.build_workdir);
+            println!("  chroot: {}", self.ramdisk.chroot);
+            println!("  packages: {}", self.ramdisk.packages);
+            println!(
+                "  seed_chroot_from: {}",
+                self.ramdisk
+                    .seed_chroot_from
+                    .as_deref()
+                    .unwrap_or("(none)")
+            );
+            println!("  sync_chroot_on_exit: {}", self.ramdisk.sync_chroot_on_exit);
+            println!("  min_free_ram_mb: {}", self.ramdisk.min_free_ram_mb);
+            println!(
+                "  reclaim_mount_on_startup: {}",
+                self.ramdisk.reclaim_mount_on_startup
+            );
+        }
 
         println!("\n{}", "Build".green().bold());
         println!("  default_environment: {}", self.build.default_environment);
@@ -464,6 +625,10 @@ impl Config {
         println!(
             "  system_update_first: {}",
             self.build.system_update_first
+        );
+        println!(
+            "  clean_chroot_after_compilation: {}",
+            self.build.clean_chroot_after_compilation
         );
 
         println!("\n{}", "System Update".green().bold());
@@ -512,12 +677,29 @@ impl Config {
             }
         }
 
-        println!("\n{}", "Skip Install Packages".green().bold());
+        println!("\n{}", "Skip Install Packages (system update)".green().bold());
         if self.skip_install_packages.is_empty() {
             println!("  (none)");
         } else {
             for pkg in &self.skip_install_packages {
                 println!("  - {}", pkg);
+            }
+        }
+
+        println!("\n{}", "Skip Install After Compilation".green().bold());
+        match &self.skip_install_packages_after_compilation {
+            None if self.skip_install_packages.is_empty() => println!("  (none)"),
+            None => {
+                println!("  (unset; using skip_install_packages for backward compatibility)");
+                for pkg in &self.skip_install_packages {
+                    println!("  - {}", pkg);
+                }
+            }
+            Some(list) if list.is_empty() => println!("  (none)"),
+            Some(list) => {
+                for pkg in list {
+                    println!("  - {}", pkg);
+                }
             }
         }
 
@@ -581,6 +763,9 @@ impl Config {
                     "    upstream_github: {} (prereleases: {})",
                     repo, cfg.upstream_prereleases
                 );
+            }
+            if let Some(code) = &cfg.ramdisk {
+                println!("    ramdisk: {} (w=workdir, c=chroot, p=packages)", code);
             }
         }
     }
@@ -657,6 +842,186 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
             sys_update.get_command_to_perform_system_update_no_refresh(),
             "custom_command"
         );
+    }
+
+    #[test]
+    fn test_parse_ramdisk_section() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/abs/packages"
+chroot_base_path = "/tmp/abs/chroot"
+ready_made_packages_path = "/tmp/abs/ready"
+
+[ramdisk]
+enabled = true
+mount_point = "/run/abs-ram"
+size = "8G"
+build_workdir = true
+chroot = true
+packages = false
+seed_chroot_from = "/tmp/abs/chroot"
+sync_chroot_on_exit = true
+min_free_ram_mb = 2048
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.ramdisk.enabled);
+        assert_eq!(config.ramdisk.mount_point, "/run/abs-ram");
+        assert_eq!(config.ramdisk.size, "8G");
+        assert!(config.ramdisk.build_workdir);
+        assert!(config.ramdisk.chroot);
+        assert!(!config.ramdisk.packages);
+        assert_eq!(
+            config.ramdisk.seed_chroot_from.as_deref(),
+            Some("/tmp/abs/chroot")
+        );
+        assert!(config.ramdisk.sync_chroot_on_exit);
+        assert_eq!(config.ramdisk.min_free_ram_mb, 2048);
+    }
+
+    #[test]
+    fn test_ramdisk_defaults_when_section_missing() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(!config.ramdisk.enabled);
+        assert_eq!(config.ramdisk.mount_point, "/run/abs-ram");
+        assert!(!config.ramdisk.build_workdir);
+        assert!(!config.ramdisk.chroot);
+        assert!(!config.ramdisk.packages);
+        assert!(config.ramdisk.reclaim_mount_on_startup);
+    }
+
+    #[test]
+    fn skip_install_after_compilation_fallback() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = ["foo", "bar"]
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.skip_install_after_compilation(), &["foo", "bar"]);
+
+        let toml_with_explicit = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = ["foo"]
+skip_install_packages_after_compilation = ["bar"]
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_with_explicit).unwrap();
+        assert_eq!(config.skip_install_after_compilation(), &["bar"]);
+    }
+
+    #[test]
+    fn test_clean_chroot_after_compilation_defaults_true() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.build.clean_chroot_after_compilation);
     }
 }
 

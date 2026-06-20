@@ -71,7 +71,8 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
 
 
 
-    let abs_dir = std::path::PathBuf::from(&config.paths.packages_path).join("abs");
+    let packages_path = config.paths.packages_path.clone();
+    let abs_dir = std::path::PathBuf::from(&packages_path).join("abs");
 
     let mut repo_ok = false;
     if abs_dir.exists() && abs_dir.join(".git").exists() {
@@ -90,7 +91,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
 
     if !repo_ok {
         blog!("Cloning latest repository source from {}...", config.self_update_github_url);
-        fs::create_dir_all(&config.paths.packages_path)
+        fs::create_dir_all(&packages_path)
             .map_err(|e| format!("Failed to create packages directory: {}", e))?;
         run_command(
             "git",

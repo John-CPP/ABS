@@ -7,6 +7,7 @@ mod git;
 mod install;
 mod package_spec;
 mod pkgbuild;
+mod ramdisk;
 mod self_update;
 mod system;
 mod upstream;
@@ -120,7 +121,22 @@ fn install_all_keys() {
 }
 
 fn remove_chroot(config: &config::Config) {
-    let master_chroot = PathBuf::from(&config.paths.chroot_base_path).join("base");
+    if ramdisk::is_session_active() {
+        let ram_targets = ramdisk::RamdiskTargets {
+            chroot: true,
+            ..Default::default()
+        };
+        let chroot_base = ramdisk::effective_chroot_base_path(config, &ram_targets);
+        remove_chroot_at(&chroot_base);
+    }
+    remove_chroot_at(&config.paths.chroot_base_path);
+}
+
+fn remove_chroot_at(chroot_base: &str) {
+    let master_chroot = PathBuf::from(chroot_base).join("base");
+    if !master_chroot.exists() {
+        return;
+    }
     if let Err(e) = check_sudo_removal(&master_chroot) {
         ewarn!(
             "Failed to remove chroot '{}': {}",
@@ -134,7 +150,10 @@ fn remove_chroot(config: &config::Config) {
 
 fn run_full_cleaning(config: &config::Config) {
     remove_chroot(config);
-    if let Err(e) = check_sudo_removal(&config.paths.packages_path) {
+    ramdisk::remove_ramdisk_work(config);
+
+    let packages_target = ramdisk::full_clean_packages_target(config);
+    if let Err(e) = check_sudo_removal(&packages_target) {
         ewarn!("Failed to remove packages path: {}", e);
     }
     if let Err(e) = check_sudo_removal(&config.paths.ready_made_packages_path) {
@@ -156,6 +175,14 @@ fn run_full_cleaning(config: &config::Config) {
         }
     }
     blog!("Full cleaning completed.");
+}
+
+struct RamdiskShutdown;
+
+impl Drop for RamdiskShutdown {
+    fn drop(&mut self) {
+        ramdisk::shutdown();
+    }
 }
 
 fn refresh_repositories(config: &config::Config, cli: &cli::Cli, run_system_repo_update: bool) {
@@ -200,6 +227,8 @@ fn run_deferred_install_phase(
 macro_rules! die {
     ($($arg:tt)*) => {{
         eprintln!("{} {}", "==> ERROR:".red(), format!($($arg)*));
+        $crate::pkgbuild::restore_pending_pkgbuilds();
+        $crate::ramdisk::shutdown();
         std::process::exit(1);
     }};
 }
@@ -300,6 +329,14 @@ fn main() {
         config.print_human_readable();
         return;
     }
+
+    if let Err(e) = ramdisk::initialize(&config) {
+        die!("Ramdisk setup failed: {}", e);
+    }
+    if let Err(e) = ramdisk::refresh_deletable_roots(&config) {
+        die!("{}", e);
+    }
+    let _ramdisk_shutdown = RamdiskShutdown;
 
     if !cli.dry_run {
         if let Err(e) = prime_sudo_for_session() {
@@ -475,12 +512,15 @@ fn run_compilations(
 
     for (base, spec) in &spec_map {
         let (repo_name, repo_url_string, base_pkg) = build::resolve_pkg_repo_for_manual(&spec.name, cli, config);
+        let pkg_config = config.packages.get(&spec.name);
+        let targets = ramdisk::resolve_ramdisk_targets(config, pkg_config, Some(spec))
+            .unwrap_or_default();
         let pkg_dir = git::prepare_repo(
             &spec.name,
             &base_pkg,
             &repo_name,
             &repo_url_string,
-            &config.paths.packages_path,
+            &ramdisk::effective_packages_path(config, &targets),
             false,
             false,
             None,

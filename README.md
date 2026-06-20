@@ -121,6 +121,63 @@ upstream_prereleases = true          # include GitHub prereleases (default: fals
 
 On **`-R`** / **`-RU`**, after syncing the AUR clone, ABS queries the GitHub API (via `curl`). If upstream is newer than `pkgver` in the PKGBUILD, it sets `pkgver`, resets `pkgrel=1`, runs `updpkgsums`, then continues the normal version report / build flow. Requires network access and `curl`.
 
+### `[ramdisk]` config keys
+
+Optional tmpfs/ramdisk support to speed up compiles and reduce disk wear. Disk `[paths]` remain the persistent locations; the ramdisk holds ephemeral build state for the ABS session.
+
+| Key | Description |
+| --- | ----------- |
+| `enabled` | Mount tmpfs at startup (default: `false`) |
+| `mount_point` | Absolute path for the tmpfs mount (default: `/run/abs-ram`) |
+| `size` | tmpfs size passed to `mount -o size=` (default: `16G`) |
+| `mode` | Directory mode for the mount (default: `0755`) |
+| `build_workdir` | Symlink each package's `src/` and `pkg/` to tmpfs during builds (default: `false`) |
+| `chroot` | Use tmpfs for `chroot_base_path` during chroot builds (default: `false`) |
+| `packages` | Move entire `packages_path` to tmpfs — high RAM use (default: `false`) |
+| `seed_chroot_from` | Optional disk path to `rsync` into the ram chroot before first use (full copy). **Unset = fresh `mkarchroot` on RAM** |
+| `sync_chroot_on_exit` | `rsync` ram chroot back to `seed_chroot_from` on exit (requires `seed_chroot_from`; default: `false`) |
+| `min_free_ram_mb` | Refuse mount when `MemAvailable` is below this (default: `4096`) |
+| `warn_packages_ram` | Print a warning when `packages = true` (default: `true`) |
+| `reclaim_mount_on_startup` | Unmount a stale tmpfs at `mount_point` before mounting (default: `true`) |
+
+**Per-package overrides:** When `[ramdisk].enabled = true`, you can leave global `build_workdir`, `chroot`, and `packages` as `false` and opt in per package. In `[packages.NAME]` set `ramdisk = "wcp"` (letters: **w** = workdir, **c** = chroot, **p** = packages). The string **replaces** the global defaults for that build. CLI: `abs mesa[ramdisk=wcp]` or `abs mesa[wcp]`.
+
+When `[ramdisk].enabled = true`, ABS unmounts the tmpfs on normal exit, on **`Ctrl+C` / SIGTERM** (stops running subprocesses first), and on error exits (`die!`). Uses lazy unmount (`umount -l`) if the mount is busy. `kill -9` cannot be handled — use `sudo umount -l /run/abs-ram` manually if needed.
+
+Example (ramdisk on, global targets off, heavy packages opt in):
+
+```toml
+[ramdisk]
+enabled = true
+mount_point = "/run/abs-ram"
+size = "16G"
+build_workdir = false
+chroot = false
+packages = false
+
+[packages.mesa]
+build_env = "chroot"
+ramdisk = "wcp"
+```
+
+Example (hybrid: git clones on disk, compile workdirs and chroot in RAM):
+
+```toml
+[paths]
+packages_path = "/media/storage/abs/packages"
+chroot_base_path = "/media/storage/abs/chroot"
+ready_made_packages_path = "/media/storage/abs/ready"
+
+[ramdisk]
+enabled = true
+mount_point = "/run/abs-ram"
+size = "16G"
+build_workdir = true
+chroot = true
+packages = false
+# seed_chroot_from = "/media/storage/abs/chroot-minimal"  # optional; omit for fresh mkarchroot
+```
+
 ### `[build]` config keys
 
 | Key                                  | Description                                                         |
@@ -129,6 +186,7 @@ On **`-R`** / **`-RU`**, after syncing the AUR clone, ABS queries the GitHub API
 | `ignore_compilation_failures`        | Log warning and continue on build failure instead of aborting       |
 | `compile_first_install_after`        | Build all packages first, then install — useful for unattended runs |
 | `clean_install_by_default`           | Remove `src/` and `pkg/` before every compile                       |
+| `clean_chroot_after_compilation`     | Reset devtools chroot after each chroot build (default: `true`)     |
 | `concurrent_repos_downloads_limit`   | Maximum number of repository clones/updates to sync concurrently (default: `10`) |
 
 ### Self-Updates config keys

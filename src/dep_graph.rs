@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::package_spec::PackageSpec;
 use crate::pkgbuild::parse_pkg_dependencies;
 use crate::git::prepare_repo;
+use crate::ramdisk;
 use crate::vlog;
 use crate::build::resolve_pkg_repo_for_manual;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,12 +47,15 @@ pub fn sort_packages_topologically(
         let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo_for_manual(&spec.name, cli, config);
         
         // Fast, read-only prepare repo (does not clone/pull if it exists; smart dry-run bypasses commands)
+        let pkg_config = config.packages.get(&spec.name);
+        let targets = ramdisk::resolve_ramdisk_targets(config, pkg_config, Some(spec))
+            .unwrap_or_default();
         let pkg_dir = prepare_repo(
             &spec.name,
             &base_pkg,
             &repo_name,
             &repo_url_string,
-            &config.paths.packages_path,
+            &ramdisk::effective_packages_path(config, &targets),
             false,
             false,
             None,

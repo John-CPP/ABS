@@ -14,7 +14,11 @@ config_version = 1
 
 manual_update_packages = [
 ]
+# Packages excluded from system update (repo binaries), via pacman/yay --ignore.
 skip_install_packages = [
+]
+# Packages excluded from pacman -U after manual compilation (omit to inherit skip_install_packages).
+skip_install_packages_after_compilation = [
 ]
 
 [paths]
@@ -23,6 +27,36 @@ chroot_base_path = "$XDG_CONFIG_HOME/.cache/abs/chroot"
 ready_made_packages_path = "$XDG_CONFIG_HOME/.cache/abs/ready"
 # Optional: path to a custom makepkg.conf file to inject into the chroot container
 # chroot_makepkg_conf = "~/.config/abs/makepkg.conf"
+
+# Optional tmpfs/ramdisk: speeds up builds and reduces disk wear.
+# Disk [paths] remain the persistent locations; ramdisk holds ephemeral compile state.
+# Set enabled = true, then turn on individual targets (build_workdir, chroot, packages).
+[ramdisk]
+# Mount and use tmpfs for the ABS session (requires sudo). When false, all other [ramdisk] keys are ignored.
+enabled = false
+# Absolute path where tmpfs is mounted for this ABS run (must not be a system root like / or /run).
+mount_point = "/run/abs-ram"
+# Maximum tmpfs size passed to mount -o size= (cap, not pre-allocated). Increase for large builds or parallel chroot workers.
+size = "16G"
+# Directory permissions for the tmpfs mount root (octal, e.g. 0755).
+mode = "0755"
+# During each build, symlink src/ and pkg/ under the package directory to per-package dirs on tmpfs (compile I/O in RAM).
+# Default for all packages when no per-package override is set. Use per-package `ramdisk = "wcp"` to override.
+build_workdir = false
+# Use tmpfs for chroot_base_path during makechrootpkg (-h) builds instead of the disk path in [paths].
+chroot = false
+# Use tmpfs for the entire packages_path (git clones and sources). High RAM use; off by default.
+packages = false
+# Optional disk directory to rsync into the ram chroot before first use (copies the entire tree; leave unset for a fresh mkarchroot on RAM).
+# seed_chroot_from = ""
+# On normal ABS exit, rsync the ram chroot back to seed_chroot_from when sync_chroot_on_exit = true (requires seed_chroot_from).
+sync_chroot_on_exit = false
+# Refuse to mount tmpfs when MemAvailable in /proc/meminfo is below this value (MiB).
+min_free_ram_mb = 4096
+# Print a warning when packages = true because full-repo-on-RAM can consume many gigabytes.
+warn_packages_ram = true
+# Unmount mount_point before mounting when it is already mounted (cleans up after a crashed ABS run).
+reclaim_mount_on_startup = true
 
 [build]
 default_environment = "local"
@@ -36,6 +70,8 @@ concurrent_compilations_limit = 1
 fast_aur_rpc_update_checks = true
 # Perform system update before compiling packages (highly recommended to prevent broken shared libraries)
 system_update_first = true
+# After each chroot (makechrootpkg) build, remove working copies and reset the devtools chroot when idle
+clean_chroot_after_compilation = true
 
 [system_update]
 command_to_update_repositories = "sudo pacman -Sy"
@@ -62,3 +98,7 @@ default = "arch"
 # tests = true
 # pre_update_command = "rm -rf mozbuild"
 # post_update_command = ""
+# Per-package ramdisk targets when [ramdisk].enabled = true (replaces global build_workdir/chroot/packages for this package):
+# w = build workdir (src/, pkg/), c = chroot, p = packages (git clone on tmpfs). Example: ramdisk = "wcp"
+# ramdisk = "wcp"
+# Or on the CLI: abs mesa[ramdisk=wcp]  /  abs mesa[wcp]

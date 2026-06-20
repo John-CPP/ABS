@@ -63,25 +63,46 @@ fn list_pkgbuild_parent_dirs(repo_root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+fn dir_name(d: &Path) -> Option<&str> {
+    d.file_name().and_then(|n| n.to_str())
+}
+
 fn find_pkg_dir_in_list(dirs: &[PathBuf], pkg_name: &str) -> Option<PathBuf> {
-    if let Some(exact) = dirs.iter().find(|d| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == pkg_name)
-            .unwrap_or(false)
-    }) {
+    // 1. Exact directory name match (case-sensitive).
+    if let Some(exact) = dirs.iter().find(|d| dir_name(d) == Some(pkg_name)) {
         return Some(exact.clone());
     }
 
     let pkg_name_lower = pkg_name.to_lowercase();
-    dirs.iter()
-        .find(|d| {
-            d.file_name()
-                .and_then(|n| n.to_str())
+
+    // 2. Case-insensitive exact match.
+    if let Some(ci_exact) = dirs
+        .iter()
+        .find(|d| dir_name(d).map(|n| n.eq_ignore_ascii_case(pkg_name)).unwrap_or(false))
+    {
+        return Some(ci_exact.clone());
+    }
+
+    // 3. Substring fallback. Multiple package dirs can contain the query as a substring
+    // (e.g. `mesa` is in `lib32-mesa` and `mesa-utils`). Prefer the closest by name length to
+    // avoid silently building the wrong package, and warn so the choice is visible.
+    let mut candidates: Vec<&PathBuf> = dirs
+        .iter()
+        .filter(|d| {
+            dir_name(d)
                 .map(|n| n.to_lowercase().contains(&pkg_name_lower))
                 .unwrap_or(false)
         })
-        .cloned()
+        .collect();
+    candidates.sort_by_key(|d| dir_name(d).map(|n| n.len()).unwrap_or(usize::MAX));
+
+    let chosen = candidates.first()?;
+    ewarn!(
+        "No exact PKGBUILD directory for '{}'; using closest match '{}'",
+        pkg_name,
+        dir_name(chosen).unwrap_or_default()
+    );
+    Some((*chosen).clone())
 }
 
 fn find_pkg_dir(repo_dir: &Path, pkg_name: &str) -> Option<PathBuf> {
@@ -254,5 +275,43 @@ pub fn prepare_repo(
     match found {
         Some(path) => path,
         None => die!("Package {} not found in repository {}", pkg_name, repo_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_pkg_dir_in_list;
+    use std::path::PathBuf;
+
+    fn dirs(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|n| PathBuf::from("/repo").join(n)).collect()
+    }
+
+    #[test]
+    fn exact_match_wins_over_substrings() {
+        let list = dirs(&["lib32-mesa", "mesa", "mesa-utils"]);
+        let found = find_pkg_dir_in_list(&list, "mesa").unwrap();
+        assert_eq!(found.file_name().unwrap(), "mesa");
+    }
+
+    #[test]
+    fn substring_fallback_prefers_shortest_name() {
+        let list = dirs(&["lib32-mesa", "mesa-extra-utils"]);
+        let found = find_pkg_dir_in_list(&list, "mesa").unwrap();
+        // Both contain "mesa"; the shorter directory name is the closer match.
+        assert_eq!(found.file_name().unwrap(), "lib32-mesa");
+    }
+
+    #[test]
+    fn case_insensitive_exact_beats_substring() {
+        let list = dirs(&["lib32-mesa", "Mesa"]);
+        let found = find_pkg_dir_in_list(&list, "mesa").unwrap();
+        assert_eq!(found.file_name().unwrap(), "Mesa");
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let list = dirs(&["firefox", "vim"]);
+        assert!(find_pkg_dir_in_list(&list, "mesa").is_none());
     }
 }

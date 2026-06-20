@@ -108,7 +108,7 @@ fn collect_candidate_files_from_pkgdest(
                 Some(n) => n,
                 None => continue,
             };
-            if !name.ends_with(".pkg.tar.zst") {
+            if !crate::utils::is_package_artifact(name) {
                 continue;
             }
             if name.starts_with(&format!("{}-", base_pkg_name))
@@ -339,7 +339,7 @@ pub fn install_artifacts(
     files.retain(|f| {
         let pkg_name = package_name_from_file(f);
         if let Some(name) = pkg_name
-            && config.skip_install_packages.contains(&name)
+            && config.skip_install_after_compilation().contains(&name)
         {
             vlog!("Skipping ignored package artifact: {}", name);
             return false;

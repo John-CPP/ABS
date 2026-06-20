@@ -235,12 +235,13 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
 
                     let (repo_name, repo_url_string, base_pkg) =
                         crate::build::resolve_pkg_repo_for_manual(&task.pkg, cli, config);
+                    let packages_path = crate::ramdisk::packages_path_for_pkg(config, &task.pkg);
                     let pkg_dir = prepare_repo(
                         &task.pkg,
                         &base_pkg,
                         &repo_name,
                         repo_url_string.as_str(),
-                        &config.paths.packages_path,
+                        &packages_path,
                         false,
                         false,
                         None,

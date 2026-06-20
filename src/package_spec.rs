@@ -12,6 +12,8 @@ pub struct PackageSpec {
     pub chroot_build: Option<bool>,
     pub no_check: Option<bool>,
     pub compiler: Option<String>,
+    /// CLI override for ramdisk targets (`w`, `c`, `p`), e.g. `mesa[ramdisk=wcp]` or `mesa[wcp]`.
+    pub ramdisk: Option<String>,
 }
 
 impl PackageSpec {
@@ -24,12 +26,52 @@ impl PackageSpec {
             chroot_build: None,
             no_check: None,
             compiler: None,
+            ramdisk: None,
         }
     }
 }
 
 fn normalize_repo_name(name: &str) -> String {
     name.to_ascii_lowercase()
+}
+
+fn merge_ramdisk_code(existing: &str, addition: &str) -> String {
+    let mut w = false;
+    let mut c = false;
+    let mut p = false;
+    for ch in existing.chars().chain(addition.chars()) {
+        match ch.to_ascii_lowercase() {
+            'w' => w = true,
+            'c' => c = true,
+            'p' => p = true,
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    if w {
+        out.push('w');
+    }
+    if c {
+        out.push('c');
+    }
+    if p {
+        out.push('p');
+    }
+    out
+}
+
+fn normalize_ramdisk_code(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| matches!(c.to_ascii_lowercase(), 'w' | 'c' | 'p'))
+        .collect()
+}
+
+fn is_ramdisk_target_token(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| matches!(c.to_ascii_lowercase(), 'w' | 'c' | 'p'))
 }
 
 fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
@@ -81,6 +123,15 @@ fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
                 die!("Package '{}': [compiler] requires a value (e.g. compiler=llvm)", spec.name);
             }
             spec.compiler = Some(value.to_string());
+        }
+        "ramdisk" => {
+            if value.is_empty() {
+                die!(
+                    "Package '{}': [ramdisk] requires a value (e.g. ramdisk=wcp; w=workdir, c=chroot, p=packages)",
+                    spec.name
+                );
+            }
+            spec.ramdisk = Some(normalize_ramdisk_code(value));
         }
         _ => {
             if value.is_empty() {
@@ -140,6 +191,12 @@ pub fn parse_package_spec(input: &str) -> PackageSpec {
         }
         if let Some((key, value)) = part.split_once('=') {
             parse_attr(key.trim(), value, &mut spec);
+        } else if is_ramdisk_target_token(part) {
+            let code = normalize_ramdisk_code(part);
+            spec.ramdisk = Some(match spec.ramdisk.take() {
+                Some(existing) => merge_ramdisk_code(&existing, &code),
+                None => code,
+            });
         } else {
             parse_attr(part, "", &mut spec);
         }
@@ -192,5 +249,15 @@ mod tests {
         assert_eq!(spec.name, "mesa");
         assert_eq!(spec.compiler.as_deref(), Some("llvm17"));
         assert!(spec.pkgbuild_overrides.is_empty());
+    }
+
+    #[test]
+    fn parse_ramdisk_targets_bracket() {
+        let spec = parse_package_spec("mesa[ramdisk=wcp]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("wcp"));
+        let spec = parse_package_spec("mesa[wcp]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("wcp"));
+        let spec = parse_package_spec("mesa[w,c,p]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("wcp"));
     }
 }

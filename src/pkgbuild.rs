@@ -1,7 +1,47 @@
 use crate::vlog;
 use regex::Regex;
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Repo dirs with a live `.PKGBUILD.emerge_backup` that still needs restoring. Because `die!`
+/// calls `process::exit` (skipping `Drop`/`PkgbuildGuard`), a fatal error mid-build would otherwise
+/// leave the user's git tree on a bumped/overridden PKGBUILD. [`restore_pending_pkgbuilds`] flushes
+/// this set from the `die!` path so the working tree is always returned to its upstream state.
+static PENDING_PKGBUILD_RESTORES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn pending_restores() -> &'static Mutex<HashSet<PathBuf>> {
+    PENDING_PKGBUILD_RESTORES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_pending_restore(repo_dir: &Path) {
+    if let Ok(mut set) = pending_restores().lock() {
+        set.insert(repo_dir.to_path_buf());
+    }
+}
+
+fn unregister_pending_restore(repo_dir: &Path) {
+    if let Ok(mut set) = pending_restores().lock() {
+        set.remove(repo_dir);
+    }
+}
+
+/// Restore every PKGBUILD with an outstanding backup. Safe to call multiple times and from the
+/// `die!` path (only does file renames; no panics, no sudo).
+pub fn restore_pending_pkgbuilds() {
+    let pending: Vec<PathBuf> = match pending_restores().lock() {
+        Ok(mut set) => set.drain().collect(),
+        Err(_) => return,
+    };
+    for repo_dir in pending {
+        let original = repo_dir.join("PKGBUILD");
+        let backup = repo_dir.join(".PKGBUILD.emerge_backup");
+        if backup.exists() {
+            let _ = fs::rename(&backup, &original);
+        }
+    }
+}
 
 /// Match Bash `tr -d '"'\'' '` on the pkgrel value: drop quotes and all whitespace.
 fn bash_strip_pkgrel_value(raw: &str) -> String {
@@ -178,9 +218,13 @@ pub fn backup_pkgbuild(repo_dir: &Path) {
         return;
     }
     if backup.exists() {
+        // A leftover backup (process stopped before restore) is still pending restore.
+        register_pending_restore(repo_dir);
         return;
     }
-    let _ = fs::copy(&original, &backup);
+    if fs::copy(&original, &backup).is_ok() {
+        register_pending_restore(repo_dir);
+    }
 }
 
 pub fn restore_pkgbuild(repo_dir: &Path) {
@@ -190,6 +234,7 @@ pub fn restore_pkgbuild(repo_dir: &Path) {
     if backup.exists() {
         let _ = fs::rename(&backup, &original);
     }
+    unregister_pending_restore(repo_dir);
 }
 
 pub fn inject_compiler_env(repo_dir: &Path, cc: &str, cxx: &str) -> Result<(), String> {
@@ -283,6 +328,32 @@ mod tests {
         let content = "pkgver=1.0\n";
         let out = replace_pkgbuild_field(content, "pkgver", "foo$bar");
         assert_eq!(out, "pkgver=foo$bar\n");
+    }
+
+    #[test]
+    fn restore_pending_restores_backed_up_pkgbuild() {
+        let temp = std::env::temp_dir().join(format!(
+            "abs_pending_restore_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let pkgbuild = temp.join("PKGBUILD");
+        fs::write(&pkgbuild, "pkgver=1.0\npkgrel=1\n").unwrap();
+
+        backup_pkgbuild(&temp);
+        // Simulate a mid-build edit (pkgrel bump / override).
+        fs::write(&pkgbuild, "pkgver=1.0\npkgrel=1.2\n").unwrap();
+
+        restore_pending_pkgbuilds();
+
+        let restored = fs::read_to_string(&pkgbuild).unwrap();
+        assert_eq!(restored, "pkgver=1.0\npkgrel=1\n");
+        assert!(!temp.join(".PKGBUILD.emerge_backup").exists());
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]

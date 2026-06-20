@@ -7,10 +7,12 @@ use crate::pkgbuild::{
     inject_compiler_env,
 };
 use crate::utils::{
-    pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
+    check_sudo_removal, pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
     remove_src_pkg_workdirs, remove_stale_pkgs_in_pkgdest, run_command,
     run_shell_in_dir_with_tee, vercmp,
 };
+use crate::ramdisk::{self, WorkdirGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::{blog, die, ewarn, vlog};
 use colored::Colorize;
 use regex::Regex;
@@ -104,6 +106,78 @@ fn ensure_devtools_chroot(chrootdir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+static ACTIVE_CHROOT_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Tracks an in-flight chroot build and resets the devtools chroot on drop when configured.
+struct ChrootBuildGuard {
+    chrootdir: PathBuf,
+    worker_copy: Option<String>,
+    clean: bool,
+}
+
+impl ChrootBuildGuard {
+    fn new(config: &Config, chrootdir: PathBuf, chroot_copy: Option<&str>) -> Self {
+        let clean = config.build.clean_chroot_after_compilation;
+        if clean {
+            ACTIVE_CHROOT_BUILDS.fetch_add(1, Ordering::SeqCst);
+        }
+        Self {
+            chrootdir,
+            worker_copy: chroot_copy.map(str::to_string),
+            clean,
+        }
+    }
+
+    fn worker_copy_path(&self) -> Option<PathBuf> {
+        if let Some(name) = &self.worker_copy {
+            return Some(self.chrootdir.join(name));
+        }
+        std::env::var("USER")
+            .ok()
+            .map(|user| self.chrootdir.join(user))
+    }
+}
+
+impl Drop for ChrootBuildGuard {
+    fn drop(&mut self) {
+        if !self.clean {
+            return;
+        }
+
+        let remaining = ACTIVE_CHROOT_BUILDS.fetch_sub(1, Ordering::SeqCst);
+        if remaining == 1 {
+            vlog!(
+                "Cleaning devtools chroot at {} after build...",
+                self.chrootdir.display()
+            );
+            if let Err(e) = check_sudo_removal(&self.chrootdir) {
+                ewarn!(
+                    "Failed to reset devtools chroot at {}: {}",
+                    self.chrootdir.display(),
+                    e
+                );
+            }
+            return;
+        }
+
+        if remaining > 1
+            && let Some(copy_path) = self.worker_copy_path()
+        {
+            vlog!(
+                "Removing chroot working copy {} (parallel builds still running)...",
+                copy_path.display()
+            );
+            if let Err(e) = check_sudo_removal(&copy_path) {
+                ewarn!(
+                    "Failed to remove chroot working copy {}: {}",
+                    copy_path.display(),
+                    e
+                );
+            }
+        }
+    }
 }
 
 fn run_build_with_key_retry(build_cmd: &str, repo_dir: &Path) -> Result<(), String> {
@@ -287,7 +361,7 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
         &base_pkg,
         &repo_name,
         repo_url,
-        &config.paths.packages_path,
+        &ramdisk::packages_path_for_pkg(config, pkg),
         false,
         false,
         None,
@@ -424,12 +498,13 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                     };
 
                     let start = std::time::Instant::now();
+                    let packages_path = ramdisk::packages_path_for_pkg(config, &task.pkg);
                     let _ = prepare_repo(
                         &task.pkg,
                         &task.base_pkg,
                         &task.repo_name,
                         task.repo_url_string.as_str(),
-                        &config.paths.packages_path,
+                        &packages_path,
                         false,
                         true,
                         None,
@@ -481,7 +556,7 @@ fn classify_manual_pkg_version(
         &base_pkg,
         &repo_name,
         repo_url_string.as_str(),
-        &config.paths.packages_path,
+        &ramdisk::packages_path_for_pkg(config, pkg),
         false,
         false,
         Some(pkgbuild_cache),
@@ -611,13 +686,17 @@ pub fn install_package_phase(spec: &PackageSpec, cli: &Cli, config: &Config) {
 
     let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
+    let packages_path = match ramdisk::packages_path_for(config, pkg, Some(spec)) {
+        Ok(p) => p,
+        Err(e) => die!("Invalid ramdisk targets for {}: {}", pkg, e),
+    };
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
     let repo_dir_path = prepare_repo(
         pkg,
         base_pkg.as_str(),
         &repo_name,
         repo_url_string.as_str(),
-        &config.paths.packages_path,
+        &packages_path,
         false,
         false,
         None,
@@ -687,6 +766,12 @@ pub fn process_package(
 ) -> bool {
     let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
+    let ramdisk_targets = match ramdisk::resolve_ramdisk_targets(config, pkg_config, Some(spec)) {
+        Ok(t) => t,
+        Err(e) => die!("Invalid ramdisk targets for {}: {}", pkg, e),
+    };
+    ramdisk::warn_if_packages_on_ram(config, pkg, &ramdisk_targets);
+    let packages_path = ramdisk::effective_packages_path(config, &ramdisk_targets);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
     let repo_url = repo_url_string.as_str();
     let base_pkg_name = base_pkg.as_str();
@@ -698,7 +783,7 @@ pub fn process_package(
             base_pkg_name,
             &repo_name,
             repo_url,
-            &config.paths.packages_path,
+            &packages_path,
             false,
             false,
             None,
@@ -716,7 +801,7 @@ pub fn process_package(
             base_pkg_name,
             &repo_name,
             repo_url,
-            &config.paths.packages_path,
+            &packages_path,
             cli.clean,
             true,
             None,
@@ -732,7 +817,7 @@ pub fn process_package(
         base_pkg_name,
         &repo_name,
         repo_url,
-        &config.paths.packages_path,
+        &packages_path,
         cli.clean,
         refresh_remote,
         None,
@@ -810,6 +895,11 @@ pub fn process_package(
     let build_env = effective_cfg.build_env.clone();
     let skip_tests = effective_cfg.skip_tests;
 
+    let _workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets) {
+        Ok(guard) => guard,
+        Err(e) => die!("Ramdisk build workdir setup failed: {}", e),
+    };
+
     let mut custom_cmd = None;
     if let Some(pc) = pkg_config {
         if build_env == "local" {
@@ -855,8 +945,13 @@ pub fn process_package(
     } else {
         blog!("Building in chroot with makechrootpkg...");
         // `makechrootpkg -r <dir>` expects `<dir>/root` (see mkarchroot / makechrootpkg man pages).
-        let chrootdir = PathBuf::from(&config.paths.chroot_base_path).join("base");
-        if let Err(e) = ensure_devtools_chroot(&chrootdir).and_then(|_| inject_chroot_makepkg_conf(&chrootdir, config)) {
+        let chroot_base = ramdisk::effective_chroot_base_path(config, &ramdisk_targets);
+        let chrootdir = PathBuf::from(&chroot_base).join("base");
+        let _chroot_guard = ChrootBuildGuard::new(config, chrootdir.clone(), chroot_copy);
+        if let Err(e) = ramdisk::seed_chroot_if_needed(config, Path::new(&chroot_base), &ramdisk_targets)
+            .and_then(|_| ensure_devtools_chroot(&chrootdir))
+            .and_then(|_| inject_chroot_makepkg_conf(&chrootdir, config))
+        {
             if config.build.ignore_compilation_failures {
                 ewarn!("Chroot setup failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);

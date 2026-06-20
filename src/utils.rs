@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::collections::HashSet;
 
 pub fn sh_single_quote(s: &str) -> String {
     let mut out = String::from('\'');
@@ -76,6 +77,43 @@ const BLOCKED_DELETION_ROOTS: &[&str] = &[
 ];
 
 static DELETABLE_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+static TRACKED_CHILDREN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn tracked_children() -> &'static Mutex<HashSet<u32>> {
+    TRACKED_CHILDREN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn track_child(pid: u32) {
+    tracked_children().lock().unwrap().insert(pid);
+}
+
+fn untrack_child(pid: u32) {
+    tracked_children().lock().unwrap().remove(&pid);
+}
+
+/// Send SIGTERM (then SIGKILL) to ABS-spawned subprocesses still running (e.g. rsync, makepkg).
+pub fn terminate_foreground_children() {
+    let pids: Vec<u32> = tracked_children().lock().unwrap().iter().copied().collect();
+    if pids.is_empty() {
+        return;
+    }
+    crate::vlog!(
+        "Stopping {} foreground subprocess(es) before ramdisk cleanup...",
+        pids.len()
+    );
+    for pid in &pids {
+        unsafe {
+            libc::kill(*pid as i32, libc::SIGTERM);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for pid in pids {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        untrack_child(pid);
+    }
+}
 
 fn deletable_roots() -> &'static Mutex<Vec<PathBuf>> {
     DELETABLE_ROOTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -144,9 +182,10 @@ pub fn init_deletable_roots(
     packages_path: &str,
     chroot_base_path: &str,
     ready_made_packages_path: &str,
+    extra_roots: &[PathBuf],
 ) -> Result<(), String> {
     let roots = [packages_path, chroot_base_path, ready_made_packages_path];
-    let mut canonical = Vec::with_capacity(roots.len());
+    let mut canonical = Vec::with_capacity(roots.len() + extra_roots.len());
     for path in roots {
         let resolved = resolve_path_for_deletion(Path::new(path))?;
         if is_blocked_deletion_root(&resolved) {
@@ -157,7 +196,40 @@ pub fn init_deletable_roots(
         }
         canonical.push(resolved);
     }
+    for path in extra_roots {
+        let resolved = resolve_path_for_deletion(path)?;
+        if is_blocked_deletion_root(&resolved) {
+            return Err(format!(
+                "refusing to register system directory as deletable root: {}",
+                resolved.display()
+            ));
+        }
+        if !canonical.iter().any(|existing| existing == &resolved) {
+            canonical.push(resolved);
+        }
+    }
     *deletable_roots().lock().unwrap() = canonical;
+    Ok(())
+}
+
+/// Append ramdisk (or other runtime) roots after the initial config validation pass.
+pub fn append_deletable_roots(extra_roots: &[PathBuf]) -> Result<(), String> {
+    let mut roots = deletable_roots().lock().unwrap();
+    if roots.is_empty() {
+        return Err("deletable path roots are not initialized (internal error)".into());
+    }
+    for path in extra_roots {
+        let resolved = resolve_path_for_deletion(path)?;
+        if is_blocked_deletion_root(&resolved) {
+            return Err(format!(
+                "refusing to register system directory as deletable root: {}",
+                resolved.display()
+            ));
+        }
+        if !roots.iter().any(|existing| existing == &resolved) {
+            roots.push(resolved);
+        }
+    }
     Ok(())
 }
 
@@ -208,9 +280,14 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
 
     // Use `.status()` so stdout/stderr are inherited and long builds (makepkg /
     // makechrootpkg) show live output like the Bash script does.
-    let status = command
-        .status()
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("Failed to execute '{}': {}", cmd, e))?;
+    track_child(child.id());
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait on '{}': {}", cmd, e))?;
+    untrack_child(child.id());
 
     if status.success() {
         Ok(())
@@ -351,12 +428,18 @@ pub fn remove_src_pkg_workdirs(repo_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove prior `*.pkg.tar.zst` for this package base name from PKGDEST so old builds (e.g.
+/// True for a built package artifact (`pkgname-ver-rel-arch.pkg.tar.<ext>`) regardless of the
+/// configured `PKGEXT` (zst/xz/gz/lz4/uncompressed). Excludes detached signatures (`.sig`).
+pub fn is_package_artifact(name: &str) -> bool {
+    name.contains(".pkg.tar") && !name.ends_with(".sig")
+}
+
+/// Remove prior package artifacts for this package base name from PKGDEST so old builds (e.g.
 /// `-1.2`) are not offered alongside the new one (`-1.3`) after a recompile.
 pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
     if crate::is_dry_run_mode() {
         println!(
-            "[DRY RUN] rm stale {}-*.pkg.tar.zst in {}",
+            "[DRY RUN] rm stale {}-*.pkg.tar.* in {}",
             base_name, pkgdest
         );
         return;
@@ -373,7 +456,7 @@ pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(".pkg.tar.zst") || !name.starts_with(&prefix) {
+        if !is_package_artifact(name) || !name.starts_with(&prefix) {
             continue;
         }
         if let Err(e) = validate_deletable_path(&path) {
@@ -699,6 +782,23 @@ pub fn pacman_sync_version(pkg: &str) -> Result<Option<String>, String> {
 }
 
 #[cfg(test)]
+mod artifact_tests {
+    use super::is_package_artifact;
+
+    #[test]
+    fn matches_any_pkgext_and_excludes_signatures() {
+        assert!(is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar.zst"));
+        assert!(is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar.xz"));
+        assert!(is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar.gz"));
+        assert!(is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar.lz4"));
+        assert!(is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar"));
+        assert!(!is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar.zst.sig"));
+        assert!(!is_package_artifact("PKGBUILD"));
+        assert!(!is_package_artifact("mesa-26.1.0.tar.gz"));
+    }
+}
+
+#[cfg(test)]
 mod version_tests {
     use super::{parse_pacman_si_output, parse_srcinfo_full_version};
 
@@ -755,6 +855,10 @@ mod path_safety_tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
+    /// `init_deletable_roots` mutates a process-global, so tests that call it must not run
+    /// concurrently with one another.
+    static ROOTS_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn path_has_prefix_does_not_match_partial_directory_name() {
         assert!(!path_has_prefix(
@@ -773,6 +877,7 @@ mod path_safety_tests {
 
     #[test]
     fn validate_deletable_path_rejects_outside_registered_roots() {
+        let _guard = ROOTS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!(
             "abs_path_safety_{}",
             std::time::SystemTime::now()
@@ -791,6 +896,7 @@ mod path_safety_tests {
             packages.to_str().unwrap(),
             chroot.to_str().unwrap(),
             ready.to_str().unwrap(),
+            &[],
         )
         .unwrap();
 
@@ -814,6 +920,7 @@ mod path_safety_tests {
 
     #[test]
     fn validate_deletable_path_rejects_symlink_escape() {
+        let _guard = ROOTS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!(
             "abs_symlink_safety_{}",
             std::time::SystemTime::now()
@@ -834,6 +941,7 @@ mod path_safety_tests {
             packages.to_str().unwrap(),
             chroot.to_str().unwrap(),
             ready.to_str().unwrap(),
+            &[],
         )
         .unwrap();
 
