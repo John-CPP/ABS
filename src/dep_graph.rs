@@ -48,18 +48,24 @@ pub fn sort_packages_topologically(
         
         // Fast, read-only prepare repo (does not clone/pull if it exists; smart dry-run bypasses commands)
         let pkg_config = config.packages.get(&spec.name);
-        let targets = ramdisk::resolve_ramdisk_targets(config, pkg_config, Some(spec))
+        let targets = ramdisk::resolve_ramdisk_targets(
+            config,
+            pkg_config,
+            Some(spec),
+            cli.ramdisk.as_deref(),
+        )
             .unwrap_or_default();
         let pkg_dir = prepare_repo(
             &spec.name,
             &base_pkg,
             &repo_name,
             &repo_url_string,
-            &ramdisk::effective_packages_path(config, &targets),
+            &ramdisk::download_packages_path(config, &targets),
             false,
             false,
             None,
-        );
+        )
+        .pkg_dir;
 
         let deps = parse_pkg_dependencies(pkg_dir.as_path());
         vlog!("Topological Sort: {} has dependencies {:?}", base, deps);
@@ -188,7 +194,24 @@ mod tests {
             check_update: false,
             self_update: false,
             help: None,
+            ramdisk: None,
             packages: vec![],
+            pgo: None,
+            pgo_resume: None,
+            pgo_status: None,
+            pgo_abort: None,
+            pgo_restart: None,
+            pgo_stage: None,
+            pgo_once: false,
+            pgo_goto: false,
+            pgo_auto: false,
+            kernel_build: None,
+            ramdisk_shutdown: false,
+            json: false,
+            event_log: None,
+            purge: false,
+            yes: false,
+            no_wait: false,
         };
 
         let specs = vec![
@@ -249,7 +272,24 @@ mod tests {
             check_update: false,
             self_update: false,
             help: None,
+            ramdisk: None,
             packages: vec![],
+            pgo: None,
+            pgo_resume: None,
+            pgo_status: None,
+            pgo_abort: None,
+            pgo_restart: None,
+            pgo_stage: None,
+            pgo_once: false,
+            pgo_goto: false,
+            pgo_auto: false,
+            kernel_build: None,
+            ramdisk_shutdown: false,
+            json: false,
+            event_log: None,
+            purge: false,
+            yes: false,
+            no_wait: false,
         };
 
         let specs = vec![

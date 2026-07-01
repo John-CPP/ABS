@@ -8,7 +8,8 @@ config_version = 1
 # self_update_at_updates = false
 # self_update_github_url = "https://github.com/John-CPP/ABS"
 # self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"
-# self_update_install_path = "/usr/bin/abs"
+# self_update_use_pacman = true   # default: auto (use pacman when abs/absgui packages are installed)
+# self_update_install_path = "/usr/bin/abs"  # fallback when self_update_use_pacman = false
 # If false, checks for newer versions of Arch Linux or CachyOS packages using stable pacman sync databases instead of git.
 # install_testing_phase_archlinux_packages = false
 
@@ -32,7 +33,8 @@ ready_made_packages_path = "$XDG_CONFIG_HOME/.cache/abs/ready"
 # Disk [paths] remain the persistent locations; ramdisk holds ephemeral compile state.
 # Set enabled = true, then turn on individual targets (build_workdir, chroot, packages).
 [ramdisk]
-# Mount and use tmpfs for the ABS session (requires sudo). When false, all other [ramdisk] keys are ignored.
+# Enable tmpfs/ramdisk support (requires sudo when a package task opts in via global or per-package
+# targets). Tmpfs is mounted lazily on the first build/download that needs it, not at ABS startup.
 enabled = false
 # Absolute path where tmpfs is mounted for this ABS run (must not be a system root like / or /run).
 mount_point = "/run/abs-ram"
@@ -100,5 +102,27 @@ default = "arch"
 # post_update_command = ""
 # Per-package ramdisk targets when [ramdisk].enabled = true (replaces global build_workdir/chroot/packages for this package):
 # w = build workdir (src/, pkg/), c = chroot, p = packages (git clone on tmpfs). Example: ramdisk = "wcp"
+# ramdisk = "disabled"  # force disk-only for this package (same as ramdisk = "")
 # ramdisk = "wcp"
-# Or on the CLI: abs mesa[ramdisk=wcp]  /  abs mesa[wcp]
+# Or on the CLI (quote in zsh): abs 'mesa[ramdisk=wcp]'  /  abs 'electron40[ramdisk=disabled]'
+# Or without brackets: abs --ramdisk=wcp mesa  /  abs --ramdisk=disabled electron40
+
+# Example: CachyOS kernel 3-stage PGO (AutoFDO + Propeller)
+# [packages.linux-cachyos]
+# source = "aur"
+# build_env = "local"
+# ramdisk = "w"
+#
+# [packages.linux-cachyos.kernel]
+# _cpusched = "cachyos"
+# _processor_opt = "native"
+#
+# [packages.linux-cachyos.pgo]
+# enabled = true
+# profiles_archive_dir = "/mnt/hdd/abs/pgo/profiles"
+# benchmark_command = "/path/to/custom-benchmark.sh"  # optional; default is bundled assets/pgo-benchmark.sh
+# profiling_quality = "maximum"  # standard | maximum (default: maximum)
+# perf_extra_args = "--mmap-pages 131072 -a -N -b -c 48000"  # override auto quality tuning
+# build_user = "john"
+# sysctl_command = "cachyos-perf-sysctl"
+# auto_restart = false  # reboot + resume via user systemd until PGO completes (--pgo-auto)

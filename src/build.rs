@@ -3,13 +3,14 @@ use crate::config::Config;
 use crate::git::{is_per_package_repo, prepare_repo, PkgbuildDirCache};
 use crate::package_spec::PackageSpec;
 use crate::pkgbuild::{
-    apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, restore_pkgbuild, update_pkgsums,
-    inject_compiler_env,
+    apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, parse_validpgpkeys, restore_pkgbuild,
+    update_pkgsums, inject_compiler_env,
 };
 use crate::utils::{
-    check_sudo_removal, pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
-    remove_src_pkg_workdirs, remove_stale_pkgs_in_pkgdest, run_command,
-    run_shell_in_dir_with_tee, vercmp,
+    check_sudo_removal, gpg_has_public_key, gpg_key_short_id, import_gpg_key_for_build,
+    pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
+    remove_src_pkg_workdirs, remove_stale_pkgs_in_pkgdest, run_command, run_shell_in_dir_with_tee,
+    vercmp, ShellRunOpts,
 };
 use crate::ramdisk::{self, WorkdirGuard};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,22 @@ use colored::Colorize;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// When compilation uses tmpfs (`w`) but the git repo stays on disk, keep makepkg source
+/// tarballs on disk so PGO stages do not re-download the kernel archive.
+fn ramdisk_srcdest_env(repo_dir: &Path, targets: &ramdisk::RamdiskTargets) -> String {
+    if !targets.build_workdir || targets.packages {
+        return String::new();
+    }
+    let srcdest = ramdisk::srcdest_for_repo(repo_dir);
+    if let Err(e) = std::fs::create_dir_all(&srcdest) {
+        crate::ewarn!("Failed to create SRCDEST {}: {e}", srcdest.display());
+    }
+    format!(
+        "SRCDEST={} ",
+        crate::utils::sh_single_quote(&srcdest.to_string_lossy())
+    )
+}
 
 fn normalize_repo_name(name: &str) -> String {
     name.to_ascii_lowercase()
@@ -47,12 +64,46 @@ fn repository_url(repos: &HashMap<String, String>, start: &str) -> Option<String
 
 pub struct PkgbuildGuard<'a> {
     pub repo_dir: &'a Path,
+    pub skip_restore: bool,
 }
 
 impl<'a> Drop for PkgbuildGuard<'a> {
     fn drop(&mut self) {
-        restore_pkgbuild(self.repo_dir);
+        if !self.skip_restore {
+            restore_pkgbuild(self.repo_dir);
+        }
     }
+}
+
+/// Overrides used by the kernel PGO pipeline when calling makepkg.
+#[derive(Debug, Clone)]
+pub struct PgoBuildContext {
+    pub env_vars: HashMap<String, String>,
+    pub makepkg_flags: String,
+    pub clean_src: bool,
+    pub clean_pkg: bool,
+    pub defer_pkgbuild_restore: bool,
+    pub skip_abs_install: bool,
+}
+
+/// Mirror CachyOS `linux-cachyos` PKGBUILD `pkgbase=linux-$_pkgsuffix` from PGO env vars.
+pub fn pgo_pkgbase_from_env(env: &HashMap<String, String>) -> String {
+    let llvm_lto = env.get("_use_llvm_lto").map(String::as_str).unwrap_or("thin");
+    let is_lto = matches!(llvm_lto, "thin" | "full" | "thin-dist");
+    let lto_suffix = env.get("_use_lto_suffix").map(String::as_str).unwrap_or("no");
+    let gcc_suffix = env.get("_use_gcc_suffix").map(String::as_str).unwrap_or("yes");
+    let pkgsuffix = if is_lto && lto_suffix == "yes" {
+        "cachyos-lto"
+    } else if !is_lto && gcc_suffix == "yes" {
+        "cachyos-gcc"
+    } else {
+        "cachyos"
+    };
+    format!("linux-{pkgsuffix}")
+}
+
+fn chroot_rootfs_is_complete(rootfs: &Path) -> bool {
+    crate::ramdisk::is_chroot_rootfs_complete(rootfs)
 }
 
 /// Ensure `<chrootdir>/root` exists for `makechrootpkg -r <chrootdir>` (see makechrootpkg(1)).
@@ -60,7 +111,15 @@ fn ensure_devtools_chroot(chrootdir: &Path) -> Result<(), String> {
     let rootfs = chrootdir.join("root");
 
     if rootfs.is_dir() {
-        return Ok(());
+        if chroot_rootfs_is_complete(&rootfs) {
+            vlog!("Using existing chroot rootfs at {}.", rootfs.display());
+            return Ok(());
+        }
+        blog!(
+            "Incomplete chroot rootfs at {}; removing and recreating with mkarchroot...",
+            rootfs.display()
+        );
+        check_sudo_removal(&rootfs)?;
     }
     if rootfs.exists() {
         return Err(format!(
@@ -84,6 +143,9 @@ fn ensure_devtools_chroot(chrootdir: &Path) -> Result<(), String> {
         "Chroot rootfs missing at {}; creating with mkarchroot (first run may take a while)...",
         rootfs.display()
     );
+    crate::utils::phase_banner(
+        "mkarchroot: installing base-devel into chroot (locale generation is the last step)",
+    );
 
     run_command(
         "sudo",
@@ -98,6 +160,8 @@ fn ensure_devtools_chroot(chrootdir: &Path) -> Result<(), String> {
         None::<&str>,
     )?;
 
+    crate::utils::restore_terminal();
+
     if !rootfs.is_dir() {
         return Err(format!(
             "mkarchroot finished but {} is not a usable directory",
@@ -105,6 +169,95 @@ fn ensure_devtools_chroot(chrootdir: &Path) -> Result<(), String> {
         ));
     }
 
+    blog!("Chroot rootfs ready at {}.", rootfs.display());
+    crate::utils::phase_banner("mkarchroot finished — syncing chroot working copy next");
+    Ok(())
+}
+
+fn chroot_worker_copy_name(chroot_copy: Option<&str>) -> String {
+    if let Some(name) = chroot_copy {
+        return name.to_string();
+    }
+    if let Ok(user) = std::env::var("SUDO_USER")
+        && !user.is_empty()
+        && user != "root"
+    {
+        return user;
+    }
+    match std::env::var("USER") {
+        Ok(user) if !user.is_empty() && user != "root" => user,
+        _ => "copy".to_string(),
+    }
+}
+
+fn chroot_copy_lock_path(chrootdir: &Path, copy: &str) -> PathBuf {
+    chrootdir.join(format!("{copy}.lock"))
+}
+
+/// Mirror `makechrootpkg` `sync_chroot` with visible rsync progress (devtools uses `rsync -q`).
+fn sync_chroot_working_copy(
+    chrootdir: &Path,
+    copy: &str,
+    refresh: bool,
+) -> Result<(), String> {
+    let root = chrootdir.join("root");
+    let copydir = chrootdir.join(copy);
+    let lock_path = chroot_copy_lock_path(chrootdir, copy);
+
+    if lock_path.is_file() {
+        vlog!("Removing stale chroot lock {}", lock_path.display());
+        let _ = check_sudo_removal(&lock_path);
+    }
+
+    if copydir.is_dir() {
+        if refresh || !chroot_rootfs_is_complete(&copydir) {
+            blog!(
+                "Refreshing chroot working copy at {}...",
+                copydir.display()
+            );
+            check_sudo_removal(&copydir)?;
+        } else {
+            vlog!("Using existing chroot working copy at {}", copydir.display());
+            return Ok(());
+        }
+    }
+
+    if !chroot_rootfs_is_complete(&root) {
+        return Err(format!(
+            "chroot root {} is missing or incomplete; cannot sync working copy",
+            root.display()
+        ));
+    }
+
+    crate::utils::phase_banner(format!(
+        "rsync: {} → {} (makechrootpkg skips this when the copy already exists)",
+        root.display(),
+        copydir.display()
+    ));
+
+    // The chroot root holds root-owned 0600/0700 files (shadow, gnupg keys, sudoers).
+    // devtools' makechrootpkg syncs as root; do the same so rsync can read them.
+    run_command(
+        "sudo",
+        &["mkdir", "-p", &copydir.to_string_lossy()],
+        None::<&str>,
+    )?;
+
+    let src = format!("{}/", root.to_string_lossy());
+    let dst = format!("{}/", copydir.to_string_lossy());
+    run_command(
+        "sudo",
+        &[
+            "rsync", "-a", "--delete", "--info=progress2", "-W", "-x", &src, &dst,
+        ],
+        None::<&str>,
+    )?;
+    run_command(
+        "sudo",
+        &["touch", copydir.to_string_lossy().as_ref()],
+        None::<&str>,
+    )?;
+    blog!("Chroot working copy ready at {}.", copydir.display());
     Ok(())
 }
 
@@ -180,7 +333,28 @@ impl Drop for ChrootBuildGuard {
     }
 }
 
-fn run_build_with_key_retry(build_cmd: &str, repo_dir: &Path) -> Result<(), String> {
+fn ensure_pkgsource_pgp_keys(build_dir: &Path) {
+    let pkgbuild_path = build_dir.join("PKGBUILD");
+    let Ok(text) = std::fs::read_to_string(&pkgbuild_path) else {
+        return;
+    };
+    for key in parse_validpgpkeys(&text) {
+        if gpg_has_public_key(&key) {
+            continue;
+        }
+        let short = gpg_key_short_id(&key);
+        crate::blog!("Importing PKGBUILD signing key {}...", short);
+        if let Err(e) = import_gpg_key_for_build(&key) {
+            crate::ewarn!("Could not import PGP key {}: {}", short, e);
+        }
+    }
+}
+
+fn run_build_with_key_retry(
+    build_cmd: &str,
+    repo_dir: &Path,
+    opts: ShellRunOpts,
+) -> Result<(), String> {
     let key_re = Regex::new(r"(?i)unknown public key ([0-9A-F]+)")
         .map_err(|e| format!("Failed to compile missing-key regex: {}", e))?;
     // Large logs (e.g. Firefox) can mention "unknown public key" long before the real failure in
@@ -190,7 +364,7 @@ fn run_build_with_key_retry(build_cmd: &str, repo_dir: &Path) -> Result<(), Stri
     let mut seen_keys: HashSet<String> = HashSet::new();
 
     loop {
-        match run_shell_in_dir_with_tee(repo_dir, build_cmd) {
+        match run_shell_in_dir_with_tee(repo_dir, build_cmd, opts) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if pkgbuild_phase_failed_re.is_match(&err) {
@@ -203,35 +377,38 @@ fn run_build_with_key_retry(build_cmd: &str, repo_dir: &Path) -> Result<(), Stri
                         newly_found.push(key);
                     }
                 }
+                if newly_found.is_empty()
+                    && err.to_ascii_lowercase().contains("pgp")
+                {
+                    if let Ok(text) = std::fs::read_to_string(repo_dir.join("PKGBUILD")) {
+                        for key in parse_validpgpkeys(&text) {
+                            let short = gpg_key_short_id(&key).to_string();
+                            if seen_keys.insert(short.clone()) {
+                                newly_found.push(short);
+                            }
+                        }
+                    }
+                }
                 if newly_found.is_empty() {
                     return Err(err);
                 }
 
                 for key in newly_found {
-                    crate::vlog!("Importing missing key: {}", key);
-                    if let Err(gpg_err) = run_command(
-                        "gpg",
-                        &[
-                            "--keyserver",
-                            "hkps://keyserver.ubuntu.com",
-                            "--recv-keys",
-                            &key,
-                        ],
-                        None::<&str>,
-                    ) {
+                    crate::blog!("Importing missing PGP key {}...", key);
+                    if let Err(gpg_err) = import_gpg_key_for_build(&key) {
                         return Err(format!(
                             "Build failed and key import also failed for {}: {}\nOriginal build error:\n{}",
                             key, gpg_err, err
                         ));
                     }
                 }
-                crate::vlog!("Retrying build after importing keys...");
+                crate::blog!("Retrying build after importing PGP keys...");
             }
         }
     }
 }
 
-fn resolve_pkg_repo(
+pub fn resolve_pkg_repo(
     pkg: &str,
     cli: &Cli,
     config: &Config,
@@ -365,7 +542,8 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
         false,
         false,
         None,
-    );
+    )
+    .pkg_dir;
     let src_ver = read_pkg_full_version_from_dir(pkg_dir.as_path())?;
     let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
         return Ok(true);
@@ -560,7 +738,8 @@ fn classify_manual_pkg_version(
         false,
         false,
         Some(pkgbuild_cache),
-    );
+    )
+    .pkg_dir;
     let src = read_pkg_full_version_from_dir(pkg_dir.as_path())?;
     let inst = pacman_query_version(&base_pkg)?;
     let Some(inst) = inst else {
@@ -686,10 +865,19 @@ pub fn install_package_phase(spec: &PackageSpec, cli: &Cli, config: &Config) {
 
     let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
-    let packages_path = match ramdisk::packages_path_for(config, pkg, Some(spec)) {
-        Ok(p) => p,
+    let ramdisk_targets = match ramdisk::resolve_ramdisk_targets(
+        config,
+        pkg_config,
+        Some(spec),
+        cli.ramdisk.as_deref(),
+    ) {
+        Ok(t) => t,
         Err(e) => die!("Invalid ramdisk targets for {}: {}", pkg, e),
     };
+    if let Err(e) = ramdisk::ensure_for_targets(config, &ramdisk_targets) {
+        die!("Ramdisk setup failed for {}: {}", pkg, e);
+    }
+    let packages_path = ramdisk::download_packages_path(config, &ramdisk_targets);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
     let repo_dir_path = prepare_repo(
         pkg,
@@ -700,7 +888,8 @@ pub fn install_package_phase(spec: &PackageSpec, cli: &Cli, config: &Config) {
         false,
         false,
         None,
-    );
+    )
+    .pkg_dir;
     let repo_dir = repo_dir_path.as_path();
 
     crate::install::install_artifacts(
@@ -766,12 +955,20 @@ pub fn process_package(
 ) -> bool {
     let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
-    let ramdisk_targets = match ramdisk::resolve_ramdisk_targets(config, pkg_config, Some(spec)) {
+    let ramdisk_targets = match ramdisk::resolve_ramdisk_targets(
+        config,
+        pkg_config,
+        Some(spec),
+        cli.ramdisk.as_deref(),
+    ) {
         Ok(t) => t,
         Err(e) => die!("Invalid ramdisk targets for {}: {}", pkg, e),
     };
+    if let Err(e) = ramdisk::ensure_for_targets(config, &ramdisk_targets) {
+        die!("Ramdisk setup failed for {}: {}", pkg, e);
+    }
     ramdisk::warn_if_packages_on_ram(config, pkg, &ramdisk_targets);
-    let packages_path = ramdisk::effective_packages_path(config, &ramdisk_targets);
+    let packages_path = ramdisk::download_packages_path(config, &ramdisk_targets);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
     let repo_url = repo_url_string.as_str();
     let base_pkg_name = base_pkg.as_str();
@@ -787,7 +984,8 @@ pub fn process_package(
             false,
             false,
             None,
-        );
+        )
+        .pkg_dir;
         crate::install::install_artifacts(pkg, base_pkg_name, Some(&repo_dir_path), config);
         return true;
     }
@@ -821,7 +1019,8 @@ pub fn process_package(
         cli.clean,
         refresh_remote,
         None,
-    );
+    )
+    .pkg_dir;
     let repo_dir = repo_dir_path.as_path();
 
     // Bash `process_package` order: `prepare_repo` → `PRE_UPDATE_COMMANDS` → `prepare_sums_pkgrel` → build …
@@ -831,7 +1030,10 @@ pub fn process_package(
     // If `.PKGBUILD.emerge_backup` already exists (e.g. last run stopped before restore), we do not
     // overwrite it — keep the upstream baseline for bump logic.
     backup_pkgbuild(repo_dir);
-    let _guard = PkgbuildGuard { repo_dir };
+    let _guard = PkgbuildGuard {
+        repo_dir,
+        skip_restore: false,
+    };
 
     let effective_cfg = resolve_effective_config(spec, cli, config, pkg_config);
 
@@ -868,6 +1070,13 @@ pub fn process_package(
         apply_pkgbuild_overrides(repo_dir, &spec.pkgbuild_overrides);
     }
 
+    // Kernel build variables are baked into the PKGBUILD so they apply in both local and chroot
+    // builds (env-var prefixes do not propagate into makechrootpkg's nspawn environment).
+    if !spec.kernel_vars.is_empty() {
+        blog!("Applying kernel build options for {}...", pkg);
+        apply_pkgbuild_overrides(repo_dir, &spec.kernel_vars);
+    }
+
     let is_upgrade = if let Ok(src_ver) = read_pkg_full_version_from_dir(repo_dir) {
         if let Ok(Some(inst_ver)) = pacman_query_version(base_pkg_name) {
             vercmp(&src_ver, &inst_ver).ok().is_some_and(|c| c > 0)
@@ -895,10 +1104,14 @@ pub fn process_package(
     let build_env = effective_cfg.build_env.clone();
     let skip_tests = effective_cfg.skip_tests;
 
-    let _workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets) {
+    let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, false) {
         Ok(guard) => guard,
         Err(e) => die!("Ramdisk build workdir setup failed: {}", e),
     };
+    let build_dir = workdir_guard
+        .as_ref()
+        .map(WorkdirGuard::build_dir)
+        .unwrap_or(repo_dir);
 
     let mut custom_cmd = None;
     if let Some(pc) = pkg_config {
@@ -910,8 +1123,9 @@ pub fn process_package(
     }
 
     if let Some(cmd) = custom_cmd {
+        ensure_pkgsource_pgp_keys(build_dir);
         blog!("Executing custom build command...");
-        if let Err(e) = run_build_with_key_retry(&cmd, repo_dir) {
+        if let Err(e) = run_build_with_key_retry(&cmd, build_dir, ShellRunOpts::default()) {
             if config.build.ignore_compilation_failures {
                 ewarn!("Custom build command failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -920,13 +1134,15 @@ pub fn process_package(
             die!("Custom build command failed: {}", e);
         }
     } else if build_env == "local" {
+        ensure_pkgsource_pgp_keys(build_dir);
         blog!("Building locally with makepkg...");
 
         let mut build_cmd = format!(
-            "PKGDEST=\"{}\" makepkg --syncdeps --noconfirm --needed -f",
+            "{}PKGDEST=\"{}\" makepkg --syncdeps --noconfirm --needed -f",
+            ramdisk_srcdest_env(repo_dir, &ramdisk_targets),
             config.paths.ready_made_packages_path
         );
-        if cli.clean {
+        if cli.clean && !ramdisk_targets.build_workdir {
             build_cmd.push_str(" -c");
         }
 
@@ -934,7 +1150,9 @@ pub fn process_package(
             build_cmd.push_str(" --nocheck");
         }
 
-        if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir) {
+        build_cmd = strip_makepkg_cleanbuild_in_shell(&build_cmd);
+
+        if let Err(e) = run_build_with_key_retry(&build_cmd, build_dir, ShellRunOpts::default()) {
             if config.build.ignore_compilation_failures {
                 ewarn!("makepkg failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -948,6 +1166,10 @@ pub fn process_package(
         let chroot_base = ramdisk::effective_chroot_base_path(config, &ramdisk_targets);
         let chrootdir = PathBuf::from(&chroot_base).join("base");
         let _chroot_guard = ChrootBuildGuard::new(config, chrootdir.clone(), chroot_copy);
+        blog!(
+            "Preparing chroot at {} (seed copy or mkarchroot if needed)...",
+            chrootdir.display()
+        );
         if let Err(e) = ramdisk::seed_chroot_if_needed(config, Path::new(&chroot_base), &ramdisk_targets)
             .and_then(|_| ensure_devtools_chroot(&chrootdir))
             .and_then(|_| inject_chroot_makepkg_conf(&chrootdir, config))
@@ -959,8 +1181,18 @@ pub fn process_package(
             }
             die!("Chroot setup failed for {}: {}", pkg, e);
         }
+        let copy_name = chroot_worker_copy_name(chroot_copy);
+        if let Err(e) = sync_chroot_working_copy(&chrootdir, &copy_name, cli.clean) {
+            if config.build.ignore_compilation_failures {
+                ewarn!("Chroot sync failed for {}: {}", pkg, e);
+                restore_pkgbuild(repo_dir);
+                return false;
+            }
+            die!("Chroot sync failed for {}: {}", pkg, e);
+        }
+        ensure_pkgsource_pgp_keys(build_dir);
         let mut build_cmd = format!(
-            "PKGDEST=\"{}\" makechrootpkg -c -r \"{}\" -d \"{}\"",
+            "PKGDEST=\"{}\" makechrootpkg -r \"{}\" -d \"{}\"",
             config.paths.ready_made_packages_path,
             chrootdir.to_string_lossy(),
             repo_dir.to_string_lossy()
@@ -973,7 +1205,15 @@ pub fn process_package(
         if skip_tests {
             build_cmd.push_str(" -- --nocheck");
         }
-        if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir) {
+        blog!("Starting makechrootpkg for {}...", pkg);
+        crate::utils::phase_banner(format!(
+            "makechrootpkg: installing dependencies and building {pkg} (large packages can take 30+ minutes)"
+        ));
+        let chroot_opts = ShellRunOpts {
+            live_output: true,
+            heartbeat_label: Some("makechrootpkg"),
+        };
+        if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir, chroot_opts) {
             if config.build.ignore_compilation_failures {
                 ewarn!("makechrootpkg failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -1002,6 +1242,216 @@ pub fn process_package(
     restore_pkgbuild(repo_dir);
 
     true
+}
+
+fn remove_dir_if_exists(path: &Path) {
+    if path.exists()
+        && let Err(e) = check_sudo_removal(path)
+    {
+        die!("Failed to remove {}: {}", path.display(), e);
+    }
+}
+
+fn format_pgo_makepkg_cmd(
+    config: &Config,
+    pgo: &PgoBuildContext,
+    repo_dir: &Path,
+    targets: &ramdisk::RamdiskTargets,
+) -> String {
+    let env_prefix: String = pgo
+        .env_vars
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, crate::utils::sh_single_quote(v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let srcdest = ramdisk_srcdest_env(repo_dir, targets);
+    let pkgdest = format!(
+        "PKGDEST={}",
+        crate::utils::sh_single_quote(&config.paths.ready_made_packages_path)
+    );
+    let mut parts = Vec::new();
+    if !srcdest.is_empty() {
+        parts.push(srcdest.trim().to_string());
+    }
+    if !env_prefix.is_empty() {
+        parts.push(env_prefix);
+    }
+    parts.push(pkgdest);
+    let makepkg_flags = sanitize_makepkg_flags_for_ramdisk(&pgo.makepkg_flags, targets);
+    format!(
+        "{} makepkg --syncdeps --noconfirm {}",
+        parts.join(" "),
+        makepkg_flags
+    )
+}
+
+/// makepkg `-c` / `--cleanbuild` removes `src/` and recreates it on disk, breaking ramdisk
+/// symlinks. Strip those flags when compilation uses tmpfs (`w`).
+fn sanitize_makepkg_flags_for_ramdisk(flags: &str, targets: &ramdisk::RamdiskTargets) -> String {
+    if !targets.build_workdir {
+        return flags.to_string();
+    }
+    strip_makepkg_cleanbuild_tokens(flags)
+}
+
+/// Remove makepkg clean flags from a token list or full shell command (flags after `makepkg` only).
+pub fn strip_makepkg_cleanbuild_in_shell(cmd: &str) -> String {
+    let mut out = Vec::new();
+    let mut past_makepkg = false;
+    let mut stripped = false;
+    for tok in cmd.split_whitespace() {
+        if tok == "makepkg" {
+            past_makepkg = true;
+            out.push(tok);
+            continue;
+        }
+        if past_makepkg && (tok == "--cleanbuild" || tok == "-c") {
+            stripped = true;
+            continue;
+        }
+        out.push(tok);
+    }
+    if stripped {
+        crate::blog!(
+            "Omitting makepkg --cleanbuild/-c so src/ and pkg/ stay on ramdisk tmpfs"
+        );
+    }
+    out.join(" ")
+}
+
+fn strip_makepkg_cleanbuild_tokens(flags: &str) -> String {
+    let tokens: Vec<&str> = flags.split_whitespace().collect();
+    let sanitized: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .filter(|tok| *tok != "--cleanbuild" && *tok != "-c")
+        .collect();
+    sanitized.join(" ")
+}
+
+/// Build a package under PGO pipeline overrides (env-injected makepkg, optional src/pkg cleanup).
+pub fn process_package_pgo(
+    spec: &PackageSpec,
+    cli: &Cli,
+    config: &Config,
+    pgo: &PgoBuildContext,
+    events: &crate::pgo::EventLog,
+) -> bool {
+    let pkg = spec.name.as_str();
+    let pkg_config = config.packages.get(pkg);
+    let ramdisk_targets = match ramdisk::resolve_ramdisk_targets(
+        config,
+        pkg_config,
+        Some(spec),
+        cli.ramdisk.as_deref(),
+    ) {
+        Ok(t) => t,
+        Err(e) => die!("Invalid ramdisk targets for {}: {}", pkg, e),
+    };
+    if let Err(e) = ramdisk::ensure_for_targets(config, &ramdisk_targets) {
+        die!("Ramdisk setup failed for {}: {}", pkg, e);
+    }
+    ramdisk::warn_if_packages_on_ram(config, pkg, &ramdisk_targets);
+    let packages_path = ramdisk::download_packages_path(config, &ramdisk_targets);
+    let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
+    let repo_dir_path = prepare_repo(
+        pkg,
+        base_pkg.as_str(),
+        &repo_name,
+        repo_url_string.as_str(),
+        &packages_path,
+        false,
+        false,
+        None,
+    )
+    .pkg_dir;
+    let repo_dir = repo_dir_path.as_path();
+
+    backup_pkgbuild(repo_dir);
+    let _guard = PkgbuildGuard {
+        repo_dir,
+        skip_restore: pgo.defer_pkgbuild_restore,
+    };
+
+    if pgo.clean_src && !ramdisk_targets.build_workdir {
+        remove_dir_if_exists(&repo_dir.join("src"));
+    }
+    if pgo.clean_pkg && !ramdisk_targets.build_workdir {
+        remove_dir_if_exists(&repo_dir.join("pkg"));
+    }
+
+    if !spec.pkgbuild_overrides.is_empty() {
+        apply_pkgbuild_overrides(repo_dir, &spec.pkgbuild_overrides);
+    }
+
+    if !spec.pkgbuild_overrides.contains_key("pkgrel") {
+        bump_pkgrel(repo_dir);
+    }
+
+    let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, pgo.clean_pkg) {
+        Ok(guard) => guard,
+        Err(e) => die!("Ramdisk build workdir setup failed: {}", e),
+    };
+    let build_dir = workdir_guard
+        .as_ref()
+        .map(WorkdirGuard::build_dir)
+        .unwrap_or(repo_dir);
+
+    let mut build_cmd = format_pgo_makepkg_cmd(config, pgo, repo_dir, &ramdisk_targets);
+    if workdir_guard.as_ref().is_some_and(WorkdirGuard::uses_ramdisk) {
+        build_cmd = strip_makepkg_cleanbuild_in_shell(&build_cmd);
+    }
+    events.log_line(
+        "stdout",
+        format!("$ (cd {} && {build_cmd})", build_dir.display()),
+    );
+
+    if let Err(e) = run_build_with_key_retry(&build_cmd, build_dir, ShellRunOpts::default()) {
+        if !pgo.defer_pkgbuild_restore {
+            restore_pkgbuild(repo_dir);
+        }
+        die!("PGO makepkg failed for {}: {}", pkg, e);
+    }
+
+    if !pgo.skip_abs_install && !cli.compile_only {
+        let pkgbase = pgo_pkgbase_from_env(&pgo.env_vars);
+        blog!("PGO stage installs packages for pkgbase {pkgbase}");
+        crate::install::install_pgo_artifacts(
+            pkg,
+            &pkgbase,
+            Some(repo_dir),
+            config,
+            &pgo.env_vars,
+        );
+    }
+
+    if !pgo.defer_pkgbuild_restore {
+        restore_pkgbuild(repo_dir);
+    }
+
+    true
+}
+
+/// One-shot (non-PGO) kernel build: applies the user's full `[packages.PKG.kernel]` options
+/// (scheduler, compiler/LTO, tick rate, etc.) to the PKGBUILD, then builds and installs in a
+/// single pass via the normal build path. This honors the configured `build_env` (local or
+/// chroot), custom build commands, and ramdisk targets, with no profiling.
+pub fn process_kernel_oneshot(package: &str, cli: &Cli, config: &Config) -> bool {
+    let kernel = config
+        .packages
+        .get(package)
+        .and_then(|p| p.kernel.clone())
+        .unwrap_or_default();
+
+    let mut spec = PackageSpec::plain(package);
+    for (key, val) in crate::config::kernel_override_pairs(&kernel) {
+        if let Some(v) = val {
+            spec.kernel_vars.insert(key.to_string(), v.clone());
+        }
+    }
+
+    blog!("One-shot kernel build for {} (no PGO)", package);
+    process_package(&spec, cli, config, false, None)
 }
 
 #[cfg(test)]
@@ -1067,6 +1517,41 @@ mod tests {
     }
 
     #[test]
+    fn strip_makepkg_cleanbuild_in_shell_command() {
+        use super::strip_makepkg_cleanbuild_in_shell;
+
+        let cmd = "SRCDEST='/tmp/x' PKGDEST='/tmp/r' makepkg --syncdeps --noconfirm --cleanbuild -sfi";
+        assert_eq!(
+            strip_makepkg_cleanbuild_in_shell(cmd),
+            "SRCDEST='/tmp/x' PKGDEST='/tmp/r' makepkg --syncdeps --noconfirm -sfi"
+        );
+    }
+
+    #[test]
+    fn sanitize_makepkg_flags_strips_cleanbuild_for_ramdisk_w() {
+        use super::sanitize_makepkg_flags_for_ramdisk;
+        use crate::ramdisk::RamdiskTargets;
+
+        let w = RamdiskTargets {
+            build_workdir: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            sanitize_makepkg_flags_for_ramdisk("--cleanbuild -sfi --noconfirm", &w),
+            "-sfi --noconfirm"
+        );
+        assert_eq!(
+            sanitize_makepkg_flags_for_ramdisk("-sfi -c", &w),
+            "-sfi"
+        );
+        let no_w = RamdiskTargets::default();
+        assert_eq!(
+            sanitize_makepkg_flags_for_ramdisk("--cleanbuild -sfi", &no_w),
+            "--cleanbuild -sfi"
+        );
+    }
+
+    #[test]
     fn test_aur_up_to_date_cache() {
         let pkg = "test_pkg_cache";
         // Ensure starting state is false
@@ -1080,5 +1565,45 @@ mod tests {
         // Unmark it and check
         super::unmark_aur_package_up_to_date(pkg);
         assert!(!super::is_aur_package_up_to_date(pkg));
+    }
+
+    #[test]
+    fn pgo_pkgbase_from_env_matches_cachyos_pkgnaming() {
+        use std::collections::HashMap;
+
+        let stage1 = HashMap::from([
+            ("_use_llvm_lto".into(), "none".into()),
+            ("_use_lto_suffix".into(), "no".into()),
+            ("_use_gcc_suffix".into(), "no".into()),
+        ]);
+        assert_eq!(super::pgo_pkgbase_from_env(&stage1), "linux-cachyos");
+
+        let stage2 = HashMap::from([
+            ("_use_llvm_lto".into(), "thin".into()),
+            ("_use_lto_suffix".into(), "yes".into()),
+            ("_use_gcc_suffix".into(), "no".into()),
+        ]);
+        assert_eq!(super::pgo_pkgbase_from_env(&stage2), "linux-cachyos-lto");
+    }
+
+    #[test]
+    fn chroot_rootfs_complete_requires_pacman_tree() {
+        let tmp = std::env::temp_dir().join(format!(
+            "abs-chroot-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("root")).unwrap();
+        assert!(!super::chroot_rootfs_is_complete(&tmp.join("root")));
+        std::fs::create_dir_all(tmp.join("root/etc")).unwrap();
+        std::fs::write(tmp.join("root/etc/pacman.conf"), "[options]\n").unwrap();
+        std::fs::create_dir_all(tmp.join("root/usr/bin")).unwrap();
+        std::fs::write(tmp.join("root/usr/bin/pacman"), "").unwrap();
+        std::fs::create_dir_all(tmp.join("root/var/lib/pacman/local")).unwrap();
+        assert!(super::chroot_rootfs_is_complete(&tmp.join("root")));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

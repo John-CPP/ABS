@@ -1,7 +1,7 @@
 use crate::config::{Config, PackageConfig, RamdiskConfig};
 use crate::package_spec::PackageSpec;
 use crate::utils::{
-    append_deletable_roots, check_sudo_removal, init_deletable_roots, path_has_prefix,
+    append_deletable_roots, check_sudo_removal, path_has_prefix,
     resolve_path_for_deletion, run_command, validate_config_path,
 };
 use crate::{blog, die, ewarn, is_dry_run_mode, vlog};
@@ -11,9 +11,6 @@ use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
 
 struct RamdiskSession {
     config: RamdiskConfig,
@@ -25,6 +22,39 @@ struct RamdiskSession {
 static SESSION: OnceLock<Mutex<Option<RamdiskSession>>> = OnceLock::new();
 static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 static EXIT_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
+static PENDING_WORKDIR_REMOVALS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+fn pending_workdir_removals() -> &'static Mutex<Vec<PathBuf>> {
+    PENDING_WORKDIR_REMOVALS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Ramdisk work trees queued for removal at [`shutdown`] (after the exit pause).
+pub fn pending_workdir_paths() -> Vec<PathBuf> {
+    pending_workdir_removals().lock().unwrap().clone()
+}
+
+fn defer_workdir_removal(path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    pending_workdir_removals().lock().unwrap().push(path);
+}
+
+pub fn cleanup_pending_workdirs() {
+    let paths: Vec<PathBuf> = pending_workdir_removals().lock().unwrap().drain(..).collect();
+    for path in paths {
+        if path.exists() {
+            let _ = check_sudo_removal(&path);
+        }
+    }
+}
+
+/// True when `<chrootdir>/root` looks like a finished `mkarchroot base-devel` tree.
+pub fn is_chroot_rootfs_complete(rootfs: &Path) -> bool {
+    rootfs.join("etc/pacman.conf").is_file()
+        && rootfs.join("usr/bin/pacman").is_file()
+        && rootfs.join("var/lib/pacman/local").is_dir()
+}
 
 fn session_lock() -> &'static Mutex<Option<RamdiskSession>> {
     SESSION.get_or_init(|| Mutex::new(None))
@@ -63,7 +93,23 @@ pub fn effective_packages_path(config: &Config, targets: &RamdiskTargets) -> Str
             .to_string_lossy()
             .into_owned();
     }
+    disk_packages_path(config)
+}
+
+/// On-disk packages path (never tmpfs). Source tarballs and git repos live here unless `p` is set.
+pub fn disk_packages_path(config: &Config) -> String {
     config.paths.packages_path.clone()
+}
+
+/// Where git clones / PKGBUILD / makepkg source tarballs are stored for this build.
+/// When only compilation (`w`) or profiles (`r`) use the ramdisk, downloads stay on disk.
+pub fn download_packages_path(config: &Config, targets: &RamdiskTargets) -> String {
+    effective_packages_path(config, targets)
+}
+
+/// Persistent makepkg source tarball cache beside the repo (always on disk).
+pub fn srcdest_for_repo(repo_dir: &Path) -> PathBuf {
+    repo_dir.join(".makepkg-src")
 }
 
 pub fn effective_chroot_base_path(config: &Config, targets: &RamdiskTargets) -> String {
@@ -85,16 +131,44 @@ pub struct RamdiskTargets {
     pub build_workdir: bool,
     pub chroot: bool,
     pub packages: bool,
+    /// PGO profile collection scratch (perf data) on tmpfs before archiving.
+    pub profiles: bool,
 }
 
 impl RamdiskTargets {
-    #[allow(dead_code)]
     pub fn any(&self) -> bool {
-        self.build_workdir || self.chroot || self.packages
+        self.build_workdir || self.chroot || self.packages || self.profiles
     }
 }
 
-/// Parse `w` (workdir), `c` (chroot), `p` (packages). Separators are ignored (`wcp`, `w,c,p`, `w-c-p`).
+/// Per-package / CLI override that disables all ramdisk targets (disk-only build).
+pub const RAMDISK_DISABLED: &str = "disabled";
+
+/// True for `disabled` (case-insensitive); also accepts empty string (legacy abs.toml).
+pub fn is_ramdisk_disabled(code: &str) -> bool {
+    code.trim().is_empty() || code.trim().eq_ignore_ascii_case(RAMDISK_DISABLED)
+}
+
+/// Canonical ramdisk code for abs.toml / CLI (e.g. `"wr"`, `"wcp"`).
+pub fn format_ramdisk_targets(targets: &RamdiskTargets) -> String {
+    let mut s = String::new();
+    if targets.build_workdir {
+        s.push('w');
+    }
+    if targets.chroot {
+        s.push('c');
+    }
+    if targets.packages {
+        s.push('p');
+    }
+    if targets.profiles {
+        s.push('r');
+    }
+    s
+}
+
+/// Parse `w` (workdir), `c` (chroot), `p` (packages), `r` (PGO profile scratch).
+/// Separators are ignored (`wcp`, `w,c,p`, `w-c-p`).
 pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
     let mut targets = RamdiskTargets::default();
     let mut saw = false;
@@ -112,10 +186,14 @@ pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
                 targets.packages = true;
                 saw = true;
             }
+            'r' => {
+                targets.profiles = true;
+                saw = true;
+            }
             ',' | ' ' | '+' | '/' | '-' | '_' => {}
             _ => {
                 return Err(format!(
-                    "invalid ramdisk target '{ch}' in {:?} (use w=workdir, c=chroot, p=packages)",
+                    "invalid ramdisk target '{ch}' in {:?} (use w=workdir, c=chroot, p=packages, r=profiles)",
                     code
                 ));
             }
@@ -123,7 +201,7 @@ pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
     }
     if !code.trim().is_empty() && !saw {
         return Err(format!(
-            "ramdisk targets {:?} contain no recognized letters (use w, c, p)",
+            "ramdisk targets {:?} contain no recognized letters (use w, c, p, r)",
             code
         ));
     }
@@ -134,46 +212,41 @@ pub fn resolve_ramdisk_targets(
     config: &Config,
     pkg_config: Option<&PackageConfig>,
     spec: Option<&PackageSpec>,
+    cli_ramdisk: Option<&str>,
 ) -> Result<RamdiskTargets, String> {
+    let override_code = spec
+        .and_then(|s| s.ramdisk.as_deref())
+        .or(cli_ramdisk)
+        .or_else(|| pkg_config.and_then(|p| p.ramdisk.as_deref()));
+
+    // Per-package / CLI ramdisk= (e.g. kernel PGO `wr`) applies even when [ramdisk].enabled = false.
+    if let Some(code) = override_code {
+        if is_ramdisk_disabled(code) {
+            return Ok(RamdiskTargets::default());
+        }
+        return parse_ramdisk_targets(code);
+    }
+
     if !config.ramdisk.enabled {
         return Ok(RamdiskTargets::default());
     }
 
-    let mut targets = RamdiskTargets {
+    Ok(RamdiskTargets {
         build_workdir: config.ramdisk.build_workdir,
         chroot: config.ramdisk.chroot,
         packages: config.ramdisk.packages,
-    };
-
-    let override_code = spec
-        .and_then(|s| s.ramdisk.as_deref())
-        .or_else(|| pkg_config.and_then(|p| p.ramdisk.as_deref()));
-
-    if let Some(code) = override_code {
-        targets = parse_ramdisk_targets(code)?;
-    }
-
-    Ok(targets)
+        profiles: false,
+    })
 }
 
 pub fn resolve_ramdisk_targets_for_pkg(config: &Config, pkg_name: &str) -> RamdiskTargets {
     let pkg_config = config.packages.get(pkg_name);
-    resolve_ramdisk_targets(config, pkg_config, None).unwrap_or_default()
-}
-
-pub fn packages_path_for(
-    config: &Config,
-    pkg_name: &str,
-    spec: Option<&PackageSpec>,
-) -> Result<String, String> {
-    let pkg_config = config.packages.get(pkg_name);
-    let targets = resolve_ramdisk_targets(config, pkg_config, spec)?;
-    Ok(effective_packages_path(config, &targets))
+    resolve_ramdisk_targets(config, pkg_config, None, None).unwrap_or_default()
 }
 
 pub fn packages_path_for_pkg(config: &Config, pkg_name: &str) -> String {
     let targets = resolve_ramdisk_targets_for_pkg(config, pkg_name);
-    effective_packages_path(config, &targets)
+    download_packages_path(config, &targets)
 }
 
 pub fn warn_if_packages_on_ram(config: &Config, pkg_name: &str, targets: &RamdiskTargets) {
@@ -302,23 +375,100 @@ fn ensure_ramdisk_subdir(path: &Path) -> Result<(), String> {
     match fs::create_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let (uid, gid) = invoking_uid_gid();
-            let path_str = path.to_string_lossy();
-            if is_dry_run_mode() {
-                println!("[DRY RUN] sudo mkdir -p {}", path_str);
-                println!("[DRY RUN] sudo chown {}:{} {}", uid, gid, path_str);
-                return Ok(());
-            }
-            run_command("sudo", &["mkdir", "-p", path_str.as_ref()], None::<&str>)?;
-            run_command(
-                "sudo",
-                &["chown", &format!("{uid}:{gid}"), path_str.as_ref()],
-                None::<&str>,
-            )?;
-            Ok(())
+            ensure_ramdisk_path(path)
         }
         Err(e) => Err(format!("failed to create {}: {}", path.display(), e)),
     }
+}
+
+/// Create a directory under the active ramdisk mount with correct ownership.
+/// Uses sudo because stale mounts or prior runs may leave `work/` root-owned.
+fn ensure_ramdisk_path(path: &Path) -> Result<(), String> {
+    if is_dry_run_mode() {
+        println!("[DRY RUN] sudo mkdir -p {}", path.display());
+        println!(
+            "[DRY RUN] sudo chown -R {}:{} {}",
+            invoking_uid_gid().0,
+            invoking_uid_gid().1,
+            path.display()
+        );
+        return Ok(());
+    }
+    let (uid, gid) = invoking_uid_gid();
+    let path_str = path.to_string_lossy();
+    run_command("sudo", &["mkdir", "-p", path_str.as_ref()], None::<&str>)?;
+    run_command(
+        "sudo",
+        &["chown", "-R", &format!("{uid}:{gid}"), path_str.as_ref()],
+        None::<&str>,
+    )?;
+    if !path.is_dir() {
+        return Err(format!(
+            "ramdisk directory {} was not created (is tmpfs mounted and writable?)",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Large PGO profiling artifacts live on disk (or pgo-scratch), not in the ramdisk workdir.
+const PGO_REPO_RSYNC_EXCLUDES: &[&str] = &[
+    ".git/",
+    "kernel.data",
+    "kernel.data.old",
+    "propeller.data",
+    "propeller.data.old",
+];
+
+fn repair_root_owned_pgo_artifacts(repo: &Path) {
+    for name in PGO_REPO_RSYNC_EXCLUDES {
+        if *name == ".git/" {
+            continue;
+        }
+        let path = repo.join(name);
+        if path.is_file() {
+            let _ = crate::utils::ensure_build_user_can_read(&path);
+        }
+    }
+}
+
+fn sync_package_tree_to_ramdisk(
+    disk_repo: &Path,
+    ram_repo: &Path,
+    clear_pkg: bool,
+) -> Result<(), String> {
+    blog!(
+        "Ramdisk (w): syncing package tree {} → {}",
+        disk_repo.display(),
+        ram_repo.display()
+    );
+    repair_root_owned_pgo_artifacts(disk_repo);
+    ensure_ramdisk_path(ram_repo)?;
+    if clear_pkg {
+        let pkg = ram_repo.join("pkg");
+        if pkg.exists() {
+            check_sudo_removal(&pkg)?;
+        }
+    }
+    if is_dry_run_mode() {
+        println!(
+            "[DRY RUN] rsync -a --delete --exclude .git/ {}/ {}/",
+            disk_repo.display(),
+            ram_repo.display()
+        );
+        return Ok(());
+    }
+    let src = format!("{}/", disk_repo.to_string_lossy());
+    let dst = format!("{}/", ram_repo.to_string_lossy());
+    let mut rsync_args: Vec<String> = vec!["-a".into(), "--delete".into()];
+    for exclude in PGO_REPO_RSYNC_EXCLUDES {
+        rsync_args.push("--exclude".into());
+        rsync_args.push((*exclude).into());
+    }
+    rsync_args.push(src);
+    rsync_args.push(dst);
+    let refs: Vec<&str> = rsync_args.iter().map(String::as_str).collect();
+    run_command("rsync", &refs, None::<&str>)
 }
 
 fn ensure_mount_tree(mount_point: &Path) -> Result<(), String> {
@@ -358,6 +508,15 @@ fn force_unmount(mount_point: &Path) -> Result<(), String> {
 fn mount_tmpfs(mount_point: &Path, config: &RamdiskConfig) -> Result<bool, String> {
     if is_mount_point(mount_point) {
         if config.reclaim_mount_on_startup {
+            let cached_chroot = mount_point.join("chroot/base/root");
+            if is_chroot_rootfs_complete(&cached_chroot) {
+                blog!(
+                    "Reusing ramdisk at {} (cached chroot; run `abs --ramdisk-shutdown` to clear)",
+                    mount_point.display()
+                );
+                ensure_mount_tree(mount_point)?;
+                return Ok(false);
+            }
             vlog!(
                 "Reclaiming existing tmpfs mount at {} before mounting a fresh ramdisk...",
                 mount_point.display()
@@ -431,34 +590,71 @@ pub fn install_exit_handlers() {
     if EXIT_HANDLERS_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
-    if let Err(e) = ctrlc::set_handler(|| {
-        eprintln!("==> WARNING: Interrupted; stopping builds and unmounting ramdisk...");
+    let on_interrupt = || {
+        eprintln!(
+            "==> WARNING: Interrupted (abs {}); stopping builds (ramdisk kept mounted for retry)...",
+            env!("CARGO_PKG_VERSION")
+        );
         crate::utils::terminate_foreground_children();
+        if let Some(session) = session_ref() {
+            crate::utils::kill_processes_with_cwd_under(&session.mount_point, "ramdisk");
+        }
         crate::pkgbuild::restore_pending_pkgbuilds();
-        shutdown();
+        crate::utils::restore_terminal();
+        shutdown_on_interrupt();
         std::process::exit(130);
-    }) {
+    };
+    if let Err(e) = ctrlc::set_handler(on_interrupt) {
         ewarn!("Failed to install ramdisk interrupt handler: {}", e);
+    }
+    unsafe {
+        extern "C" fn on_sigterm(_: libc::c_int) {
+            eprintln!(
+                "==> WARNING: Terminated (abs {}); stopping builds (ramdisk kept mounted for retry)...",
+                env!("CARGO_PKG_VERSION")
+            );
+            crate::utils::terminate_foreground_children();
+            if let Some(session) = session_ref() {
+                crate::utils::kill_processes_with_cwd_under(&session.mount_point, "ramdisk");
+            }
+            crate::pkgbuild::restore_pending_pkgbuilds();
+            crate::utils::restore_terminal();
+            shutdown_on_interrupt();
+            unsafe {
+                libc::_exit(143);
+            }
+        }
+        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
     }
 }
 
-pub fn initialize(config: &Config) -> Result<(), String> {
-    if !config.ramdisk.enabled {
+/// Mount tmpfs when a package task needs ramdisk targets (`w`/`c`/`p`/`r`). No-op when no target
+/// flags apply for this package, or a session is already active. Per-package `ramdisk = "wr"`
+/// mounts tmpfs even if `[ramdisk].enabled = false` (global `enabled` only gates default targets).
+pub fn ensure_for_targets(config: &Config, targets: &RamdiskTargets) -> Result<(), String> {
+    if !targets.any() {
+        return Ok(());
+    }
+    if session_ref().is_some() {
         return Ok(());
     }
 
+    if targets.packages && config.ramdisk.warn_packages_ram {
+        ewarn!(
+            "[ramdisk] packages (p) enabled for this build; packages_path uses tmpfs \
+             (high RAM use for large git trees)"
+        );
+    }
+
+    mount_session(config)
+}
+
+fn mount_session(config: &Config) -> Result<(), String> {
     let available = mem_available_mb()?;
     if available < config.ramdisk.min_free_ram_mb {
         die!(
             "Refusing to mount ramdisk: MemAvailable is {} MiB (min_free_ram_mb = {})",
             available, config.ramdisk.min_free_ram_mb
-        );
-    }
-
-    if config.ramdisk.packages && config.ramdisk.warn_packages_ram {
-        ewarn!(
-            "[ramdisk] packages = true moves the entire packages_path to tmpfs. \
-             This can use many gigabytes of RAM for large git trees and sources."
         );
     }
 
@@ -493,24 +689,36 @@ pub fn initialize(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-pub fn refresh_deletable_roots(config: &Config) -> Result<(), String> {
-    let default_targets = resolve_ramdisk_targets_for_pkg(config, "");
-    let chroot_base = effective_chroot_base_path(config, &default_targets);
-    let packages_path = effective_packages_path(config, &default_targets);
-    let mut extra = Vec::new();
-    if let Some(session) = session_ref() {
-        extra = ramdisk_mount_subdirs(&session.mount_point);
-    }
-    init_deletable_roots(
-        &packages_path,
-        &chroot_base,
-        &config.paths.ready_made_packages_path,
-        &extra,
-    )
-}
-
 pub fn is_session_active() -> bool {
     session_ref().is_some()
+}
+
+/// Tmpfs mount point when a ramdisk session is active.
+pub fn session_mount_point() -> Option<PathBuf> {
+    session_ref().map(|s| s.mount_point)
+}
+
+/// Path for PGO perf/profile scratch on the active ramdisk session.
+pub fn pgo_scratch_path(mount: &Path, package: &str) -> PathBuf {
+    mount.join("pgo-scratch").join(package)
+}
+
+/// Mount tmpfs (when needed) and create `pgo-scratch/<package>` for PGO profiling.
+pub fn ensure_pgo_scratch_dir(
+    config: &Config,
+    package: &str,
+    targets: &RamdiskTargets,
+) -> Result<Option<PathBuf>, String> {
+    if !targets.profiles && !targets.build_workdir {
+        return Ok(None);
+    }
+    ensure_for_targets(config, targets)?;
+    let Some(mount) = session_mount_point() else {
+        return Ok(None);
+    };
+    let scratch = pgo_scratch_path(&mount, package);
+    ensure_ramdisk_path(&scratch)?;
+    Ok(Some(scratch))
 }
 
 pub fn seed_chroot_if_needed(
@@ -531,7 +739,12 @@ pub fn seed_chroot_if_needed(
     }
 
     let chroot_base = chroot_base.to_path_buf();
-    if chroot_base.join("base").join("root").is_dir() {
+    let rootfs = chroot_base.join("base").join("root");
+    if is_chroot_rootfs_complete(&rootfs) {
+        vlog!(
+            "Ramdisk chroot already present at {}; skipping seed copy",
+            chroot_base.display()
+        );
         return Ok(());
     }
 
@@ -557,11 +770,14 @@ pub fn seed_chroot_if_needed(
         "rsync",
         &[
             "-a",
+            "--info=progress2",
             &format!("{}/", seed_path.to_string_lossy()),
             &format!("{}/", chroot_base.to_string_lossy()),
         ],
         None::<&str>,
-    )
+    )?;
+    blog!("Chroot seed copy finished.");
+    Ok(())
 }
 
 fn sync_chroot_to_seed(session: &RamdiskSession) {
@@ -613,7 +829,7 @@ fn sync_chroot_to_seed(session: &RamdiskSession) {
     }
 }
 
-pub fn shutdown() {
+pub fn shutdown_on_interrupt() {
     if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -626,120 +842,117 @@ pub fn shutdown() {
     };
 
     sync_chroot_to_seed(&session);
+    if session.unmount_on_shutdown {
+        crate::utils::phase_banner(format!(
+            "Ramdisk left mounted at {} — retry the build to skip mkarchroot; run `abs --ramdisk-shutdown` to unmount",
+            session.mount_point.display()
+        ));
+    }
+}
+
+pub fn shutdown() {
+    if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    crate::utils::terminate_foreground_children();
+
+    let session = session_lock().lock().unwrap().take();
+    let Some(session) = session else {
+        cleanup_pending_workdirs();
+        return;
+    };
+
+    sync_chroot_to_seed(&session);
+    cleanup_pending_workdirs();
     unmount_tmpfs(&session.mount_point, session.unmount_on_shutdown);
 }
 
-fn migrate_dir_to_workdir(source: &Path, target: &Path) -> Result<(), String> {
-    fs::create_dir_all(target.parent().unwrap_or(target))
-        .map_err(|e| format!("failed to create {}: {}", target.display(), e))?;
-
-    if source.is_symlink() {
-        fs::remove_file(source).map_err(|e| format!("failed to remove symlink {}: {}", source.display(), e))?;
-    } else if source.is_dir() {
-        if is_dry_run_mode() {
-            println!(
-                "[DRY RUN] cp -a {}/. {}/",
-                source.display(),
-                target.display()
-            );
-        } else {
-            run_command(
-                "cp",
-                &[
-                    "-a",
-                    &format!("{}/.", source.to_string_lossy()),
-                    &format!("{}/.", target.to_string_lossy()),
-                ],
-                None::<&str>,
-            )?;
-        }
-        check_sudo_removal(source)?;
-    } else if source.exists() {
-        return Err(format!(
-            "{} exists but is neither a directory nor a symlink",
-            source.display()
-        ));
-    } else {
-        fs::create_dir_all(target)
-            .map_err(|e| format!("failed to create {}: {}", target.display(), e))?;
+/// Unmount the configured ramdisk when the abs process no longer has session state
+/// (e.g. GUI abort killed abs, or user ran `--ramdisk-shutdown`).
+pub fn force_unmount_configured(config: &Config) -> Result<(), String> {
+    let mount_point = PathBuf::from(config.ramdisk.mount_point.trim());
+    if mount_point.as_os_str().is_empty() {
+        return Ok(());
     }
-
-    if is_dry_run_mode() {
-        println!(
-            "[DRY RUN] ln -s {} {}",
-            target.display(),
-            source.display()
+    if !is_mount_point(&mount_point) {
+        vlog!(
+            "Ramdisk mount point {} is not mounted; nothing to unmount",
+            mount_point.display()
         );
         return Ok(());
     }
 
-    #[cfg(unix)]
-    symlink(target, source).map_err(|e| {
-        format!(
-            "failed to symlink {} -> {}: {}",
-            source.display(),
-            target.display(),
-            e
-        )
-    })?;
-    Ok(())
+    if config.ramdisk.sync_chroot_on_exit && config.ramdisk.chroot {
+        let session = RamdiskSession {
+            config: config.ramdisk.clone(),
+            mount_point: mount_point.clone(),
+            unmount_on_shutdown: true,
+        };
+        sync_chroot_to_seed(&session);
+    }
+
+    blog!("Unmounting ramdisk at {}...", mount_point.display());
+    cleanup_pending_workdirs();
+    force_unmount(&mount_point)
 }
 
 pub struct WorkdirGuard {
-    repo_dir: PathBuf,
-    workdir: PathBuf,
+    disk_repo: PathBuf,
+    ram_repo: Option<PathBuf>,
 }
 
 impl WorkdirGuard {
+    /// Directory where makepkg should run (ramdisk copy when `w` is active).
+    pub fn build_dir(&self) -> &Path {
+        self.ram_repo
+            .as_deref()
+            .unwrap_or(self.disk_repo.as_path())
+    }
+
+    pub fn uses_ramdisk(&self) -> bool {
+        self.ram_repo.is_some()
+    }
+
     pub fn setup(
         config: &Config,
-        repo_dir: &Path,
+        disk_repo: &Path,
         targets: &RamdiskTargets,
+        clear_pkg: bool,
     ) -> Result<Option<Self>, String> {
-        let Some(session) = session_ref() else {
-            return Ok(None);
-        };
         if !targets.build_workdir {
             return Ok(None);
         }
+        let Some(session) = session_ref() else {
+            return Ok(None);
+        };
 
-        let packages_path = effective_packages_path(config, targets);
-        let key = workdir_key(repo_dir, &packages_path);
-        let workdir = session.mount_point.join("work").join(key);
-        let src_target = workdir.join("src");
-        let pkg_target = workdir.join("pkg");
+        let packages_path = download_packages_path(config, targets);
+        let key = workdir_key(disk_repo, &packages_path);
+        let ram_repo = session.mount_point.join("work").join(key);
 
-        vlog!(
-            "Ramdisk build workdir for {}: {}",
-            repo_dir.display(),
-            workdir.display()
-        );
-
-        migrate_dir_to_workdir(&repo_dir.join("src"), &src_target)?;
-        migrate_dir_to_workdir(&repo_dir.join("pkg"), &pkg_target)?;
+        sync_package_tree_to_ramdisk(disk_repo, &ram_repo, clear_pkg)?;
 
         Ok(Some(Self {
-            repo_dir: repo_dir.to_path_buf(),
-            workdir,
+            disk_repo: disk_repo.to_path_buf(),
+            ram_repo: Some(ram_repo),
         }))
     }
 }
 
 impl Drop for WorkdirGuard {
     fn drop(&mut self) {
-        for name in ["src", "pkg"] {
-            let link = self.repo_dir.join(name);
-            if link.is_symlink() {
-                let _ = fs::remove_file(&link);
-            }
-        }
-        if self.workdir.exists() {
-            let _ = check_sudo_removal(&self.workdir);
+        if let Some(ram) = self.ram_repo.take()
+            && ram.exists()
+        {
+            // Keep the tree until after the interactive exit pause (see `shutdown`).
+            defer_workdir_removal(ram);
         }
     }
 }
 
 pub fn remove_ramdisk_work(_config: &Config) {
+    cleanup_pending_workdirs();
     if let Some(session) = session_ref() {
         let work = session.mount_point.join("work");
         if work.exists() {
@@ -777,15 +990,89 @@ mod tests {
     }
 
     #[test]
+    fn pgo_scratch_path_under_mount() {
+        let p = pgo_scratch_path(Path::new("/run/abs-ram"), "linux-cachyos");
+        assert_eq!(p, PathBuf::from("/run/abs-ram/pgo-scratch/linux-cachyos"));
+    }
+
+    #[test]
+    fn pending_workdir_paths_tracks_deferred_removals() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs-pending-workdir-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        defer_workdir_removal(dir.clone());
+        assert_eq!(pending_workdir_paths(), vec![dir.clone()]);
+        cleanup_pending_workdirs();
+        assert!(pending_workdir_paths().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn parse_ramdisk_targets_letters() {
         let t = parse_ramdisk_targets("wcp").unwrap();
-        assert!(t.build_workdir && t.chroot && t.packages);
+        assert!(t.build_workdir && t.chroot && t.packages && !t.profiles);
+        let t = parse_ramdisk_targets("wr").unwrap();
+        assert!(t.build_workdir && t.profiles && !t.chroot && !t.packages);
+        assert_eq!(format_ramdisk_targets(&t), "wr");
         let t = parse_ramdisk_targets("w").unwrap();
         assert!(t.build_workdir && !t.chroot && !t.packages);
         let t = parse_ramdisk_targets("w,c-p").unwrap();
         assert!(t.build_workdir && t.chroot && t.packages);
-        assert!(parse_ramdisk_targets("").unwrap().build_workdir == false);
+        assert!(!parse_ramdisk_targets("").unwrap().build_workdir);
         assert!(parse_ramdisk_targets("xyz").is_err());
+        assert!(parse_ramdisk_targets("disabled").is_err());
+    }
+
+    #[test]
+    fn is_ramdisk_disabled_values() {
+        assert!(is_ramdisk_disabled(""));
+        assert!(is_ramdisk_disabled("disabled"));
+        assert!(is_ramdisk_disabled("DISABLED"));
+        assert!(!is_ramdisk_disabled("w"));
+    }
+
+    #[test]
+    fn resolve_ramdisk_disabled_overrides_global() {
+        use crate::config::Config;
+
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/p"
+chroot_base_path = "/tmp/c"
+ready_made_packages_path = "/tmp/r"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[ramdisk]
+enabled = true
+build_workdir = true
+chroot = true
+packages = true
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let t = resolve_ramdisk_targets(&config, None, None, Some("disabled")).unwrap();
+        assert!(!t.any());
+        let t = resolve_ramdisk_targets(&config, None, None, Some("wcp")).unwrap();
+        assert!(t.build_workdir && t.chroot && t.packages);
     }
 
     #[test]
@@ -826,22 +1113,105 @@ packages = false
 "#;
         let config: Config = toml::from_str(toml_content).unwrap();
 
-        let global = resolve_ramdisk_targets(&config, None, None).unwrap();
+        let global = resolve_ramdisk_targets(&config, None, None, None).unwrap();
         assert!(!global.build_workdir && !global.chroot && !global.packages);
 
         let pkg = PackageConfig {
             ramdisk: Some("wcp".to_string()),
             ..Default::default()
         };
-        let t = resolve_ramdisk_targets(&config, Some(&pkg), None).unwrap();
+        let t = resolve_ramdisk_targets(&config, Some(&pkg), None, None).unwrap();
         assert!(t.build_workdir && t.chroot && t.packages);
+
+        let t = resolve_ramdisk_targets(&config, Some(&pkg), None, Some("w")).unwrap();
+        assert!(t.build_workdir && !t.chroot && !t.packages);
 
         let spec = PackageSpec {
             ramdisk: Some("c".to_string()),
             ..PackageSpec::plain("mesa")
         };
-        let t = resolve_ramdisk_targets(&config, Some(&pkg), Some(&spec)).unwrap();
+        let t = resolve_ramdisk_targets(&config, Some(&pkg), Some(&spec), Some("w")).unwrap();
         assert!(!t.build_workdir && t.chroot && !t.packages);
+    }
+
+    #[test]
+    fn resolve_ramdisk_per_package_wr_without_global_enabled() {
+        use crate::config::Config;
+
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/p"
+chroot_base_path = "/tmp/c"
+ready_made_packages_path = "/tmp/r"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[ramdisk]
+enabled = false
+
+[packages.linux-cachyos]
+ramdisk = "wr"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let pkg = config.packages.get("linux-cachyos").unwrap();
+        let t = resolve_ramdisk_targets(&config, Some(pkg), None, None).unwrap();
+        assert!(t.build_workdir && t.profiles && !t.packages && !t.chroot);
+    }
+
+    #[test]
+    fn ensure_for_targets_noop_without_target_flags() {
+        use crate::config::Config;
+
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/p"
+chroot_base_path = "/tmp/c"
+ready_made_packages_path = "/tmp/r"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[ramdisk]
+enabled = true
+build_workdir = false
+chroot = false
+packages = false
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let targets = RamdiskTargets::default();
+        ensure_for_targets(&config, &targets).unwrap();
+        assert!(!is_session_active());
     }
 
     #[test]

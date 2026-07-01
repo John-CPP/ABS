@@ -91,8 +91,98 @@ fn resolve_packagelist_line(
     best_match.map(|(path, _)| path)
 }
 
-/// Artifacts already in **`PKGDEST`** for this package (no `makepkg` subprocess).
+/// True when a built package name belongs to this PGO stage's `pkgbase` (e.g. `linux-cachyos-dbg`
+/// yes, `linux-cachyos-lto` no when pkgbase is `linux-cachyos`).
+pub fn artifact_belongs_to_pkgbase(pkg_name: &str, pkgbase: &str) -> bool {
+    if pkg_name == pkgbase {
+        return true;
+    }
+    let Some(suffix) = pkg_name.strip_prefix(&format!("{pkgbase}-")) else {
+        return false;
+    };
+    // Sibling kernel variants share the `linux-cachyos-*` prefix but are separate pkgbases.
+    !suffix.starts_with("lto") && !suffix.starts_with("gcc")
+}
+
+fn makepkg_env_pairs(env: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+fn collect_pgo_candidate_files(
+    repo_dir: &Path,
+    pkgbase: &str,
+    ready_packages_path: &str,
+    makepkg_env: &HashMap<String, String>,
+) -> Vec<PathBuf> {
+    let mut env_pairs = makepkg_env_pairs(makepkg_env);
+    env_pairs.push(("PKGDEST".into(), ready_packages_path.to_string()));
+    let env_refs: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    if let Ok(output) = run_command_with_output_env(
+        "makepkg",
+        &["--packagelist"],
+        Some(repo_dir),
+        &env_refs,
+    ) {
+        let mut files = Vec::new();
+        for line in output.lines() {
+            if let Some(p) = resolve_packagelist_line(line, repo_dir, ready_packages_path)
+                && let Some(name) = package_name_from_file(&p)
+                && artifact_belongs_to_pkgbase(&name, pkgbase)
+            {
+                files.push(p);
+            }
+        }
+        files.sort();
+        files.dedup();
+        if !files.is_empty() {
+            return files;
+        }
+    }
+
+    collect_candidate_files_from_pkgdest(pkgbase, ready_packages_path)
+}
+
 fn collect_candidate_files_from_pkgdest(
+    pkgbase: &str,
+    ready_packages_path: &str,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(ready_packages_path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !crate::utils::is_package_artifact(name) {
+                continue;
+            }
+            if let Some(pkg_name) = package_name_from_file(&p)
+                && artifact_belongs_to_pkgbase(&pkg_name, pkgbase)
+            {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Legacy scan used by non-PGO installs (matches abs package name prefix).
+fn collect_candidate_files_from_pkgdest_legacy(
     pkg_input: &str,
     base_pkg_name: &str,
     ready_packages_path: &str,
@@ -150,7 +240,79 @@ fn collect_candidate_files(
         }
     }
 
-    collect_candidate_files_from_pkgdest(pkg_input, base_pkg_name, ready_packages_path)
+    collect_candidate_files_from_pkgdest_legacy(pkg_input, base_pkg_name, ready_packages_path)
+}
+
+/// Install only artifacts for the PGO stage `pkgbase`, using the same makepkg env as the build.
+pub fn install_pgo_artifacts(
+    _pkg_input: &str,
+    pkgbase: &str,
+    repo_dir: Option<&Path>,
+    config: &Config,
+    makepkg_env: &HashMap<String, String>,
+) {
+    let Some(repo_dir) = repo_dir else {
+        ewarn!("PGO install skipped: no package repository directory");
+        return;
+    };
+    let mut files = collect_pgo_candidate_files(
+        repo_dir,
+        pkgbase,
+        &config.paths.ready_made_packages_path,
+        makepkg_env,
+    );
+    if files.is_empty() {
+        ewarn!(
+            "No installable artifacts for pkgbase {pkgbase} in {}; \
+             expected packages like {pkgbase} and {pkgbase}-dbg after the build",
+            config.paths.ready_made_packages_path
+        );
+        return;
+    }
+    files.retain(|f| {
+        if let Some(name) = package_name_from_file(f)
+            && config.skip_install_after_compilation().contains(&name)
+        {
+            vlog!("Skipping ignored package artifact: {}", name);
+            return false;
+        }
+        true
+    });
+    blog!(
+        "Installing {} package artifact(s) for pkgbase {pkgbase}…",
+        files.len()
+    );
+    for path in &files {
+        vlog!("  {}", path.display());
+    }
+    install_package_files_auto(&files);
+}
+
+fn install_package_files_auto(files: &[PathBuf]) {
+    if files.is_empty() {
+        blog!("Skipping installation.");
+        return;
+    }
+    let mut selected = files.to_vec();
+    auto_include_local_dependencies(&mut selected, files);
+    selected.sort();
+    selected.dedup();
+
+    let mut args: Vec<String> = vec![
+        "pacman".to_string(),
+        "-U".to_string(),
+        "--noconfirm".to_string(),
+    ];
+    args.extend(selected.iter().map(|p| p.to_string_lossy().to_string()));
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    if let Err(e) = crate::utils::prime_sudo_for_session() {
+        ewarn!("sudo refresh before install failed: {e}");
+    }
+    if let Err(e) = run_command("sudo", &refs, None::<&str>) {
+        ewarn!("Failed to install selected packages: {}", e);
+    } else {
+        blog!("Installed selected package artifacts.");
+    }
 }
 
 fn prompt_for_selection(files: &[PathBuf]) -> Option<Vec<PathBuf>> {
@@ -325,6 +487,16 @@ pub fn install_artifacts(
     repo_dir: Option<&Path>,
     config: &Config,
 ) {
+    install_artifacts_inner(pkg_input, base_pkg_name, repo_dir, config, false);
+}
+
+fn install_artifacts_inner(
+    pkg_input: &str,
+    base_pkg_name: &str,
+    repo_dir: Option<&Path>,
+    config: &Config,
+    auto_install_all: bool,
+) {
     let mut files = collect_candidate_files(
         pkg_input,
         base_pkg_name,
@@ -347,7 +519,15 @@ pub fn install_artifacts(
         true
     });
 
-    let Some(selected) = prompt_for_selection(&files) else {
+    let selected = if auto_install_all {
+        blog!(
+            "Installing {} package artifact(s) from PKGDEST…",
+            files.len()
+        );
+        files.clone()
+    } else if let Some(sel) = prompt_for_selection(&files) {
+        sel
+    } else {
         ewarn!("Failed to read install selection from stdin.");
         return;
     };
@@ -355,23 +535,7 @@ pub fn install_artifacts(
         blog!("Skipping installation.");
         return;
     }
-    let mut selected = selected;
-    auto_include_local_dependencies(&mut selected, &files);
-    selected.sort();
-    selected.dedup();
-
-    let mut args: Vec<String> = vec![
-        "pacman".to_string(),
-        "-U".to_string(),
-        "--noconfirm".to_string(),
-    ];
-    args.extend(selected.iter().map(|p| p.to_string_lossy().to_string()));
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    if let Err(e) = run_command("sudo", &refs, None::<&str>) {
-        ewarn!("Failed to install selected packages: {}", e);
-    } else {
-        blog!("Installed selected package artifacts.");
-    }
+    install_package_files_auto(&selected);
 }
 
 #[cfg(test)]
@@ -425,5 +589,31 @@ mod tests {
         assert_eq!(resolved, Some(built_file));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn artifact_belongs_to_pkgbase_excludes_sibling_variants() {
+        assert!(artifact_belongs_to_pkgbase("linux-cachyos", "linux-cachyos"));
+        assert!(artifact_belongs_to_pkgbase("linux-cachyos-dbg", "linux-cachyos"));
+        assert!(artifact_belongs_to_pkgbase(
+            "linux-cachyos-headers",
+            "linux-cachyos"
+        ));
+        assert!(!artifact_belongs_to_pkgbase(
+            "linux-cachyos-lto",
+            "linux-cachyos"
+        ));
+        assert!(!artifact_belongs_to_pkgbase(
+            "linux-cachyos-lto-dbg",
+            "linux-cachyos"
+        ));
+        assert!(artifact_belongs_to_pkgbase(
+            "linux-cachyos-lto",
+            "linux-cachyos-lto"
+        ));
+        assert!(artifact_belongs_to_pkgbase(
+            "linux-cachyos-lto-dbg",
+            "linux-cachyos-lto"
+        ));
     }
 }

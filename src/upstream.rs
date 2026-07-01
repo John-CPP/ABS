@@ -245,7 +245,8 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
                         false,
                         false,
                         None,
-                    );
+                    )
+                    .pkg_dir;
 
                     let upstream_pkgver = match fetch_github_latest_version(&task.github, task.upstream_prereleases) {
                         Ok(v) => v,

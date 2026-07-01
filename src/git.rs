@@ -1,4 +1,4 @@
-use crate::utils::{check_sudo_removal, run_command, run_command_quiet};
+use crate::utils::{check_sudo_removal, run_command};
 use crate::{die, ewarn, vlog};
 use colored::Colorize;
 use std::collections::{HashMap, HashSet};
@@ -134,6 +134,29 @@ fn per_package_repo_key(repo_name: &str) -> String {
     repo_name.to_ascii_lowercase()
 }
 
+/// Whether [`prepare_repo`] cloned or updated the git tree on this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoSyncAction {
+    Unchanged,
+    Cloned,
+    Updated,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrepareRepoResult {
+    pub pkg_dir: PathBuf,
+    pub sync_action: RepoSyncAction,
+}
+
+impl PrepareRepoResult {
+    pub fn synced(&self) -> bool {
+        matches!(
+            self.sync_action,
+            RepoSyncAction::Cloned | RepoSyncAction::Updated
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_repo(
     pkg_name: &str,
@@ -144,14 +167,9 @@ pub fn prepare_repo(
     clean: bool,
     force_update: bool,
     pkgbuild_cache: Option<&mut PkgbuildDirCache>,
-) -> PathBuf {
-    let git_run = |c: &str, a: &[&str], d: Option<&Path>| {
-        if crate::is_verbose_mode() {
-            run_command(c, a, d)
-        } else {
-            run_command_quiet(c, a, d)
-        }
-    };
+) -> PrepareRepoResult {
+    let git_run = |c: &str, a: &[&str], d: Option<&Path>| run_command(c, a, d);
+    let mut sync_action = RepoSyncAction::Unchanged;
     if is_per_package_repo(repo_name) {
         let repo_key = per_package_repo_key(repo_name);
         let repo_dir = PathBuf::from(packages_path)
@@ -178,6 +196,7 @@ pub fn prepare_repo(
             ) {
                 die!("Failed to clone repository {}: {}", clone_url, e);
             }
+            sync_action = RepoSyncAction::Cloned;
             shared_repo_remote_note_updated(&repo_dir);
         } else if force_update
             && repo_dir.join(".git").exists()
@@ -189,13 +208,19 @@ pub fn prepare_repo(
                 base_pkg_name
             );
             match git_run("git", &["pull", "--ff-only"], Some(repo_dir.as_path())) {
-                Ok(()) => shared_repo_remote_note_updated(&repo_dir),
+                Ok(()) => {
+                    sync_action = RepoSyncAction::Updated;
+                    shared_repo_remote_note_updated(&repo_dir);
+                }
                 Err(e) => {
                     ewarn!("git pull failed for {}: {}", base_pkg_name, e);
                 }
             }
         }
-        return repo_dir;
+        return PrepareRepoResult {
+            pkg_dir: repo_dir,
+            sync_action,
+        };
     }
 
     let repo_dir = PathBuf::from(packages_path).join(repo_name);
@@ -215,10 +240,12 @@ pub fn prepare_repo(
         ) {
             die!("Failed to clone repository {}: {}", repo_url, e);
         }
+        sync_action = RepoSyncAction::Cloned;
         shared_repo_remote_note_updated(&repo_dir);
     } else if force_update && !shared_repo_remote_already_updated(&repo_dir) {
         loop {
             if git_run("git", &["pull", "--ff-only"], Some(repo_dir.as_path())).is_ok() {
+                sync_action = RepoSyncAction::Updated;
                 shared_repo_remote_note_updated(&repo_dir);
                 break;
             }
@@ -255,6 +282,7 @@ pub fn prepare_repo(
                     ) {
                         die!("Failed to clone repository {}: {}", repo_url, e);
                     }
+                    sync_action = RepoSyncAction::Cloned;
                     shared_repo_remote_note_updated(&repo_dir);
                     break;
                 }
@@ -272,9 +300,13 @@ pub fn prepare_repo(
         Some(cache) => find_pkg_dir_cached(&repo_dir, base_pkg_name, cache),
         None => find_pkg_dir(&repo_dir, base_pkg_name),
     };
-    match found {
+    let pkg_dir = match found {
         Some(path) => path,
         None => die!("Package {} not found in repository {}", pkg_name, repo_name),
+    };
+    PrepareRepoResult {
+        pkg_dir,
+        sync_action,
     }
 }
 

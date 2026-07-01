@@ -43,6 +43,7 @@ fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
         .iter()
         .chain(config.manual_update_packages.iter())
         .chain(config.skip_install_packages.iter())
+        .chain(crate::pgo::active_pipeline_hold_packages(config).iter())
     {
         if seen.insert(pkg.clone()) {
             out.push(pkg.clone());
@@ -130,6 +131,7 @@ mod tests {
             self_update_github_url: String::new(),
             self_update_raw_url: String::new(),
             self_update_install_path: String::new(),
+            self_update_use_pacman: None,
             self_update_at_updates: false,
             install_testing_phase_archlinux_packages: false,
             compilers: Default::default(),

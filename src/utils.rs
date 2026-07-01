@@ -1,8 +1,102 @@
+use std::collections::HashMap;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::collections::HashSet;
+
+static TRACKED_CHILDREN: OnceLock<Mutex<HashMap<u32, ()>>> = OnceLock::new();
+static EXIT_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SKIP_EXIT_PAUSE: AtomicBool = AtomicBool::new(false);
+
+fn tracked_children() -> &'static Mutex<HashMap<u32, ()>> {
+    TRACKED_CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Mark that abs ran build/update work; [`wait_before_exit_if_needed`] may prompt before teardown.
+pub fn request_exit_pause() {
+    EXIT_PAUSE_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Disable the interactive exit pause (`--no-wait` / `ABS_NO_EXIT_PAUSE`).
+pub fn set_skip_exit_pause(skip: bool) {
+    SKIP_EXIT_PAUSE.store(skip, Ordering::Relaxed);
+}
+
+/// When jobs finished on an interactive TTY, wait for Enter before ramdisk unmount / process exit.
+pub fn wait_before_exit_if_needed() {
+    if !EXIT_PAUSE_REQUESTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if SKIP_EXIT_PAUSE.load(Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var_os("ABS_GUI").is_some() || std::env::var_os("ABS_NO_EXIT_PAUSE").is_some() {
+        return;
+    }
+    if crate::is_dry_run_mode() || !io::stdin().is_terminal() {
+        return;
+    }
+    for path in crate::ramdisk::pending_workdir_paths() {
+        let _ = writeln!(
+            io::stdout(),
+            "==> Ramdisk build tree at {} (inspect logs here before pressing Enter)",
+            path.display()
+        );
+    }
+    let _ = writeln!(io::stdout());
+    let _ = writeln!(
+        io::stdout(),
+        "==> All jobs are finished. Press <Enter> to exit..."
+    );
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+}
+
+fn track_child(pid: u32) {
+    tracked_children().lock().unwrap().insert(pid, ());
+}
+
+fn untrack_child(id: u32) {
+    tracked_children().lock().unwrap().remove(&id);
+}
+
+#[cfg(unix)]
+fn list_process_tree(root: u32) -> Vec<u32> {
+    let mut order = Vec::new();
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        order.push(pid);
+        let children_path = format!("/proc/{pid}/task/{pid}/children");
+        if let Ok(data) = fs::read_to_string(&children_path) {
+            for token in data.split_whitespace() {
+                if let Ok(child) = token.parse::<u32>() {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    order
+}
+
+#[cfg(not(unix))]
+fn list_process_tree(root: u32) -> Vec<u32> {
+    vec![root]
+}
+
+fn signal_process_tree(root: u32, sig: i32) {
+    let mut pids = list_process_tree(root);
+    pids.reverse();
+    for pid in pids {
+        signal_pid(pid as i32, sig);
+    }
+}
 
 pub fn sh_single_quote(s: &str) -> String {
     let mut out = String::from('\'');
@@ -77,42 +171,162 @@ const BLOCKED_DELETION_ROOTS: &[&str] = &[
 ];
 
 static DELETABLE_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-static TRACKED_CHILDREN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
-fn tracked_children() -> &'static Mutex<HashSet<u32>> {
-    TRACKED_CHILDREN.get_or_init(|| Mutex::new(HashSet::new()))
+fn signal_pid(pid: i32, sig: i32) {
+    unsafe {
+        let _ = libc::kill(pid, sig);
+    }
 }
 
-fn track_child(pid: u32) {
-    tracked_children().lock().unwrap().insert(pid);
-}
-
-fn untrack_child(pid: u32) {
-    tracked_children().lock().unwrap().remove(&pid);
-}
-
-/// Send SIGTERM (then SIGKILL) to ABS-spawned subprocesses still running (e.g. rsync, makepkg).
+/// Send SIGINT/TERM/KILL to ABS-spawned subprocess trees (e.g. rsync, makepkg, sudo).
 pub fn terminate_foreground_children() {
-    let pids: Vec<u32> = tracked_children().lock().unwrap().iter().copied().collect();
-    if pids.is_empty() {
+    let roots: Vec<u32> = tracked_children()
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    if roots.is_empty() {
         return;
     }
     crate::vlog!(
         "Stopping {} foreground subprocess(es) before ramdisk cleanup...",
-        pids.len()
+        roots.len()
     );
-    for pid in &pids {
-        unsafe {
-            libc::kill(*pid as i32, libc::SIGTERM);
-        }
+    for root in &roots {
+        signal_process_tree(*root, libc::SIGINT);
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
-    for pid in pids {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-        untrack_child(pid);
+    for root in &roots {
+        signal_process_tree(*root, libc::SIGTERM);
     }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for root in roots {
+        signal_process_tree(root, libc::SIGKILL);
+        untrack_child(root);
+    }
+}
+
+/// Best-effort kill of processes whose cwd lives under `prefix` (orphaned makepkg/gcc after abort).
+pub fn kill_processes_with_cwd_under(prefix: &Path, label: &str) {
+    let Ok(resolved) = resolve_path_for_deletion(prefix) else {
+        return;
+    };
+    let pids = find_pids_with_cwd_under(&resolved);
+    if pids.is_empty() {
+        return;
+    }
+    crate::vlog!(
+        "Sending SIGTERM to {} process(es) under {} ({})...",
+        pids.len(),
+        resolved.display(),
+        label
+    );
+    for pid in &pids {
+        signal_pid(*pid as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for pid in find_pids_with_cwd_under(&resolved) {
+        signal_pid(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Kill other `abs` processes running PGO / kernel builds for `package` (e.g. a build started in
+/// an external terminal that absgui does not track by PID).
+#[cfg(unix)]
+pub fn kill_abs_cli_processes(package: &str) {
+    let self_pid = std::process::id();
+    let mut targets = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(data) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let cmdline = data
+            .split(|&b| b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !cmdline.contains("abs") {
+            continue;
+        }
+        if cmdline.contains("--pgo-abort") || cmdline.contains("--pgo-status") {
+            continue;
+        }
+        let build_flag = cmdline.contains("--pgo-resume")
+            || cmdline.contains("--kernel-build")
+            || cmdline.split_whitespace().any(|w| w == "--pgo");
+        if !build_flag {
+            continue;
+        }
+        if !cmdline.split_whitespace().any(|w| w == package) {
+            continue;
+        }
+        targets.push(pid);
+    }
+    if targets.is_empty() {
+        return;
+    }
+    crate::vlog!(
+        "Sending SIGTERM to {} abs build process(es) for {}...",
+        targets.len(),
+        package
+    );
+    for pid in &targets {
+        signal_pid(*pid as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for pid in targets {
+        let still_alive = Path::new(&format!("/proc/{pid}")).exists();
+        if still_alive {
+            signal_pid(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_abs_cli_processes(_package: &str) {}
+
+fn find_pids_with_cwd_under(prefix: &Path) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let cwd_link = PathBuf::from(format!("/proc/{pid}/cwd"));
+        let Ok(cwd) = fs::read_link(&cwd_link) else {
+            continue;
+        };
+        let cwd_resolved = if cwd.exists() {
+            fs::canonicalize(&cwd).unwrap_or(cwd)
+        } else {
+            cwd
+        };
+        if path_has_prefix(prefix, &cwd_resolved) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 fn deletable_roots() -> &'static Mutex<Vec<PathBuf>> {
@@ -260,26 +474,152 @@ pub fn validate_deletable_path(path: &Path) -> Result<(), String> {
     ))
 }
 
+/// Shell-style command line for logging (`git pull --ff-only`).
+pub fn render_command_line(cmd: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{} {}", cmd, args.join(" "))
+    }
+}
+
+/// True when abs should print `$ command` lines before spawning (absgui log / `-v` only).
+fn should_echo_commands() -> bool {
+    crate::is_verbose_mode() || std::env::var_os("ABS_GUI").is_some()
+}
+
+/// Print a command to stdout before execution (absgui build logs and `-v` only).
+pub fn echo_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) {
+    if !should_echo_commands() {
+        return;
+    }
+    let line = render_command_line(cmd, args);
+    if let Some(dir) = cwd {
+        println!("$ (cd {} && {line})", dir.as_ref().display());
+    } else {
+        println!("$ {line}");
+    }
+}
+
+/// Print a shell snippet to stdout before execution.
+pub fn echo_shell_command<P: AsRef<Path>>(shell_body: &str, cwd: Option<P>) {
+    if !should_echo_commands() {
+        return;
+    }
+    if let Some(dir) = cwd {
+        println!("$ (cd {} && {shell_body})", dir.as_ref().display());
+    } else {
+        println!("$ {shell_body}");
+    }
+}
+
+fn echo_captured_output(stdout: &[u8], stderr: &[u8]) {
+    if !should_echo_commands() {
+        return;
+    }
+    if !stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(stdout));
+        if !stdout.ends_with(b"\n") {
+            println!();
+        }
+    }
+    if !stderr.is_empty() {
+        for line in String::from_utf8_lossy(stderr).lines() {
+            eprintln!("[stderr] {line}");
+        }
+    }
+}
+
+/// True when absgui (or another GUI parent) set `ABS_GUI` and a graphical askpass helper.
+fn use_sudo_askpass() -> bool {
+    std::env::var_os("ABS_GUI").is_some() && std::env::var_os("SUDO_ASKPASS").is_some()
+}
+
+/// `sudo` prefix for `sh -c` snippets. GUI children inherit the launching shell's controlling TTY,
+/// so bare `sudo` prompts there instead of the askpass dialog; `-A` routes through `SUDO_ASKPASS`.
+pub fn shell_sudo() -> &'static str {
+    if use_sudo_askpass() {
+        "sudo -A"
+    } else {
+        "sudo"
+    }
+}
+
+/// Prepend `sudo -A` when a GUI askpass is configured so prompts never steal the parent terminal.
+fn sudo_prefixed_args(args: &[&str]) -> Vec<String> {
+    if use_sudo_askpass()
+        && !args.contains(&"-A")
+        && !args.contains(&"-n")
+    {
+        let mut v = vec!["-A".to_string()];
+        v.extend(args.iter().map(|s| (*s).to_string()));
+        v
+    } else {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+}
+
+fn configure_sudo_command(command: &mut Command, args: &[&str]) {
+    let owned = sudo_prefixed_args(args);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    command.args(&refs);
+    if use_sudo_askpass() {
+        command.stdin(Stdio::null());
+    } else {
+        command.stdin(Stdio::inherit());
+    }
+}
+
+/// UID/GID of the user driving the build (not root when invoked via sudo).
+pub fn build_uid_gid() -> (u32, u32) {
+    if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID"))
+        && let (Ok(u), Ok(g)) = (uid.parse::<u32>(), gid.parse::<u32>())
+    {
+        return (u, g);
+    }
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+/// `chown` a root-owned artifact back to the build user when stage-2 profiling left it behind.
+pub fn ensure_build_user_can_read(path: &Path) -> Result<(), String> {
+    if fs::OpenOptions::new().read(true).open(path).is_ok() {
+        return Ok(());
+    }
+    let (uid, gid) = build_uid_gid();
+    let owner = format!("{uid}:{gid}");
+    let path_s = path.to_string_lossy();
+    run_command("sudo", &["chown", &owner, path_s.as_ref()], None::<&str>)
+}
+
 pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> Result<(), String> {
     if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
-        let rendered_cmd = if args.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{} {}", cmd, args.join(" "))
-        };
+        let rendered_cmd = render_command_line(cmd, args);
         println!("[DRY RUN] {}", rendered_cmd);
         return Ok(());
     }
 
+    let owned_sudo_args;
+    let exec_args: Vec<&str> = if cmd == "sudo" {
+        owned_sudo_args = sudo_prefixed_args(args);
+        owned_sudo_args.iter().map(String::as_str).collect()
+    } else {
+        args.to_vec()
+    };
+
+    echo_command(cmd, &exec_args, cwd.as_ref().map(|p| p.as_ref()));
+
     let mut command = Command::new(cmd);
-    command.args(args);
 
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
 
-    // Use `.status()` so stdout/stderr are inherited and long builds (makepkg /
-    // makechrootpkg) show live output like the Bash script does.
+    if cmd == "sudo" {
+        configure_sudo_command(&mut command, args);
+    } else {
+        command.args(&exec_args);
+    }
+
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to execute '{}': {}", cmd, e))?;
@@ -292,11 +632,7 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
     if status.success() {
         Ok(())
     } else {
-        let rendered_cmd = if args.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{} {}", cmd, args.join(" "))
-        };
+        let rendered_cmd = render_command_line(cmd, args);
         Err(format!(
             "Command failed: `{}` (exit: {})\n(Output was printed above.)",
             rendered_cmd,
@@ -307,24 +643,36 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
     }
 }
 
-/// Like [`run_command`], but captures stdout and stderr instead of inheriting them.
-/// Use this when you want to suppress output in non-verbose mode.
+/// Like [`run_command`], but captures stdout/stderr instead of inheriting them when silent.
+/// At normal or verbose log level, behaves like [`run_command`] (echo + live output).
 pub fn run_command_quiet<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> Result<(), String> {
+    if crate::verbosity() >= crate::Verbosity::Normal {
+        return run_command(cmd, args, cwd);
+    }
+
     if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
-        let rendered_cmd = if args.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{} {}", cmd, args.join(" "))
-        };
-        println!("[DRY RUN] {}", rendered_cmd);
+        println!("[DRY RUN] {}", render_command_line(cmd, args));
         return Ok(());
     }
 
+    let owned_sudo_args;
+    let exec_args: Vec<&str> = if cmd == "sudo" {
+        owned_sudo_args = sudo_prefixed_args(args);
+        owned_sudo_args.iter().map(String::as_str).collect()
+    } else {
+        args.to_vec()
+    };
+
     let mut command = Command::new(cmd);
-    command.args(args);
 
     if let Some(dir) = cwd {
         command.current_dir(dir);
+    }
+
+    if cmd == "sudo" {
+        configure_sudo_command(&mut command, args);
+    } else {
+        command.args(&exec_args);
     }
 
     let output = command
@@ -336,7 +684,7 @@ pub fn run_command_quiet<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P
     } else {
         Err(format_command_error(
             cmd,
-            args,
+            &exec_args,
             &output.stdout,
             &output.stderr,
             output.status.code(),
@@ -344,16 +692,71 @@ pub fn run_command_quiet<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P
     }
 }
 
+/// How [`run_shell_in_dir_with_tee`] runs the build pipeline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShellRunOpts {
+    /// Stream output directly to the terminal instead of `script(1)` (needed for makechrootpkg).
+    pub live_output: bool,
+    /// When set, print a heartbeat every 45s while the command runs.
+    pub heartbeat_label: Option<&'static str>,
+}
+
+/// Always-visible phase line on stderr (flushed), even when abs runs with `-s`.
+pub fn phase_banner(msg: impl AsRef<str>) {
+    eprintln!("==> {}", msg.as_ref());
+    let _ = io::stderr().flush();
+}
+
+/// Reset terminal attributes after `script(1)`, devtools ANSI, or Ctrl+C mid-line.
+pub fn restore_terminal() {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("printf '\\033[0m\\033[?25h\\n' 2>/dev/null; stty sane 2>/dev/null || true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Restore the terminal when dropped (normal exit). Interrupt handlers must call [`restore_terminal`] too.
+pub struct TerminalRestoreGuard(bool);
+
+impl TerminalRestoreGuard {
+    pub fn new() -> Self {
+        Self(io::stdin().is_terminal())
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            restore_terminal();
+        }
+    }
+}
+
 /// Run a multi-line shell snippet in `cwd`, streaming combined output to the terminal
-/// (`tee`) while saving a copy for callers that need to parse logs (e.g. missing PGP keys).
-pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(cwd: P, shell_body: &str) -> Result<(), String> {
+/// while saving a copy for callers that need to parse logs (e.g. missing PGP keys).
+///
+/// Uses `script` when available so subprocesses (makepkg → `pacman -U` → `sudo`) get a real TTY.
+/// A plain `cmd | tee` pipeline breaks sudo password prompts.
+pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(
+    cwd: P,
+    shell_body: &str,
+    opts: ShellRunOpts,
+) -> Result<(), String> {
     if crate::is_dry_run_mode() {
-        println!(
-            "[DRY RUN] bash (build in {}, tee to log)",
-            cwd.as_ref().display()
-        );
+        echo_shell_command(shell_body, Some(cwd.as_ref()));
+        println!("[DRY RUN] (output streamed via tee)");
         return Ok(());
     }
+
+    let _terminal_guard = TerminalRestoreGuard::new();
+
+    echo_shell_command(shell_body, Some(cwd.as_ref()));
 
     let tmp = std::env::temp_dir();
     let stamp = std::time::SystemTime::now()
@@ -377,23 +780,84 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(cwd: P, shell_body: &str) -> Re
 
     let inner_arg = sh_single_quote(inner_path.to_string_lossy().as_ref());
     let log_arg = sh_single_quote(log_path.to_string_lossy().as_ref());
-    // One script for `bash -c`: run inner helper, mirror output to terminal + log, propagate failure.
-    let pipeline = format!(
-        "bash {} 2>&1 | tee {}; exit ${{PIPESTATUS[0]}}",
-        inner_arg, log_arg
-    );
 
-    let status = Command::new("bash")
+    let pipeline = if opts.live_output {
+        let stdbuf = if command_exists("stdbuf") {
+            "stdbuf -oL -eL "
+        } else {
+            ""
+        };
+        format!(
+            "{stdbuf}bash {inner_arg} 2>&1 | {stdbuf}tee {log_arg}; exit ${{PIPESTATUS[0]}}",
+        )
+    } else if command_exists("script") && io::stdin().is_terminal() {
+        let stdbuf = if command_exists("stdbuf") {
+            "stdbuf -oL -eL "
+        } else {
+            ""
+        };
+        format!(
+            "{stdbuf}script -q -f -c {cmd} {log}",
+            cmd = sh_single_quote(&format!("{stdbuf}bash {inner_arg}")),
+            log = log_arg,
+        )
+    } else {
+        let stdbuf = if command_exists("stdbuf") {
+            "stdbuf -oL -eL "
+        } else {
+            ""
+        };
+        format!(
+            "{stdbuf}bash {inner_arg} 2>&1 | {stdbuf}tee {log_arg}; exit ${{PIPESTATUS[0]}}",
+        )
+    };
+
+    let mut command = Command::new("bash");
+    command
         .arg("-o")
         .arg("pipefail")
         .arg("-c")
-        .arg(&pipeline)
-        .status()
+        .arg(&pipeline);
+
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("failed to run build pipeline: {}", e))?;
+    track_child(child.id());
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heartbeat = opts.heartbeat_label.map(|label| {
+        let done_flag = std::sync::Arc::clone(&done);
+        let label = label.to_string();
+        std::thread::spawn(move || {
+            let mut elapsed_secs = 0u64;
+            while !done_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(45));
+                if done_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                elapsed_secs += 45;
+                let mins = elapsed_secs / 60;
+                let secs = elapsed_secs % 60;
+                eprintln!(
+                    "==> Still running: {label} ({mins}m {secs:02}s) — chroot sync and dependency install can take a long time for large packages"
+                );
+            }
+        })
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait on build pipeline: {}", e))?;
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(handle) = heartbeat {
+        let _ = handle.join();
+    }
+    untrack_child(child.id());
 
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     let _ = std::fs::remove_file(&inner_path);
     let _ = std::fs::remove_file(&log_path);
+    restore_terminal();
 
     if status.success() {
         Ok(())
@@ -406,6 +870,15 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(cwd: P, shell_body: &str) -> Re
             log_text
         ))
     }
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Remove **`src/`** and **`pkg/`** under the package directory (makepkg workdirs) before a fresh build.
@@ -484,18 +957,14 @@ pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
     }
 }
 
-pub fn run_command_with_output<P: AsRef<Path>>(
+/// Like [`run_command_with_output`], but never logs the command or prints captured output.
+/// Used for background update checks that must stay silent and must not interleave with sudo prompts.
+pub fn run_command_with_output_silent<P: AsRef<Path>>(
     cmd: &str,
     args: &[&str],
     cwd: Option<P>,
 ) -> Result<String, String> {
     if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
-        let rendered_cmd = if args.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{} {}", cmd, args.join(" "))
-        };
-        println!("[DRY RUN] {}", rendered_cmd);
         return Ok(String::new());
     }
 
@@ -509,6 +978,44 @@ pub fn run_command_with_output<P: AsRef<Path>>(
     let output = command
         .output()
         .map_err(|e| format!("Failed to execute '{}': {}", cmd, e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format_command_error(
+            cmd,
+            args,
+            &output.stdout,
+            &output.stderr,
+            output.status.code(),
+        ))
+    }
+}
+
+pub fn run_command_with_output<P: AsRef<Path>>(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<P>,
+) -> Result<String, String> {
+    if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
+        println!("[DRY RUN] {}", render_command_line(cmd, args));
+        return Ok(String::new());
+    }
+
+    echo_command(cmd, args, cwd.as_ref().map(|p| p.as_ref()));
+
+    let mut command = Command::new(cmd);
+    command.args(args);
+
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to execute '{}': {}", cmd, e))?;
+
+    echo_captured_output(&output.stdout, &output.stderr);
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -531,13 +1038,28 @@ pub fn run_command_with_output_env<P: AsRef<Path>>(
     env: &[(&str, &str)],
 ) -> Result<String, String> {
     if crate::is_dry_run_mode() && !is_readonly_command(cmd, args) {
-        let rendered_cmd = if args.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{} {}", cmd, args.join(" "))
-        };
-        println!("[DRY RUN] {} (env: {:?})", rendered_cmd, env);
+        println!(
+            "[DRY RUN] {} (env: {:?})",
+            render_command_line(cmd, args),
+            env
+        );
         return Ok(String::new());
+    }
+
+    if should_echo_commands() {
+        let mut line = render_command_line(cmd, args);
+        if !env.is_empty() {
+            let env_bits: Vec<String> = env
+                .iter()
+                .map(|(k, v)| format!("{k}={}", sh_single_quote(v)))
+                .collect();
+            line = format!("{} {}", env_bits.join(" "), line);
+        }
+        if let Some(dir) = cwd.as_ref() {
+            println!("$ (cd {} && {line})", dir.as_ref().display());
+        } else {
+            println!("$ {line}");
+        }
     }
 
     let mut command = Command::new(cmd);
@@ -553,6 +1075,8 @@ pub fn run_command_with_output_env<P: AsRef<Path>>(
         .output()
         .map_err(|e| format!("Failed to execute '{}': {}", cmd, e))?;
 
+    echo_captured_output(&output.stdout, &output.stderr);
+
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
@@ -566,23 +1090,63 @@ pub fn run_command_with_output_env<P: AsRef<Path>>(
     }
 }
 
+/// True when sudo already has a valid cached timestamp (checked non-interactively, never blocks).
+fn sudo_timestamp_valid() -> bool {
+    Command::new("sudo")
+        .args(["-n", "-v"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Run **`sudo -v`** so the password is cached before later **`sudo rm`** / **`sudo pacman`** calls.
 /// Long runs also use [`spawn_sudo_keepalive`] to refresh the timestamp before it expires (~15 minutes by default).
+///
+/// When launched from absgui (`ABS_GUI=1`) there is no interactive terminal, so a bare `sudo -v`
+/// would block forever on an invisible password prompt. In that case we require a graphical askpass
+/// (`SUDO_ASKPASS`) and use `sudo -A`, or fail with a clear message instead of hanging.
 pub fn prime_sudo_for_session() -> Result<(), String> {
     if crate::is_dry_run_mode() {
         return Ok(());
     }
+    // Fast path: timestamp already valid (also refreshes it). Never blocks.
+    if sudo_timestamp_valid() {
+        return Ok(());
+    }
+    // absgui children inherit the launching terminal as stdin; never use it for sudo there.
+    if std::env::var_os("ABS_GUI").is_some() {
+        if std::env::var_os("SUDO_ASKPASS").is_some() {
+            return run_command("sudo", &["-v"], None::<&str>);
+        }
+        return Err(
+            "sudo needs a password but no graphical askpass program was found. Install one of \
+             ksshaskpass / lxqt-openssh-askpass / x11-ssh-askpass / zenity / kdialog, or enable \
+             passwordless sudo for the build commands."
+                .into(),
+        );
+    }
+    if !io::stdin().is_terminal() && std::env::var_os("SUDO_ASKPASS").is_some() {
+        return run_command("sudo", &["-v"], None::<&str>);
+    }
     run_command("sudo", &["-v"], None::<&str>)
 }
 
-/// Background thread: **`sudo -v`** every few minutes while the process is alive (stops when the program exits).
+/// Background thread: refresh **`sudo`** timestamp every few minutes (non-interactive only).
 pub fn spawn_sudo_keepalive() {
     if crate::is_dry_run_mode() {
         return;
     }
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(3 * 60));
-        let _ = prime_sudo_for_session();
+        // Never prompt from a background thread (`sudo -v` would steal/break the TTY).
+        let _ = Command::new("sudo")
+            .args(["-n", "-v"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     });
 }
 
@@ -713,17 +1277,30 @@ pub fn pacman_query_version(pkg: &str) -> Result<Option<String>, String> {
 }
 
 /// `vercmp a b` stdout: `-1`, `0`, or `1` (see `vercmp(8)`).
-pub fn vercmp(a: &str, b: &str) -> Result<i32, String> {
-    if crate::is_dry_run_mode() {
-        return Err("dry-run".into());
-    }
-    let out = run_command_with_output("vercmp", &[a, b], None::<&str>)?;
+fn parse_vercmp_output(out: &str) -> Result<i32, String> {
     match out.trim() {
         "-1" => Ok(-1),
         "0" => Ok(0),
         "1" => Ok(1),
         other => Err(format!("unexpected vercmp output: {:?}", other)),
     }
+}
+
+pub fn vercmp(a: &str, b: &str) -> Result<i32, String> {
+    if crate::is_dry_run_mode() {
+        return Err("dry-run".into());
+    }
+    let out = run_command_with_output("vercmp", &[a, b], None::<&str>)?;
+    parse_vercmp_output(&out)
+}
+
+/// Like [`vercmp`], but never logs the command or its output.
+pub(crate) fn vercmp_silent(a: &str, b: &str) -> Result<i32, String> {
+    if crate::is_dry_run_mode() {
+        return Err("dry-run".into());
+    }
+    let out = run_command_with_output_silent("vercmp", &[a, b], None::<&str>)?;
+    parse_vercmp_output(&out)
 }
 
 fn parse_pacman_si_output(out: &str) -> Option<String> {
@@ -778,6 +1355,168 @@ pub fn pacman_sync_version(pkg: &str) -> Result<Option<String>, String> {
     match run_command_with_output("pacman", &["-Si", pkg], None::<&str>) {
         Ok(out) => Ok(parse_pacman_si_output(&out)),
         Err(_) => Ok(None),
+    }
+}
+
+const PACKAGER_KEYRING_PATHS: &[&str] = &[
+    "/usr/share/pacman/keyrings/archlinux.gpg",
+    "/usr/share/pacman/keyrings/cachyos.gpg",
+];
+
+fn launch_dirmngr_if_needed() {
+    let _ = Command::new("gpgconf")
+        .args(["--launch", "dirmngr"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn run_gpg_silent(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("gpg")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run gpg: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn gpg_key_listed(key: &str) -> bool {
+    Command::new("gpg")
+        .args(["--batch", "--list-keys", key])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn gpg_has_public_key(key: &str) -> bool {
+    if gpg_key_listed(key) {
+        return true;
+    }
+    if key.len() > 16 {
+        return gpg_key_listed(&key[key.len() - 16..]);
+    }
+    false
+}
+
+pub fn gpg_key_short_id(key: &str) -> &str {
+    if key.len() > 16 {
+        &key[key.len() - 16..]
+    } else {
+        key
+    }
+}
+
+/// Import Arch/CachyOS packager keys into the user keyring (`~/.gnupg`) for makepkg PGP checks.
+pub fn seed_user_gpg_from_packager_keyrings() {
+    if crate::is_dry_run_mode() {
+        return;
+    }
+    for path in PACKAGER_KEYRING_PATHS {
+        let path = Path::new(path);
+        if !path.is_file() {
+            continue;
+        }
+        if path.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+            continue;
+        }
+        if let Err(e) = run_gpg_silent(&["--batch", "--import", path.to_string_lossy().as_ref()]) {
+            crate::vlog!("gpg --import {}: {}", path.display(), e);
+        }
+    }
+}
+
+/// Import a missing packager key for makepkg source verification.
+pub fn import_gpg_key_for_build(key: &str) -> Result<(), String> {
+    if crate::is_dry_run_mode() {
+        return Ok(());
+    }
+    if gpg_has_public_key(key) {
+        return Ok(());
+    }
+
+    launch_dirmngr_if_needed();
+
+    let _ = run_gpg_silent(&["--locate-keys", key]);
+    if gpg_has_public_key(key) {
+        return Ok(());
+    }
+
+    const KEYSERVERS: &[&str] = &[
+        "hkps://keyserver.archlinux.org",
+        "hkps://keyserver.ubuntu.com",
+        "hkps://keys.openpgp.org",
+    ];
+    for server in KEYSERVERS {
+        if run_gpg_silent(&["--keyserver", server, "--recv-keys", key]).is_ok()
+            && gpg_has_public_key(key)
+        {
+            return Ok(());
+        }
+    }
+
+    if import_gpg_key_via_http(key).is_ok() && gpg_has_public_key(key) {
+        return Ok(());
+    }
+
+    seed_user_gpg_from_packager_keyrings();
+    if gpg_has_public_key(key) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "could not import PGP key {} (tried locate-keys, keyservers, HTTP lookup, and packager keyrings)",
+        gpg_key_short_id(key)
+    ))
+}
+
+fn import_gpg_key_via_http(key: &str) -> Result<(), String> {
+    let short = gpg_key_short_id(key);
+    let url = format!(
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{short}"
+    );
+    let output = Command::new("curl")
+        .args(["-fsSL", &url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("curl failed: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    if output.stdout.is_empty() {
+        return Err("empty keyserver response".into());
+    }
+    let mut child = Command::new("gpg")
+        .args(["--batch", "--import"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("gpg --import failed to start: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(&output.stdout)
+            .map_err(|e| format!("gpg --import stdin: {e}"))?;
+    }
+    let import_out = child
+        .wait_with_output()
+        .map_err(|e| format!("gpg --import wait: {e}"))?;
+    if import_out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&import_out.stderr).trim().to_string())
     }
 }
 
@@ -846,6 +1585,16 @@ Name            : systemd
 Version         : 260.1-3
 ";
         assert_eq!(parse_pacman_si_output(sample_with_staging), Some("260.1-3".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::restore_terminal;
+
+    #[test]
+    fn restore_terminal_is_noop_off_tty() {
+        restore_terminal();
     }
 }
 
@@ -956,5 +1705,21 @@ mod path_safety_tests {
     fn validate_config_path_rejects_system_root() {
         assert!(validate_config_path("paths.packages_path", "/").is_err());
         assert!(validate_config_path("paths.packages_path", "/usr").is_err());
+    }
+
+    #[test]
+    fn exit_pause_skipped_when_not_requested() {
+        EXIT_PAUSE_REQUESTED.store(false, Ordering::Relaxed);
+        SKIP_EXIT_PAUSE.store(false, Ordering::Relaxed);
+        wait_before_exit_if_needed();
+    }
+
+    #[test]
+    fn exit_pause_skipped_when_disabled() {
+        EXIT_PAUSE_REQUESTED.store(true, Ordering::Relaxed);
+        SKIP_EXIT_PAUSE.store(true, Ordering::Relaxed);
+        wait_before_exit_if_needed();
+        SKIP_EXIT_PAUSE.store(false, Ordering::Relaxed);
+        EXIT_PAUSE_REQUESTED.store(false, Ordering::Relaxed);
     }
 }

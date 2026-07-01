@@ -32,6 +32,11 @@ pub struct Config {
     pub self_update_raw_url: String,
     #[serde(default = "default_self_update_install_path")]
     pub self_update_install_path: String,
+    /// When `true`, `--self-update` builds `aur/PKGBUILD` and installs with pacman.
+    /// When `false`, copies the compiled `abs` binary to `self_update_install_path`.
+    /// Default (`null`/unset): auto-detect from installed pacman packages.
+    #[serde(default)]
+    pub self_update_use_pacman: Option<bool>,
     #[serde(default = "default_self_update_at_updates")]
     pub self_update_at_updates: bool,
     #[serde(default = "default_install_testing_phase_archlinux_packages")]
@@ -290,6 +295,219 @@ pub struct PackageConfig {
     /// Per-package ramdisk targets: `w` = build workdir, `c` = chroot, `p` = packages (e.g. `"wcp"`).
     #[serde(default)]
     pub ramdisk: Option<String>,
+    /// CachyOS kernel PKGBUILD env overrides (maps to `_cpusched`, `_processor_opt`, etc.).
+    #[serde(default)]
+    pub kernel: Option<KernelBuildConfig>,
+    /// Multi-stage kernel PGO pipeline (AutoFDO + Propeller).
+    #[serde(default)]
+    pub pgo: Option<PgoConfig>,
+}
+
+/// GUI-friendly kernel build options; each field maps to a CachyOS PKGBUILD env var.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct KernelBuildConfig {
+    #[serde(default, rename = "_cpusched")]
+    pub cpusched: Option<String>,
+    #[serde(default, rename = "_processor_opt")]
+    pub processor_opt: Option<String>,
+    // LTO / suffix / KCFI are controlled per-stage by the PGO pipeline, but a one-shot
+    // (non-PGO) kernel build applies them verbatim from the user's config.
+    #[serde(default, rename = "_use_llvm_lto")]
+    pub use_llvm_lto: Option<String>,
+    #[serde(default, rename = "_use_lto_suffix")]
+    pub use_lto_suffix: Option<String>,
+    #[serde(default, rename = "_use_gcc_suffix")]
+    pub use_gcc_suffix: Option<String>,
+    #[serde(default, rename = "_use_kcfi")]
+    pub use_kcfi: Option<String>,
+    #[serde(default, rename = "_HZ_ticks")]
+    pub hz_ticks: Option<String>,
+    #[serde(default, rename = "_tickrate")]
+    pub tickrate: Option<String>,
+    #[serde(default, rename = "_preempt")]
+    pub preempt: Option<String>,
+    #[serde(default, rename = "_hugepage")]
+    pub hugepage: Option<String>,
+    #[serde(default, rename = "_cc_harder")]
+    pub cc_harder: Option<String>,
+}
+
+/// All kernel options a user can set, including compiler/LTO. Used by one-shot (non-PGO) builds
+/// where the user's choices (e.g. GCC vs LLVM/LTO) must be applied verbatim.
+pub fn kernel_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option<String>); 11] {
+    [
+        ("_cpusched", &kernel.cpusched),
+        ("_processor_opt", &kernel.processor_opt),
+        ("_use_llvm_lto", &kernel.use_llvm_lto),
+        ("_use_lto_suffix", &kernel.use_lto_suffix),
+        ("_use_gcc_suffix", &kernel.use_gcc_suffix),
+        ("_use_kcfi", &kernel.use_kcfi),
+        ("_HZ_ticks", &kernel.hz_ticks),
+        ("_tickrate", &kernel.tickrate),
+        ("_preempt", &kernel.preempt),
+        ("_hugepage", &kernel.hugepage),
+        ("_cc_harder", &kernel.cc_harder),
+    ]
+}
+
+/// Kernel options exposed in absgui / user config. PGO stages set LTO, AutoFDO, KCFI, etc. separately.
+pub fn kernel_user_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option<String>); 7] {
+    [
+        ("_cpusched", &kernel.cpusched),
+        ("_processor_opt", &kernel.processor_opt),
+        ("_HZ_ticks", &kernel.hz_ticks),
+        ("_tickrate", &kernel.tickrate),
+        ("_preempt", &kernel.preempt),
+        ("_hugepage", &kernel.hugepage),
+        ("_cc_harder", &kernel.cc_harder),
+    ]
+}
+
+fn default_pgo_preset() -> String {
+    "cachyos-kernel".to_string()
+}
+
+fn default_auto_str() -> String {
+    "auto".to_string()
+}
+
+fn default_profiling_quality() -> String {
+    "maximum".to_string()
+}
+
+/// `perf record` flags after event args when `perf_extra_args` is left at the serde default.
+/// `standard`: stage scripts (`-c 100000`) scaled for llvm-profgen (~1.8×).
+/// `maximum`: further scaled (~1.1× headroom after a ~56000 run).
+fn default_perf_extra_args() -> String {
+    "--mmap-pages 131072 -a -N -b -c 56000".to_string()
+}
+
+pub const PERF_EXTRA_ARGS_STANDARD: &str = "--mmap-pages 131072 -a -N -b -c 56000";
+pub const PERF_EXTRA_ARGS_MAXIMUM: &str = "--mmap-pages 131072 -a -N -b -c 48000";
+
+fn default_afdo_tool() -> String {
+    "llvm-profgen".to_string()
+}
+
+fn default_propeller_tool() -> String {
+    "create_llvm_prof".to_string()
+}
+
+fn default_afdo_profile_name() -> String {
+    "kernel-compilation.afdo".to_string()
+}
+
+fn default_benchmark_preset() -> String {
+    "fast".to_string()
+}
+
+/// Per-package multi-stage kernel PGO configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PgoConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_pgo_preset")]
+    pub preset: String,
+    /// Required when running PGO: persistent profile archive (HDD path is fine).
+    pub profiles_archive_dir: Option<String>,
+    #[serde(default = "default_auto_str")]
+    pub profile_scratch_dir: String,
+    #[serde(default = "default_true")]
+    pub perf_data_on_ram: bool,
+    /// Optional override for the bundled PGO benchmark script (`assets/pgo-benchmark.sh`).
+    pub benchmark_command: Option<String>,
+    /// Profiling workload: `fast` (sysbench + stress-ng) or `cachyos` (full cachyos-benchmarker).
+    /// Ignored during profiling when `profiling_quality = "maximum"` (always uses `cachyos`).
+    #[serde(default = "default_benchmark_preset")]
+    pub benchmark_preset: String,
+    /// `standard` or `maximum` (default). Maximum uses denser perf sampling and the full
+    /// cachyos-benchmarker workload for llvm-profgen-quality kernel profiles.
+    #[serde(default = "default_profiling_quality")]
+    pub profiling_quality: String,
+    /// Persistent directory for cachyos-benchmarker downloads (ffmpeg, kernel test tree, etc.).
+    /// When unset, uses `{profiles_archive_dir}/benchmark-workdir` or `~/.cache/abs/pgo-benchmark/PKG`.
+    pub benchmark_workdir: Option<String>,
+    pub build_user: Option<String>,
+    #[serde(default = "default_auto_str")]
+    pub perf_event_args: String,
+    #[serde(default = "default_perf_extra_args")]
+    pub perf_extra_args: String,
+    pub sysctl_command: Option<String>,
+    #[serde(default = "default_auto_str")]
+    pub vmlinux: String,
+    #[serde(default = "default_afdo_tool")]
+    pub afdo_tool: String,
+    #[serde(default = "default_propeller_tool")]
+    pub propeller_tool: String,
+    #[serde(default = "default_afdo_profile_name")]
+    pub afdo_profile_name: String,
+    #[serde(default = "default_true")]
+    pub verify_boot: bool,
+    /// When true, abs reboots at PGO wait stages and resumes via a user systemd unit until done.
+    #[serde(default)]
+    pub auto_restart: bool,
+    pub state_file: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl PgoConfig {
+    pub fn resolved_state_file(&self, package: &str) -> PathBuf {
+        if let Some(path) = &self.state_file {
+            expand_user_path(path)
+        } else {
+            dirs::config_dir()
+                .map(|d| d.join("abs").join("pgo").join(format!("{package}.json")))
+                .unwrap_or_else(|| PathBuf::from(format!("/tmp/abs-pgo-{package}.json")))
+        }
+    }
+
+    pub fn resolved_archive_dir(&self) -> Option<PathBuf> {
+        self.profiles_archive_dir
+            .as_ref()
+            .map(|p| expand_user_path(p))
+    }
+
+    /// On-disk cache for cachyos-benchmarker assets (separate from ephemeral profile scratch on tmpfs).
+    pub fn resolved_benchmark_workdir(&self, package: &str) -> PathBuf {
+        if let Some(path) = &self.benchmark_workdir {
+            let expanded = expand_user_path(path);
+            if expanded.as_os_str() != "auto" {
+                return expanded;
+            }
+        }
+        if let Some(archive) = self.resolved_archive_dir() {
+            return archive.join("benchmark-workdir");
+        }
+        dirs::cache_dir()
+            .map(|d| d.join("abs").join("pgo-benchmark").join(package))
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/abs-pgo-benchmark-{package}")))
+    }
+}
+
+/// Expand `~` and `$HOME` / `$XDG_CONFIG_HOME` in config paths.
+pub fn expand_user_path(raw: &str) -> PathBuf {
+    let mut s = raw.to_string();
+    if s.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            s = home.join(&s[2..]).to_string_lossy().into_owned();
+        }
+    } else if s == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    for (var, val) in [
+        ("$HOME", dirs::home_dir()),
+        ("$XDG_CONFIG_HOME", dirs::config_dir()),
+    ] {
+        if let Some(ref path) = val {
+            s = s.replace(var, &path.to_string_lossy());
+        }
+    }
+    PathBuf::from(s)
 }
 
 const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
@@ -454,6 +672,31 @@ impl Config {
         };
 
         // Merge self-update settings parsed under [build] for backwards-compatibility
+        Self::merge_legacy_build_fields(&mut config);
+
+        config.validate();
+        config
+    }
+
+    /// Load an existing config without creating a default file (for `--purge`).
+    pub fn try_load_existing() -> Option<Config> {
+        let user_config = user_config_path();
+        let etc_config = PathBuf::from("/etc/abs/abs.toml");
+        let config_path = if user_config.exists() {
+            user_config
+        } else if etc_config.exists() {
+            etc_config
+        } else {
+            return None;
+        };
+
+        let config_content = fs::read_to_string(&config_path).ok()?;
+        let mut config: Config = toml::from_str(&config_content).ok()?;
+        Self::merge_legacy_build_fields(&mut config);
+        Some(config)
+    }
+
+    fn merge_legacy_build_fields(config: &mut Config) {
         if let Some(val) = config.build.check_for_update_on_startup {
             config.check_for_update_on_startup = val;
         }
@@ -475,9 +718,6 @@ impl Config {
         if let Some(val) = config.build.install_testing_phase_archlinux_packages {
             config.install_testing_phase_archlinux_packages = val;
         }
-
-        config.validate();
-        config
     }
 
     fn validate(&self) {
@@ -503,6 +743,7 @@ impl Config {
                 }
             }
             if let Some(code) = &pkg.ramdisk
+                && !crate::ramdisk::is_ramdisk_disabled(code)
                 && let Err(e) = crate::ramdisk::parse_ramdisk_targets(code)
             {
                 die!("Invalid ramdisk for package {:?}: {}", pkg_name, e);
@@ -721,6 +962,14 @@ impl Config {
         println!("  self_update_github_url: {}", self.self_update_github_url);
         println!("  self_update_raw_url: {}", self.self_update_raw_url);
         println!("  self_update_install_path: {}", self.self_update_install_path);
+        println!(
+            "  self_update_use_pacman: {}",
+            match self.self_update_use_pacman {
+                None => "auto".to_string(),
+                Some(true) => "true".to_string(),
+                Some(false) => "false".to_string(),
+            }
+        );
         println!(
             "  install_testing_phase_archlinux_packages: {}",
             self.install_testing_phase_archlinux_packages

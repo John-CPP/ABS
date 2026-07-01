@@ -7,12 +7,15 @@ use std::collections::HashMap;
 pub struct PackageSpec {
     pub name: String,
     pub pkgbuild_overrides: HashMap<String, String>,
+    /// Kernel build variables (e.g. `_use_llvm_lto`) baked into the PKGBUILD. Unlike
+    /// `pkgbuild_overrides`, these never trigger `updpkgsums` since they do not affect sources.
+    pub kernel_vars: HashMap<String, String>,
     pub repo: Option<String>,
     pub local_build: Option<bool>,
     pub chroot_build: Option<bool>,
     pub no_check: Option<bool>,
     pub compiler: Option<String>,
-    /// CLI override for ramdisk targets (`w`, `c`, `p`), e.g. `mesa[ramdisk=wcp]` or `mesa[wcp]`.
+    /// CLI override for ramdisk targets (`w`, `c`, `p`, `r`) or `disabled`, e.g. `mesa[ramdisk=wcp]`.
     pub ramdisk: Option<String>,
 }
 
@@ -21,6 +24,7 @@ impl PackageSpec {
         Self {
             name: name.into(),
             pkgbuild_overrides: HashMap::new(),
+            kernel_vars: HashMap::new(),
             repo: None,
             local_build: None,
             chroot_build: None,
@@ -36,42 +40,33 @@ fn normalize_repo_name(name: &str) -> String {
 }
 
 fn merge_ramdisk_code(existing: &str, addition: &str) -> String {
-    let mut w = false;
-    let mut c = false;
-    let mut p = false;
-    for ch in existing.chars().chain(addition.chars()) {
-        match ch.to_ascii_lowercase() {
-            'w' => w = true,
-            'c' => c = true,
-            'p' => p = true,
-            _ => {}
-        }
+    if crate::ramdisk::is_ramdisk_disabled(existing) || crate::ramdisk::is_ramdisk_disabled(addition) {
+        return crate::ramdisk::RAMDISK_DISABLED.to_string();
     }
-    let mut out = String::new();
-    if w {
-        out.push('w');
-    }
-    if c {
-        out.push('c');
-    }
-    if p {
-        out.push('p');
-    }
-    out
+    let mut targets = crate::ramdisk::parse_ramdisk_targets(existing).unwrap_or_default();
+    let add = crate::ramdisk::parse_ramdisk_targets(addition).unwrap_or_default();
+    targets.build_workdir |= add.build_workdir;
+    targets.chroot |= add.chroot;
+    targets.packages |= add.packages;
+    targets.profiles |= add.profiles;
+    crate::ramdisk::format_ramdisk_targets(&targets)
 }
 
 fn normalize_ramdisk_code(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| matches!(c.to_ascii_lowercase(), 'w' | 'c' | 'p'))
-        .collect()
+    if crate::ramdisk::is_ramdisk_disabled(value) {
+        return crate::ramdisk::RAMDISK_DISABLED.to_string();
+    }
+    crate::ramdisk::parse_ramdisk_targets(value)
+        .map(|t| crate::ramdisk::format_ramdisk_targets(&t))
+        .unwrap_or_default()
 }
 
 fn is_ramdisk_target_token(part: &str) -> bool {
     !part.is_empty()
-        && part
-            .chars()
-            .all(|c| matches!(c.to_ascii_lowercase(), 'w' | 'c' | 'p'))
+        && !part.contains('=')
+        && crate::ramdisk::parse_ramdisk_targets(part)
+            .map(|t| t.any())
+            .unwrap_or(false)
 }
 
 fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
@@ -127,7 +122,7 @@ fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
         "ramdisk" => {
             if value.is_empty() {
                 die!(
-                    "Package '{}': [ramdisk] requires a value (e.g. ramdisk=wcp; w=workdir, c=chroot, p=packages)",
+                    "Package '{}': [ramdisk] requires a value (e.g. ramdisk=wr, ramdisk=disabled; w=workdir, c=chroot, p=packages, r=profiles)",
                     spec.name
                 );
             }
@@ -191,6 +186,8 @@ pub fn parse_package_spec(input: &str) -> PackageSpec {
         }
         if let Some((key, value)) = part.split_once('=') {
             parse_attr(key.trim(), value, &mut spec);
+        } else if crate::ramdisk::is_ramdisk_disabled(part) {
+            spec.ramdisk = Some(crate::ramdisk::RAMDISK_DISABLED.to_string());
         } else if is_ramdisk_target_token(part) {
             let code = normalize_ramdisk_code(part);
             spec.ramdisk = Some(match spec.ramdisk.take() {
@@ -259,5 +256,19 @@ mod tests {
         assert_eq!(spec.ramdisk.as_deref(), Some("wcp"));
         let spec = parse_package_spec("mesa[w,c,p]");
         assert_eq!(spec.ramdisk.as_deref(), Some("wcp"));
+        let spec = parse_package_spec("linux-cachyos[wr]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("wr"));
+        let spec = parse_package_spec("linux-cachyos[ramdisk=wr]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("wr"));
+    }
+
+    #[test]
+    fn parse_ramdisk_disabled_bracket() {
+        let spec = parse_package_spec("electron40[ramdisk=disabled]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("disabled"));
+        let spec = parse_package_spec("electron40[disabled]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("disabled"));
+        let spec = parse_package_spec("electron40[ramdisk=disabled,wcp]");
+        assert_eq!(spec.ramdisk.as_deref(), Some("disabled"));
     }
 }

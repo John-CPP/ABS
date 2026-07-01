@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=absgui
+Comment=ABS kernel manager and configuration GUI
+Exec=absgui
+Icon=absgui
+Terminal=false
+Categories=System;Settings;

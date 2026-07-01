@@ -203,6 +203,30 @@ pub fn bump_pkgrel(repo_dir: &Path) {
     }
 }
 
+/// Extract `validpgpkeys` fingerprints from a PKGBUILD (for makepkg source signature checks).
+pub fn parse_validpgpkeys(pkgbuild_text: &str) -> Vec<String> {
+    let block_re = match Regex::new(r"(?s)validpgpkeys=\((.*?)\)") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let Some(caps) = block_re.captures(pkgbuild_text) else {
+        return Vec::new();
+    };
+    let key_re = match Regex::new(r"[0-9A-Fa-f]{16,40}") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for m in key_re.find_iter(&caps[1]) {
+        let key = m.as_str().to_ascii_uppercase();
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// Snapshot `PKGBUILD` before any emerge edits to the package tree.
 ///
 /// Call order must match Bash `process_package` intent: **right after** `prepare_repo` and
@@ -264,6 +288,34 @@ pub fn update_pkgsums(repo_dir: &Path) -> bool {
         false
     } else {
         true
+    }
+}
+
+/// Download source tarballs with `updpkgsums` before ramdisk setup (PGO stage 1 only, on disk).
+/// When compilation uses tmpfs (`w`) but the git tree stays on disk, store tarballs in
+/// `.makepkg-src/` on disk so they survive ramdisk teardown between PGO stages.
+pub fn prefetch_pgo_sources(
+    repo_dir: &Path,
+    targets: &crate::ramdisk::RamdiskTargets,
+) -> bool {
+    if targets.build_workdir && !targets.packages {
+        let srcdest = crate::ramdisk::srcdest_for_repo(repo_dir);
+        if let Err(e) = std::fs::create_dir_all(&srcdest) {
+            crate::vlog!("Failed to create SRCDEST {}: {e}", srcdest.display());
+            return false;
+        }
+        let cmd = format!(
+            "SRCDEST={} updpkgsums",
+            crate::utils::sh_single_quote(&srcdest.to_string_lossy())
+        );
+        if let Err(e) = crate::utils::run_command("sh", &["-c", &cmd], Some(repo_dir)) {
+            crate::vlog!("updpkgsums prefetch failed: {e}");
+            false
+        } else {
+            true
+        }
+    } else {
+        update_pkgsums(repo_dir)
     }
 }
 
@@ -354,6 +406,26 @@ mod tests {
         assert!(!temp.join(".PKGBUILD.emerge_backup").exists());
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn parse_validpgpkeys_extracts_fingerprints() {
+        let sample = r#"pkgname=curl
+validpgpkeys=('27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2') # Daniel Stenberg
+source=("git+https://github.com/curl/curl.git?signed#tag=curl-${pkgver//./_}")
+"#;
+        let keys = parse_validpgpkeys(sample);
+        assert_eq!(keys, vec!["27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2"]);
+    }
+
+    #[test]
+    fn parse_validpgpkeys_multiline_array() {
+        let sample = r#"validpgpkeys=(
+  'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'
+)"#;
+        let keys = parse_validpgpkeys(sample);
+        assert_eq!(keys.len(), 2);
     }
 
     #[test]

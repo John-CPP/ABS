@@ -109,6 +109,78 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
 
+    /// Ramdisk targets for all packages on this run (`w`=workdir, `c`=chroot, `p`=packages, `disabled`=off).
+    /// Avoids shell glob issues with bracket syntax in zsh. Bracket `pkg[ramdisk=wcp]` overrides this.
+    #[arg(long, value_name = "WCP|disabled")]
+    pub ramdisk: Option<String>,
+
     /// Packages to build. Per-package options: `pkg[repo=aur,pkgver=1.0,pkgrel=2,local,chroot,nocheck]`
+    /// Quote the argument when using `[` (required in zsh): `'mesa[repo=aur]'`
     pub packages: Vec<String>,
+
+    /// Start kernel PGO pipeline for PACKAGE
+    #[arg(long, value_name = "PACKAGE")]
+    pub pgo: Option<String>,
+
+    /// Resume kernel PGO pipeline after reboot
+    #[arg(long, value_name = "PACKAGE")]
+    pub pgo_resume: Option<String>,
+
+    /// Show kernel PGO pipeline status
+    #[arg(long, value_name = "PACKAGE")]
+    pub pgo_status: Option<String>,
+
+    /// Abort kernel PGO pipeline (stops builds; preserves saved stage)
+    #[arg(long, value_name = "PACKAGE")]
+    pub pgo_abort: Option<String>,
+
+    /// Stop any in-flight PGO work, clear saved pipeline state, and start stage 1 from scratch
+    #[arg(long, value_name = "PACKAGE")]
+    pub pgo_restart: Option<String>,
+
+    /// PGO pipeline stage to run or set (with `--pgo-resume` / `--pgo-goto`). Examples:
+    /// `stage2_profile`, `profile`, `2p`, `stage1_build`, `wait_reboot1`
+    #[arg(long, value_name = "STAGE")]
+    pub pgo_stage: Option<String>,
+
+    /// With `--pgo-resume`: run only the selected stage, then stop (state still advances on success)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub pgo_once: bool,
+
+    /// Set PGO pipeline stage in the state file without running (requires `--pgo-stage` and PACKAGE)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub pgo_goto: bool,
+
+    /// Unattended PGO: resume in-progress pipelines on start, reboot at wait stages, and continue
+    /// after boot via a transient user systemd unit (also enabled by `auto_restart` in abs.toml).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub pgo_auto: bool,
+
+    /// One-shot kernel build for PACKAGE applying its [packages.PKG.kernel] options (no PGO)
+    #[arg(long, value_name = "PACKAGE")]
+    pub kernel_build: Option<String>,
+
+    /// Unmount the configured ramdisk tmpfs (e.g. after abort or GUI exit)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub ramdisk_shutdown: bool,
+
+    /// Emit machine-readable JSON (status/events)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub json: bool,
+
+    /// Append structured JSON-lines events to PATH during PGO runs
+    #[arg(long, value_name = "PATH")]
+    pub event_log: Option<std::path::PathBuf>,
+
+    /// Remove ABS from the system: binaries, config, state, cache, and build directories
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub purge: bool,
+
+    /// Skip the interactive “Press Enter to exit” prompt (for scripts and automation)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub no_wait: bool,
+
+    /// Skip confirmation prompts (used with --purge)
+    #[arg(long, short = 'y', action = ArgAction::SetTrue)]
+    pub yes: bool,
 }

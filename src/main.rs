@@ -6,7 +6,10 @@ mod dep_graph;
 mod git;
 mod install;
 mod package_spec;
+mod pgo;
+mod pgo_benchmark;
 mod pkgbuild;
+mod purge;
 mod ramdisk;
 mod self_update;
 mod system;
@@ -74,21 +77,29 @@ pub fn force_sudo_clean() -> bool {
     FORCE_SUDO_CLEAN.load(Ordering::Relaxed)
 }
 
-fn install_all_keys() {
-    blog!("Installing Arch Linux and CachyOS keyrings...");
-    if let Err(e) = run_command(
-        "sudo",
-        &[
-            "pacman",
-            "-Sy",
-            "--noconfirm",
-            "archlinux-keyring",
-            "cachyos-keyring",
-        ],
-        None::<&str>,
-    ) {
+fn install_keyring_packages() {
+    const PACKAGES: &[&str] = &["archlinux-keyring", "cachyos-keyring"];
+    let base = ["pacman", "-Sy", "--noconfirm"];
+
+    let mut args: Vec<&str> = base.to_vec();
+    args.extend(PACKAGES);
+    if run_command("sudo", &args, None::<&str>).is_ok() {
+        return;
+    }
+
+    blog!("Retrying keyring install with --overwrite (orphaned keyring files)...");
+    let mut args: Vec<&str> = base.to_vec();
+    args.push("--overwrite");
+    args.push("/usr/share/pacman/keyrings/*");
+    args.extend(PACKAGES);
+    if let Err(e) = run_command("sudo", &args, None::<&str>) {
         ewarn!("Keyring package install failed: {}", e);
     }
+}
+
+fn install_all_keys() {
+    blog!("Installing Arch Linux and CachyOS keyrings...");
+    install_keyring_packages();
 
     blog!("Populating keyrings...");
     if let Err(e) = run_command(
@@ -118,6 +129,9 @@ fn install_all_keys() {
     ) {
         ewarn!("Failed to refresh keys: {}", e);
     }
+
+    blog!("Importing packager keys into user keyring (for makepkg PGP checks)...");
+    utils::seed_user_gpg_from_packager_keyrings();
 }
 
 fn remove_chroot(config: &config::Config) {
@@ -181,6 +195,7 @@ struct RamdiskShutdown;
 
 impl Drop for RamdiskShutdown {
     fn drop(&mut self) {
+        crate::utils::wait_before_exit_if_needed();
         ramdisk::shutdown();
     }
 }
@@ -228,6 +243,7 @@ macro_rules! die {
     ($($arg:tt)*) => {{
         eprintln!("{} {}", "==> ERROR:".red(), format!($($arg)*));
         $crate::pkgbuild::restore_pending_pkgbuilds();
+        $crate::utils::wait_before_exit_if_needed();
         $crate::ramdisk::shutdown();
         std::process::exit(1);
     }};
@@ -260,6 +276,7 @@ macro_rules! vlog {
 
 fn main() {
     let cli = Cli::parse();
+    let _terminal_guard = crate::utils::TerminalRestoreGuard::new();
 
     let v = match (cli.verbose, cli.silent) {
         (true, true) => Verbosity::Normal,
@@ -270,9 +287,21 @@ fn main() {
     set_verbosity(v);
     set_dry_run_mode(cli.dry_run);
     set_force_sudo_clean(cli.use_sudo_clean);
+    crate::utils::set_skip_exit_pause(cli.no_wait);
+
+    if let Some(code) = &cli.ramdisk
+        && let Err(e) = ramdisk::parse_ramdisk_targets(code)
+    {
+        die!("Invalid --ramdisk {:?}: {}", code, e);
+    }
 
     if cli.configure.is_some() {
         config::Config::open_in_editor(cli.configure.as_deref().filter(|s| !s.is_empty()));
+        return;
+    }
+
+    if cli.purge {
+        purge::run(cli.yes);
         return;
     }
 
@@ -314,8 +343,18 @@ fn main() {
     let update_notifier = Arc::new(Mutex::new(None));
     let update_notifier_clone = Arc::clone(&update_notifier);
     let raw_url = config.self_update_raw_url.clone();
-    // Skip redundant background update checks if we are running synchronous auto-updates
-    let skip_background = config.auto_update_on_startup || (config.self_update_at_updates && cli.system_update);
+    // Skip redundant background update checks if we are running synchronous auto-updates,
+    // or about to start an interactive build (PGO / kernel) where curl output would race with
+    // `sudo -v` on the same terminal.
+    let skip_background = config.auto_update_on_startup
+        || (config.self_update_at_updates && cli.system_update)
+        || cli.pgo.is_some()
+        || cli.pgo_resume.is_some()
+        || cli.pgo_status.is_some()
+        || cli.pgo_abort.is_some()
+        || cli.pgo_restart.is_some()
+        || cli.pgo_goto
+        || cli.kernel_build.is_some();
     if config.check_for_update_on_startup && !skip_background {
         std::thread::spawn(move || {
             if let Ok((true, latest)) = self_update::check_for_update(&raw_url)
@@ -330,13 +369,73 @@ fn main() {
         return;
     }
 
-    if let Err(e) = ramdisk::initialize(&config) {
-        die!("Ramdisk setup failed: {}", e);
+    if cli.ramdisk_shutdown {
+        if let Err(e) = ramdisk::force_unmount_configured(&config) {
+            die!("{}", e);
+        }
+        blog!("Ramdisk shutdown complete.");
+        return;
     }
-    if let Err(e) = ramdisk::refresh_deletable_roots(&config) {
+
+    if cli.pgo.is_some()
+        || cli.pgo_resume.is_some()
+        || cli.pgo_status.is_some()
+        || cli.pgo_abort.is_some()
+        || cli.pgo_restart.is_some()
+        || cli.pgo_goto
+    {
+        let _ramdisk_shutdown = RamdiskShutdown;
+        crate::ramdisk::install_exit_handlers();
+        let pgo_needs_sudo = cli.pgo.is_some()
+            || cli.pgo_resume.is_some()
+            || cli.pgo_restart.is_some()
+            || cli.pgo_goto
+            || cli.pgo_abort.is_some();
+        if !cli.dry_run && pgo_needs_sudo {
+            if let Err(e) = prime_sudo_for_session() {
+                if std::env::var_os("ABS_GUI").is_some() {
+                    die!("{}", e);
+                }
+                ewarn!(
+                    "sudo -v failed (PGO build steps may prompt for a password again): {}",
+                    e
+                );
+            }
+            spawn_sudo_keepalive();
+        }
+        pgo::handle_cli(&cli, &config);
+        return;
+    }
+
+    if let Some(pkg) = cli.kernel_build.clone() {
+        let _ramdisk_shutdown = RamdiskShutdown;
+        ramdisk::install_exit_handlers();
+        if !cli.dry_run {
+            if let Err(e) = prime_sudo_for_session() {
+                if std::env::var_os("ABS_GUI").is_some() {
+                    die!("{}", e);
+                }
+                ewarn!("sudo -v failed (build steps may prompt for a password again): {}", e);
+            }
+            spawn_sudo_keepalive();
+        }
+        crate::utils::request_exit_pause();
+        if !build::process_kernel_oneshot(&pkg, &cli, &config) {
+            die!("Kernel build failed for {}", pkg);
+        }
+        return;
+    }
+
+    if let Err(e) = crate::utils::init_deletable_roots(
+        &config.paths.packages_path,
+        &config.paths.chroot_base_path,
+        &config.paths.ready_made_packages_path,
+        &[],
+    ) {
         die!("{}", e);
     }
     let _ramdisk_shutdown = RamdiskShutdown;
+    ramdisk::install_exit_handlers();
 
     if !cli.dry_run {
         if let Err(e) = prime_sudo_for_session() {
@@ -469,12 +568,13 @@ fn run_compilations(
     defer_install_pass: bool,
 ) -> HashSet<String> {
     use std::collections::{HashMap, HashSet};
-    use std::sync::{Mutex, Condvar};
+    use std::sync::{Condvar, Mutex};
 
     let mut skipped_install = HashSet::new();
     if specs.is_empty() {
         return skipped_install;
     }
+    crate::utils::request_exit_pause();
 
     let sorted_specs = match dep_graph::sort_packages_topologically(&specs, cli, config) {
         Ok(sorted) => sorted,
@@ -513,18 +613,24 @@ fn run_compilations(
     for (base, spec) in &spec_map {
         let (repo_name, repo_url_string, base_pkg) = build::resolve_pkg_repo_for_manual(&spec.name, cli, config);
         let pkg_config = config.packages.get(&spec.name);
-        let targets = ramdisk::resolve_ramdisk_targets(config, pkg_config, Some(spec))
+        let targets = ramdisk::resolve_ramdisk_targets(
+            config,
+            pkg_config,
+            Some(spec),
+            cli.ramdisk.as_deref(),
+        )
             .unwrap_or_default();
         let pkg_dir = git::prepare_repo(
             &spec.name,
             &base_pkg,
             &repo_name,
             &repo_url_string,
-            &ramdisk::effective_packages_path(config, &targets),
+            &ramdisk::download_packages_path(config, &targets),
             false,
             false,
             None,
-        );
+        )
+        .pkg_dir;
         let all_deps = pkgbuild::parse_pkg_dependencies(pkg_dir.as_path());
         let mut filtered_deps = HashSet::new();
         for dep in all_deps {
