@@ -2,15 +2,44 @@ use crate::config::Config;
 use crate::utils::{run_command, run_command_quiet, run_command_with_output_silent, vercmp_silent};
 use crate::{blog, vlog};
 use colored::Colorize;
-use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Parse version from raw Cargo.toml string
+/// Parse `version` for the workspace `abs` package from raw Cargo.toml text.
 fn parse_cargo_toml_version(text: &str) -> Option<String> {
-    let re = Regex::new(r#"(?m)^version\s*=\s*"([^"]+)""#).ok()?;
-    let caps = re.captures(text)?;
-    Some(caps[1].to_string())
+    parse_cargo_toml_package_version(text, "abs")
+}
+
+fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String> {
+    let mut in_package = false;
+    let mut matches_name = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[package]" {
+            in_package = true;
+            matches_name = false;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_package = false;
+            matches_name = false;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("name = ") {
+            let name = name.trim().trim_matches('"');
+            matches_name = name == package;
+            continue;
+        }
+        if matches_name {
+            if let Some(version) = trimmed.strip_prefix("version = ") {
+                return Some(version.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Fetch the latest version from raw GitHub Cargo.toml
@@ -235,10 +264,29 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
 
     if !is_newer {
         if !is_auto {
-            blog!(
-                "ABS is up-to-date (current version: {}).",
-                env!("CARGO_PKG_VERSION").green()
-            );
+            let current = env!("CARGO_PKG_VERSION");
+            match vercmp_silent(current, &latest) {
+                Ok(cmp) if cmp > 0 => {
+                    blog!(
+                        "ABS {} is newer than published upstream {} (local or manual install).",
+                        current.green(),
+                        latest.yellow()
+                    );
+                }
+                Ok(_) => {
+                    blog!(
+                        "ABS is up-to-date (current: {}, upstream: {}).",
+                        current.green(),
+                        latest
+                    );
+                }
+                Err(e) => {
+                    blog!(
+                        "ABS is up-to-date (current version: {}). (Could not compare with upstream: {e})",
+                        current.green()
+                    );
+                }
+            }
         }
         return Ok(false);
     }
@@ -285,8 +333,21 @@ mod tests {
     fn parse_remote_cargo_version() {
         let text = r#"[package]
 name = "abs"
-version = "1.3.3"
+version = "1.3.4"
 "#;
-        assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("1.3.3"));
+        assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("1.3.4"));
+    }
+
+    #[test]
+    fn parse_remote_cargo_version_ignores_other_workspace_members() {
+        let text = r#"[package]
+name = "absgui"
+version = "1.3.3"
+
+[package]
+name = "abs"
+version = "1.3.4"
+"#;
+        assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("1.3.4"));
     }
 }
