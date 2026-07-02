@@ -1,0 +1,99 @@
+# ABS — split packages: abs, absgui, abs-full (metapackage)
+#
+# Local build from a git checkout:
+#   cd aur && makepkg -si
+#
+# Upload to AUR: copy this directory to abs/, set ABS_GIT_URL or use the git source() below.
+
+pkgbase=abs
+pkgname=(abs absgui abs-full)
+pkgver=1.3.4
+pkgrel=1
+pkgdesc='Arch/CachyOS package builder with kernel PGO support'
+arch=('x86_64' 'aarch64')
+url='https://github.com/John-CPP/ABS'
+license=('CC-BY-4.0')
+makedepends=('cargo' 'git' 'gcc' 'llvm' 'clang' 'make' 'pkgconf')
+options=('!debug')
+install_abs=abs.install
+
+if [[ -f "$startdir/../Cargo.toml" ]]; then
+  source=()
+  sha256sums=()
+else
+  source=('git+https://github.com/John-CPP/ABS.git')
+  sha256sums=('SKIP')
+fi
+
+depends_abs=(
+  'git'
+  'pacman'
+  'patch'
+)
+optdepends_abs=(
+  'devtools: chroot builds with makechrootpkg'
+  'absgui: graphical configuration and kernel PGO UI'
+  'perf: kernel PGO profiling'
+  'llvm: AutoFDO / Propeller profile conversion'
+  'cachyos-benchmarker: bundled PGO benchmark workload'
+  'sysbench: bundled PGO benchmark workload'
+)
+
+depends_absgui=(
+  'abs'
+  'hicolor-icon-theme'
+)
+optdepends_absgui=(
+  'noto-fonts: recommended font for the iced UI'
+  'vulkan-driver: GPU rendering backend for iced'
+)
+
+pkgver() {
+  if [[ -f "$startdir/../Cargo.toml" ]]; then
+    grep '^version' "$startdir/../Cargo.toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
+  else
+    cd "$srcdir/ABS"
+    grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
+  fi
+}
+
+prepare() {
+  if [[ -f "$startdir/../Cargo.toml" ]]; then
+    ln -sfn "$startdir/.." "$srcdir/abs"
+  else
+    mv "$srcdir/ABS" "$srcdir/abs"
+  fi
+}
+
+build() {
+  cd "$srcdir/abs"
+  export CARGO_TARGET_DIR="$srcdir/cargo-target"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --release --locked
+  cargo build --release --locked -p absgui
+}
+
+package_abs() {
+  cd "$srcdir/abs"
+  install -Dm755 "$srcdir/cargo-target/release/abs" "$pkgdir/usr/bin/abs"
+  install -Dm755 assets/pgo-benchmark.sh "$pkgdir/usr/share/abs/pgo-benchmark.sh"
+  install -Dm644 abs.toml.example "$pkgdir/usr/share/doc/abs/abs.toml.example"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/abs/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/abs/LICENSE"
+}
+
+package_absgui() {
+  cd "$srcdir/abs"
+  install -Dm755 "$srcdir/cargo-target/release/absgui" "$pkgdir/usr/bin/absgui"
+  install -Dm644 absgui/absgui.desktop "$pkgdir/usr/share/applications/absgui.desktop"
+  install -Dm644 absgui/assets/icon.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/absgui.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/absgui/LICENSE"
+}
+
+package_abs-full() {
+  pkgdesc='ABS CLI and GUI (metapackage)'
+  depends=('abs' 'absgui')
+  # Metapackage: no files. Install with `pacman -S abs-full`.
+  # Remove with `pacman -Rns abs-full` to drop abs, absgui, and abs-full together.
+  :
+}

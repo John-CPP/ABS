@@ -1,0 +1,10 @@
+post_install() {
+  echo "ABS installed. Copy the example config if needed:"
+  echo "  mkdir -p ~/.config/abs"
+  echo "  cp /usr/share/doc/abs/abs.toml.example ~/.config/abs/abs.toml"
+  echo "  abs --configure"
+}
+
+post_upgrade() {
+  post_install "$@"
+}
