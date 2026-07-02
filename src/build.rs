@@ -527,7 +527,8 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
         && (repo_name == "arch" || repo_name == "cachyos")
         && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
             let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
-                return Ok(true);
+                vlog!("{}: not installed; skipping manual update build", pkg);
+                return Ok(false);
             };
             return Ok(vercmp(&sync_ver, &inst_ver)? > 0);
         }
@@ -546,7 +547,8 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
     .pkg_dir;
     let src_ver = read_pkg_full_version_from_dir(pkg_dir.as_path())?;
     let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
-        return Ok(true);
+        vlog!("{}: not installed; skipping manual update build", pkg);
+        return Ok(false);
     };
     Ok(vercmp(&src_ver, &inst_ver)? > 0)
 }
@@ -697,6 +699,7 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
 enum ManualPkgVersionLine {
     UpToDate { current: String },
     Upgrade { current: String, new: String },
+    NotInstalled,
 }
 
 fn classify_manual_pkg_version(
@@ -715,10 +718,7 @@ fn classify_manual_pkg_version(
         && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
             let inst = pacman_query_version(&base_pkg)?;
             let Some(inst_ver) = inst else {
-                return Ok(ManualPkgVersionLine::Upgrade {
-                    current: "not installed".to_string(),
-                    new: sync_ver,
-                });
+                return Ok(ManualPkgVersionLine::NotInstalled);
             };
             if vercmp(&sync_ver, &inst_ver)? > 0 {
                 return Ok(ManualPkgVersionLine::Upgrade {
@@ -743,10 +743,7 @@ fn classify_manual_pkg_version(
     let src = read_pkg_full_version_from_dir(pkg_dir.as_path())?;
     let inst = pacman_query_version(&base_pkg)?;
     let Some(inst) = inst else {
-        return Ok(ManualPkgVersionLine::Upgrade {
-            current: "not installed".to_string(),
-            new: src,
-        });
+        return Ok(ManualPkgVersionLine::NotInstalled);
     };
     match vercmp(&src, &inst)? {
         x if x > 0 => Ok(ManualPkgVersionLine::Upgrade {
@@ -772,6 +769,10 @@ fn print_manual_version_line(pkg: &str, line: ManualPkgVersionLine) {
         ManualPkgVersionLine::Upgrade { current, new } => {
             print!("{}", "Has an upgrade".red().bold());
             println!(" ({} vs {})", current.red(), new.green());
+        }
+        ManualPkgVersionLine::NotInstalled => {
+            print!("{}", "Not installed".yellow().bold());
+            println!(" (skipped)");
         }
     }
 }

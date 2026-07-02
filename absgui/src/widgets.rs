@@ -28,7 +28,7 @@ pub fn field_label_column<'a>(
 pub fn page_title(title: &str, app_theme: AppTheme) -> Element<'_, Message> {
     column![
         text(title).size(26),
-        iced::widget::container(Space::with_height(Length::Fixed(3.0)))
+        iced::widget::container(Space::new().height(Length::Fixed(3.0)))
             .width(Length::Fixed(48.0))
             .height(Length::Fixed(3.0))
             .style(style::accent_bar(app_theme)),
@@ -163,7 +163,7 @@ pub fn field_checkbox<'a, F>(
 where
     F: Fn(bool) -> Message + 'a,
 {
-    let mut col = column![checkbox(label, checked).on_toggle(on_toggle),].spacing(4);
+    let mut col = column![checkbox(checked).label(label).on_toggle(on_toggle),].spacing(4);
     if let Some(h) = help {
         col = col.push(help_line(h, app_theme));
     }

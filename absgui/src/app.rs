@@ -119,12 +119,15 @@ const PGO_PROFILING_QUALITY_OPTS: &[&str] = &["standard", "maximum"];
 pub fn run() -> iced::Result {
     let gui_settings = GuiSettings::load();
     let icon = load_window_icon();
-    iced::application(App::title, App::update, App::view)
+    let window = gui_settings.window_settings(icon);
+    let boot_settings = gui_settings.clone();
+    iced::application(move || App::new(boot_settings.clone()), App::update, App::view)
+        .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window(gui_settings.window_settings(icon))
+        .window(window)
         .exit_on_close_request(false)
-        .run_with(move || App::new(gui_settings))
+        .run()
 }
 
 pub struct App {
@@ -1143,7 +1146,7 @@ impl App {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             nav_btn("Kernels", kernels_active, theme, Message::OpenKernels),
             nav_btn(
                 "ABS settings",
@@ -1188,7 +1191,7 @@ impl App {
             text("").size(12)
         };
         container(
-            row![left, Space::with_width(Length::Fill), right]
+            row![left, Space::new().width(Length::Fill), right]
                 .align_y(Alignment::Center)
                 .padding(Padding::from([6.0, 16.0])),
         )

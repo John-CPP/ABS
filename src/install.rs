@@ -271,7 +271,10 @@ pub fn install_pgo_artifacts(
     }
     files.retain(|f| {
         if let Some(name) = package_name_from_file(f)
-            && config.skip_install_after_compilation().contains(&name)
+            && crate::package_pattern::package_matches_any_pattern(
+                &name,
+                config.skip_install_after_compilation(),
+            )
         {
             vlog!("Skipping ignored package artifact: {}", name);
             return false;
@@ -511,7 +514,10 @@ fn install_artifacts_inner(
     files.retain(|f| {
         let pkg_name = package_name_from_file(f);
         if let Some(name) = pkg_name
-            && config.skip_install_after_compilation().contains(&name)
+            && crate::package_pattern::package_matches_any_pattern(
+                &name,
+                config.skip_install_after_compilation(),
+            )
         {
             vlog!("Skipping ignored package artifact: {}", name);
             return false;

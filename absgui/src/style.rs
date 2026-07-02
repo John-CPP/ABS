@@ -73,22 +73,24 @@ pub fn muted(theme: AppTheme) -> Color {
 pub fn iced_theme(theme: AppTheme) -> Theme {
     match theme {
         AppTheme::Dark => Theme::custom(
-            "ABS Dark".into(),
+            "ABS Dark",
             iced::theme::Palette {
                 background: Color::from_rgb8(0x0f, 0x12, 0x16),
                 text: Color::from_rgb8(0xee, 0xf1, 0xf5),
                 primary: primary(AppTheme::Dark),
                 success: primary(AppTheme::Dark),
+                warning: Color::from_rgb8(0xff, 0xc1, 0x4e),
                 danger: Color::from_rgb8(0xf0, 0x5d, 0x5d),
             },
         ),
         AppTheme::Light => Theme::custom(
-            "ABS Light".into(),
+            "ABS Light",
             iced::theme::Palette {
                 background: Color::from_rgb8(0xec, 0xf0, 0xf4),
                 text: Color::from_rgb8(0x1e, 0x29, 0x3b),
                 primary: primary(AppTheme::Light),
                 success: primary(AppTheme::Light),
+                warning: Color::from_rgb8(0xd9, 0x77, 0x06),
                 danger: Color::from_rgb8(0xdc, 0x26, 0x26),
             },
         ),
@@ -303,7 +305,6 @@ pub fn log_editor(app_theme: AppTheme) -> impl Fn(&Theme, text_editor::Status) -
             width: 0.0,
             radius: 0.0.into(),
         },
-        icon: fg,
         placeholder: log_hint(app_theme),
         value: fg,
         selection: match app_theme {

@@ -6,6 +6,7 @@ mod dep_graph;
 mod git;
 mod install;
 mod package_spec;
+mod package_pattern;
 mod pgo;
 mod pgo_benchmark;
 mod pkgbuild;

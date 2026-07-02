@@ -224,7 +224,7 @@ pub fn handle_cli(cli: &Cli, config: &Config) {
     let events = EventLog::new(cli.event_log.clone(), cli.json);
 
     if cli.pgo_abort.is_some() {
-        run_abort(&package, config, &events);
+        run_abort(&package, cli, config, &events);
         return;
     }
     if !cli.pgo_goto {
@@ -348,11 +348,11 @@ fn install_pgo_auto_resume_service(package: &str) -> Result<(), String> {
 
 pub fn remove_pgo_auto_resume_service(package: &str) {
     let instance = pgo_auto_systemd_unit(package);
-    let _ = run_command(
-        "systemctl",
-        &["--user", "disable", "--now", instance.as_str()],
-        None::<&str>,
-    );
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", instance.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn trigger_pgo_auto_reboot(package: &str) -> Result<(), String> {
@@ -538,7 +538,7 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
                 return;
             }
             PgoStageId::Aborted => {
-                die!("PGO pipeline was aborted; run --pgo-abort then --pgo to restart");
+                die!("PGO pipeline was aborted; run --pgo to start a fresh pipeline");
             }
             _ => {
                 blog!("Resuming in-progress stage: {}", state.current_stage.label());
@@ -621,19 +621,36 @@ fn stage_id_name(stage: PgoStageId) -> String {
         .unwrap_or_else(|| format!("{stage:?}"))
 }
 
-fn run_abort(package: &str, config: &Config, events: &EventLog) {
-    run_abort_inner(package, config, events, true);
+fn run_abort(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
+    let disposition = if cli.pgo_keep_stage {
+        PgoAbortDisposition::KeepStage
+    } else {
+        PgoAbortDisposition::MarkAborted
+    };
+    run_abort_inner(package, config, events, disposition);
 }
 
 fn run_restart(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
     if cli.pgo_stage.is_some() || cli.pgo_once || cli.pgo_goto {
         die!("--pgo-stage, --pgo-once, and --pgo-goto are not used with --pgo-restart");
     }
-    run_abort_inner(package, config, events, false);
+    run_abort_inner(package, config, events, PgoAbortDisposition::RemoveState);
     run_start(package, cli, config, events);
 }
 
-fn run_abort_inner(package: &str, config: &Config, events: &EventLog, preserve_state: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgoAbortDisposition {
+    KeepStage,
+    MarkAborted,
+    RemoveState,
+}
+
+fn run_abort_inner(
+    package: &str,
+    config: &Config,
+    events: &EventLog,
+    disposition: PgoAbortDisposition,
+) {
     let (pgo, _) = load_pgo_config(package, config);
     let state_path = pgo.resolved_state_file(package);
     crate::utils::kill_abs_cli_processes(package);
@@ -660,34 +677,51 @@ fn run_abort_inner(package: &str, config: &Config, events: &EventLog, preserve_s
     if let Err(e) = crate::ramdisk::force_unmount_configured(config) {
         ewarn!("Ramdisk cleanup after PGO abort failed: {e}");
     }
-    if preserve_state {
-        if let Some(stage) = preserved_stage {
+    match disposition {
+        PgoAbortDisposition::KeepStage => {
+            if let Some(stage) = preserved_stage {
+                blog!(
+                    "PGO run stopped for {} (pipeline preserved at {}; use Resume or a stage button to continue)",
+                    package,
+                    stage.label()
+                );
+                events.emit(&PgoEvent::Error {
+                    ts: EventLog::now(),
+                    message: format!(
+                        "PGO stopped for {package} at {}; state preserved",
+                        stage.label()
+                    ),
+                });
+            } else {
+                blog!("PGO run stopped for {}", package);
+                events.emit(&PgoEvent::Error {
+                    ts: EventLog::now(),
+                    message: format!("PGO stopped for {package}"),
+                });
+            }
+        }
+        PgoAbortDisposition::MarkAborted => {
+            if let Some(mut state) = load_state(&state_path) {
+                transition(&mut state, PgoStageId::Aborted);
+                save_state(&state_path, &state);
+            }
             blog!(
-                "PGO run stopped for {} (pipeline preserved at {}; use Resume or a stage button to continue)",
-                package,
-                stage.label()
+                "PGO pipeline aborted for {} (kernel packages released from system-update hold; run --pgo to start fresh)",
+                package
             );
             events.emit(&PgoEvent::Error {
                 ts: EventLog::now(),
-                message: format!(
-                    "PGO stopped for {package} at {}; state preserved",
-                    stage.label()
-                ),
-            });
-        } else {
-            blog!("PGO run stopped for {}", package);
-            events.emit(&PgoEvent::Error {
-                ts: EventLog::now(),
-                message: format!("PGO stopped for {package}"),
+                message: format!("PGO pipeline aborted for {package}"),
             });
         }
-    } else {
-        let _ = fs::remove_file(&state_path);
-        blog!("PGO pipeline reset for {package}; starting from stage 1");
-        events.log_line(
-            "stdout",
-            format!("PGO pipeline reset for {package}; starting from stage 1"),
-        );
+        PgoAbortDisposition::RemoveState => {
+            let _ = fs::remove_file(&state_path);
+            blog!("PGO pipeline reset for {package}; starting from stage 1");
+            events.log_line(
+                "stdout",
+                format!("PGO pipeline reset for {package}; starting from stage 1"),
+            );
+        }
     }
 }
 
@@ -767,7 +801,7 @@ fn print_json_status(state: &PgoState, pgo: &PgoConfig) {
             reboot_resume_message(state, &state.package),
         ),
         PgoStageId::Done => (false, "none".to_string()),
-        PgoStageId::Aborted => (false, "run --pgo-abort then --pgo".to_string()),
+        PgoStageId::Aborted => (false, "run --pgo to start a fresh pipeline".to_string()),
         _ => (
             false,
             format!("abs --pgo-resume {}", state.package),
@@ -1171,26 +1205,7 @@ fn infer_suffix(base: &str) -> &str {
 pub fn active_pipeline_hold_packages(config: &Config) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut holds = Vec::new();
-    for (name, pkg) in &config.packages {
-        let Some(pgo) = pkg.pgo.as_ref() else {
-            continue;
-        };
-        if !pgo.enabled {
-            continue;
-        }
-        let state_path = pgo.resolved_state_file(name);
-        let Ok(text) = fs::read_to_string(&state_path) else {
-            continue;
-        };
-        let Ok(state) = serde_json::from_str::<PgoState>(&text) else {
-            continue;
-        };
-        if matches!(
-            state.current_stage,
-            PgoStageId::Done | PgoStageId::Aborted
-        ) {
-            continue;
-        }
+    for (_name, state) in active_pgo_states(config) {
         for pkg_name in kernel_hold_package_names(&state) {
             if seen.insert(pkg_name.clone()) {
                 holds.push(pkg_name);
@@ -1200,18 +1215,106 @@ pub fn active_pipeline_hold_packages(config: &Config) -> Vec<String> {
     holds
 }
 
+/// In-progress kernel PGO pipelines (excludes `Done` and `Aborted`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePgoPipeline {
+    pub package: String,
+    pub stage_label: String,
+}
+
+pub fn active_pipelines(config: &Config) -> Vec<ActivePgoPipeline> {
+    active_pgo_states(config)
+        .into_iter()
+        .map(|(package, state)| ActivePgoPipeline {
+            package,
+            stage_label: state.current_stage.label().to_string(),
+        })
+        .collect()
+}
+
+fn active_pgo_states(config: &Config) -> Vec<(String, PgoState)> {
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut seen_packages = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    let default_dir = default_pgo_state_dir();
+    if default_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(&default_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                try_push_active_pgo_state(&mut out, &mut seen_paths, &mut seen_packages, &path);
+            }
+        }
+    }
+
+    for (name, pkg) in &config.packages {
+        let Some(pgo) = pkg.pgo.as_ref() else {
+            continue;
+        };
+        let state_path = pgo.resolved_state_file(name);
+        try_push_active_pgo_state(&mut out, &mut seen_paths, &mut seen_packages, &state_path);
+    }
+
+    out
+}
+
+fn default_pgo_state_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("abs").join("pgo"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/abs-pgo"))
+}
+
+fn try_push_active_pgo_state(
+    out: &mut Vec<(String, PgoState)>,
+    seen_paths: &mut std::collections::HashSet<PathBuf>,
+    seen_packages: &mut std::collections::HashSet<String>,
+    path: &Path,
+) {
+    if !seen_paths.insert(path.to_path_buf()) {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(state) = serde_json::from_str::<PgoState>(&text) else {
+        return;
+    };
+    if matches!(
+        state.current_stage,
+        PgoStageId::Done | PgoStageId::Aborted
+    ) {
+        return;
+    }
+    let package = if state.package.is_empty() {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        state.package.clone()
+    };
+    if package.is_empty() || !seen_packages.insert(package.clone()) {
+        return;
+    }
+    out.push((package, state));
+}
+
 fn kernel_hold_package_names(state: &PgoState) -> Vec<String> {
     let mut names = vec![state.package.clone()];
-    let bases: Vec<&str> = if let Some(base) = state.expected_package_base.as_deref() {
+    let bases: Vec<String> = if let Some(base) = state.expected_package_base.as_deref() {
         if base == "linux-cachyos" || base == "linux-cachyos-lto" {
-            vec!["linux-cachyos", "linux-cachyos-lto"]
+            vec!["linux-cachyos".into(), "linux-cachyos-lto".into()]
+        } else if base == state.package {
+            vec![state.package.clone()]
         } else {
-            vec![base]
+            vec![base.to_string(), state.package.clone()]
         }
     } else {
-        vec!["linux-cachyos", "linux-cachyos-lto"]
+        vec![state.package.clone()]
     };
-    for base in bases {
+    for base in &bases {
         for suffix in ["", "-dbg", "-headers"] {
             names.push(format!("{base}{suffix}"));
         }
@@ -1225,7 +1328,7 @@ fn bootloader_hint(state: &PgoState) -> String {
     let pkgbase = state
         .expected_package_base
         .as_deref()
-        .unwrap_or("linux-cachyos");
+        .unwrap_or(&state.package);
     let uname = state
         .expected_kernel_uname
         .as_deref()
@@ -2164,6 +2267,114 @@ mod tests {
         assert!(!PgoStageId::Done.label().is_empty());
         assert_eq!(PgoStageId::Stage2Build.label(), "Stage 2: AutoFDO build");
         assert_eq!(PgoStageId::Stage3Build.label(), "Stage 3: final build");
+    }
+
+    #[test]
+    fn kernel_hold_package_names_uses_package_for_other_kernels() {
+        let state = PgoState {
+            package: "linux-zen".into(),
+            repo_dir: "/tmp".into(),
+            current_stage: PgoStageId::Stage2Build,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: Some("6.12.1-zen1-1-zen".into()),
+            expected_package_base: Some("linux-zen".into()),
+            stage_history: Vec::new(),
+        };
+        let names = super::kernel_hold_package_names(&state);
+        assert!(names.contains(&"linux-zen".to_string()));
+        assert!(names.contains(&"linux-zen-dbg".to_string()));
+        assert!(names.contains(&"linux-zen-headers".to_string()));
+        assert!(!names.contains(&"linux-cachyos".to_string()));
+    }
+
+    #[test]
+    fn active_pipelines_discovers_custom_state_file_for_any_kernel() {
+        use crate::config::{Config, PackageConfig, PgoConfig};
+
+        let dir = std::env::temp_dir().join(format!("abs-pgo-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("linux-zen.json");
+        let state = PgoState {
+            package: "linux-zen".into(),
+            repo_dir: "/tmp/repo".into(),
+            current_stage: PgoStageId::Stage2Build,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: None,
+            expected_package_base: None,
+            stage_history: Vec::new(),
+        };
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut config: Config = toml::from_str(
+            r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "aur"
+
+[packages]
+"#,
+        )
+        .unwrap();
+        let pgo = PgoConfig {
+            enabled: false,
+            preset: "cachyos-kernel".into(),
+            profiles_archive_dir: Some(dir.to_string_lossy().into_owned()),
+            profile_scratch_dir: "auto".into(),
+            perf_data_on_ram: true,
+            benchmark_command: None,
+            benchmark_workdir: None,
+            benchmark_preset: "fast".into(),
+            profiling_quality: "maximum".into(),
+            build_user: None,
+            perf_event_args: "auto".into(),
+            perf_extra_args: crate::config::PERF_EXTRA_ARGS_STANDARD.into(),
+            sysctl_command: None,
+            vmlinux: "auto".into(),
+            afdo_tool: "llvm-profgen".into(),
+            propeller_tool: "create_llvm_prof".into(),
+            afdo_profile_name: "kernel-compilation.afdo".into(),
+            verify_boot: true,
+            auto_restart: false,
+            state_file: Some(state_path.to_string_lossy().into_owned()),
+        };
+        config.packages.insert(
+            "linux-zen".into(),
+            PackageConfig {
+                pgo: Some(pgo),
+                ..Default::default()
+            },
+        );
+
+        let active = super::active_pipelines(&config);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].package, "linux-zen");
+        assert_eq!(active[0].stage_label, PgoStageId::Stage2Build.label());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

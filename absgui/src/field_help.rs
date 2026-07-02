@@ -142,9 +142,9 @@ pub const SELF_UPDATE_USE_PACMAN: &str =
 pub const MANUAL_UPDATE: &str =
     "Packages always rebuilt on -R/-RU even when ABS thinks they are up to date.";
 pub const SKIP_INSTALL: &str =
-    "Packages compiled but not installed to the live system.";
+    "Packages compiled but not installed to the live system. Supports globs such as qemu*.";
 pub const SKIP_INSTALL_AFTER: &str =
-    "Separate skip-install list used only after compilation in a batch run.";
+    "Separate skip-install list used only after compilation in a batch run. Supports globs such as qemu*.";
 pub const USE_SEPARATE_SKIP_AFTER: &str =
     "Maintain a distinct skip_install_packages_after_compilation list in abs.toml.";
 
@@ -156,7 +156,7 @@ pub const SYS_NO_REFRESH_CMD: &str =
     "Upgrade without refreshing databases; derived from full command if empty.";
 pub const SYS_IGNORE_FLAG: &str = "Flag passed to pacman to skip specific packages during upgrade.";
 pub const SYS_IGNORE_PACKAGES: &str =
-    "Package names excluded from system upgrades (paired with ignore_flag).";
+    "Package names excluded from system upgrades (paired with ignore_flag). Supports globs such as qemu*.";
 
 // --- Ramdisk (global) ---
 

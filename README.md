@@ -118,7 +118,7 @@ abs [FLAGS] [PACKAGE...]
 | `--pgo PKG`          | Start CachyOS kernel 3-stage PGO pipeline (debug → AutoFDO → Propeller)  |
 | `--pgo-resume PKG`   | Resume PGO pipeline after reboot                                         |
 | `--pgo-status PKG`   | Show current PGO stage (`--json` for machine-readable output)            |
-| `--pgo-abort PKG`    | Abort PGO pipeline and clear state                                       |
+| `--pgo-abort PKG`    | Abort PGO pipeline (releases system-update holds; use `--pgo-keep-stage` to preserve stage) |
 | `--json`             | JSON output (with `--pgo-status` or PGO event stream)                    |
 | `--purge`            | Remove ABS from the system (binaries, config, cache, build data)         |
 | `--yes` / `-y`       | Skip confirmation when used with `--purge`                               |

@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::utils::{run_command, sh_single_quote};
 use crate::{die, vlog};
 use colored::Colorize;
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemUpdateMode {
@@ -35,26 +34,29 @@ fn transform_system_update_command(mut cmd_str: String, is_root_user: bool) -> S
 }
 
 fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for pkg in config
+    let raw: Vec<String> = config
         .system_update
         .ignore_packages
         .iter()
         .chain(config.manual_update_packages.iter())
         .chain(config.skip_install_packages.iter())
         .chain(crate::pgo::active_pipeline_hold_packages(config).iter())
-    {
-        if seen.insert(pkg.clone()) {
-            out.push(pkg.clone());
-        }
-    }
-    out
+        .cloned()
+        .collect();
+    crate::package_pattern::expand_package_patterns(&raw)
 }
 
 /// Always appends `ignore_flag` for each entry in `ignore_packages`, `manual_update_packages`,
 /// and `skip_install_packages` (deduped), so repo packages never replace packages you build with ABS.
-pub fn run_system_update(config: &Config, mode: SystemUpdateMode) {
+///
+/// Returns `false` when a kernel PGO pipeline is in progress and the update was skipped.
+pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
+    let active = crate::pgo::active_pipelines(config);
+    if !active.is_empty() {
+        warn_system_update_blocked_during_pgo(&active, mode);
+        return false;
+    }
+
     let mut cmd_str = match mode {
         SystemUpdateMode::UpdateRepositories => {
             config.system_update.command_to_update_repositories.clone()
@@ -79,6 +81,44 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) {
     if let Err(e) = run_command("sh", &["-c", &cmd_str], None::<&str>) {
         die!("System update failed: {}", e);
     }
+    true
+}
+
+fn system_update_mode_label(mode: SystemUpdateMode) -> &'static str {
+    match mode {
+        SystemUpdateMode::UpdateRepositories => "repository refresh",
+        SystemUpdateMode::PerformUpdateWithRefresh | SystemUpdateMode::PerformUpdateNoRefresh => {
+            "system update"
+        }
+    }
+}
+
+fn warn_system_update_blocked_during_pgo(
+    pipelines: &[crate::pgo::ActivePgoPipeline],
+    mode: SystemUpdateMode,
+) {
+    let action = system_update_mode_label(mode);
+    eprintln!();
+    eprintln!(
+        "{} {}",
+        "==> PGO IN PROGRESS — SYSTEM UPDATE SKIPPED".red().bold(),
+        format!("({action} blocked while kernel PGO pipeline(s) are active)").yellow().bold()
+    );
+    for pipeline in pipelines {
+        eprintln!(
+            "    {} {} — {}",
+            "•".yellow().bold(),
+            pipeline.package.yellow().bold(),
+            pipeline.stage_label.yellow()
+        );
+    }
+    eprintln!(
+        "    {} Finish with {} or abandon with {} before running system updates.",
+        "Hint:".bold(),
+        "`abs --pgo-resume PKG`".cyan(),
+        "`abs --pgo-abort PKG`".cyan()
+    );
+    eprintln!();
 }
 
 #[cfg(test)]
@@ -146,6 +186,85 @@ mod tests {
             packages_ignored_during_system_update(&config),
             vec!["baz", "foo", "bar"]
         );
+    }
+
+    #[test]
+    fn system_update_mode_label_names() {
+        assert_eq!(
+            system_update_mode_label(SystemUpdateMode::UpdateRepositories),
+            "repository refresh"
+        );
+        assert_eq!(
+            system_update_mode_label(SystemUpdateMode::PerformUpdateWithRefresh),
+            "system update"
+        );
+        assert_eq!(
+            system_update_mode_label(SystemUpdateMode::PerformUpdateNoRefresh),
+            "system update"
+        );
+    }
+
+    #[test]
+    fn run_system_update_skipped_when_pgo_pipeline_active() {
+        use crate::config::{PackageConfig, PgoConfig};
+        use crate::pgo::{PgoStageId, PgoState};
+
+        let dir = std::env::temp_dir().join(format!("abs-sys-pgo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("linux-cachyos.json");
+        let state = PgoState {
+            package: "linux-cachyos".into(),
+            repo_dir: "/tmp/repo".into(),
+            current_stage: PgoStageId::WaitReboot2,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: None,
+            expected_package_base: None,
+            stage_history: vec![],
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut config = minimal_config(vec![], vec![], vec![]);
+        let pgo = PgoConfig {
+            enabled: true,
+            preset: "cachyos-kernel".into(),
+            profiles_archive_dir: Some(dir.to_string_lossy().into_owned()),
+            profile_scratch_dir: "auto".into(),
+            perf_data_on_ram: true,
+            benchmark_command: None,
+            benchmark_workdir: None,
+            benchmark_preset: "fast".into(),
+            profiling_quality: "maximum".into(),
+            build_user: None,
+            perf_event_args: "auto".into(),
+            perf_extra_args: crate::config::PERF_EXTRA_ARGS_STANDARD.into(),
+            sysctl_command: None,
+            vmlinux: "auto".into(),
+            afdo_tool: "llvm-profgen".into(),
+            propeller_tool: "create_llvm_prof".into(),
+            afdo_profile_name: "kernel-compilation.afdo".into(),
+            verify_boot: true,
+            auto_restart: false,
+            state_file: Some(state_path.to_string_lossy().into_owned()),
+        };
+        config.packages.insert(
+            "linux-cachyos".into(),
+            PackageConfig {
+                pgo: Some(pgo),
+                ..Default::default()
+            },
+        );
+
+        assert!(!run_system_update(
+            &config,
+            SystemUpdateMode::PerformUpdateWithRefresh
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

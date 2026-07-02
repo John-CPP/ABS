@@ -130,9 +130,14 @@ pub struct Cli {
     #[arg(long, value_name = "PACKAGE")]
     pub pgo_status: Option<String>,
 
-    /// Abort kernel PGO pipeline (stops builds; preserves saved stage)
+    /// Abort kernel PGO pipeline (stops builds and marks the pipeline aborted so kernel packages
+    /// are released from system-update holds; use `--pgo-keep-stage` to preserve the saved stage)
     #[arg(long, value_name = "PACKAGE")]
     pub pgo_abort: Option<String>,
+
+    /// With `--pgo-abort`: keep the saved pipeline stage for later resume (GUI stop button)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub pgo_keep_stage: bool,
 
     /// Stop any in-flight PGO work, clear saved pipeline state, and start stage 1 from scratch
     #[arg(long, value_name = "PACKAGE")]

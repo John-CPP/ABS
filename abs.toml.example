@@ -16,6 +16,7 @@ config_version = 1
 manual_update_packages = [
 ]
 # Packages excluded from system update (repo binaries), via pacman/yay --ignore.
+# Glob patterns are supported: "qemu*" matches all repo/installed names starting with qemu.
 skip_install_packages = [
 ]
 # Packages excluded from pacman -U after manual compilation (omit to inherit skip_install_packages).

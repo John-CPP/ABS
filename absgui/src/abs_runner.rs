@@ -642,7 +642,7 @@ pub fn stream_abs_pgo(
     pgo_auto: bool,
     handle: PgoRunHandle,
 ) -> impl Stream<Item = AbsPgoStreamItem> {
-    stream::channel(512, move |mut output| async move {
+    stream::channel(512, async move |mut output| {
         let (tx, rx) = mpsc::channel(512);
         let package_copy = package.clone();
         let event_log_copy = event_log.clone();
@@ -682,7 +682,7 @@ pub fn stream_abs_pgo(
 
 pub fn run_abs_abort(package: &str) -> Result<String, String> {
     let mut cmd = Command::new(abs_binary());
-    cmd.args(["--pgo-abort", package]);
+    cmd.args(["--pgo-abort", package, "--pgo-keep-stage"]);
     apply_gui_sudo_env(&mut cmd);
     let output = cmd
         .output()

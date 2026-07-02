@@ -510,7 +510,7 @@ pub fn view<'a>(
         repositories,
         compilers,
         actions,
-        Space::with_height(Length::Fixed(8.0)),
+        Space::new().height(Length::Fixed(8.0)),
     ]
     .spacing(16)
     .into()
