@@ -20,7 +20,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "abs"
-version = "1.3.4"
+version = "1.3.5"
 dependencies = [
  "clap",
  "colored",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "absgui"
-version = "1.3.4"
+version = "1.3.5"
 dependencies = [
  "bytes",
  "dirs",

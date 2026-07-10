@@ -20,8 +20,6 @@ pub struct ConfigDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update_at_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub self_update_github_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update_raw_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update_install_path: Option<String>,
@@ -107,6 +105,14 @@ pub struct BuildSection {
     pub system_update_first: bool,
     #[serde(default = "default_true")]
     pub clean_chroot_after_compilation: bool,
+    #[serde(default = "default_cpu_mode")]
+    pub global_cpu_threads_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_cpu_threads_cap: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_cpu_threads_cap: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_compilation_threads: Option<usize>,
 }
 
 fn default_local() -> String {
@@ -122,6 +128,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_cpu_mode() -> String {
+    "strict".into()
+}
+
 impl Default for BuildSection {
     fn default() -> Self {
         Self {
@@ -135,6 +145,10 @@ impl Default for BuildSection {
             default_compiler: None,
             system_update_first: true,
             clean_chroot_after_compilation: true,
+            global_cpu_threads_mode: default_cpu_mode(),
+            global_cpu_threads_cap: None,
+            maximum_cpu_threads_cap: None,
+            default_compilation_threads: None,
         }
     }
 }
@@ -235,6 +249,18 @@ impl Default for RamdiskSection {
     }
 }
 
+fn default_compilation_priority() -> usize {
+    1
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+fn is_default_priority(v: &usize) -> bool {
+    *v == default_compilation_priority()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackageSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +269,12 @@ pub struct PackageSection {
     pub build_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tests: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_local_build_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_chroot_build_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_github: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +287,12 @@ pub struct PackageSection {
     pub post_update_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramdisk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compilation_threads: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compile_alone: bool,
+    #[serde(default = "default_compilation_priority", skip_serializing_if = "is_default_priority")]
+    pub compilation_priority: usize,
     // Tables last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<KernelSection>,
@@ -278,6 +316,20 @@ pub struct KernelSection {
         skip_serializing_if = "Option::is_none"
     )]
     pub use_llvm_lto: Option<String>,
+    #[serde(
+        default,
+        rename = "_use_lto_suffix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub use_lto_suffix: Option<String>,
+    #[serde(
+        default,
+        rename = "_use_gcc_suffix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub use_gcc_suffix: Option<String>,
+    #[serde(default, rename = "_use_kcfi", skip_serializing_if = "Option::is_none")]
+    pub use_kcfi: Option<String>,
     #[serde(default, rename = "_HZ_ticks", skip_serializing_if = "Option::is_none")]
     pub hz_ticks: Option<String>,
     #[serde(default, rename = "_tickrate", skip_serializing_if = "Option::is_none")]
@@ -424,7 +476,6 @@ impl Default for ConfigDocument {
             check_for_update_on_startup: None,
             auto_update_on_startup: None,
             self_update_at_updates: None,
-            self_update_github_url: None,
             self_update_raw_url: None,
             self_update_install_path: None,
             self_update_use_pacman: None,

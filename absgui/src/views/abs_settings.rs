@@ -11,6 +11,7 @@ use iced::widget::{button, column, row, text, Space};
 use iced::{Alignment, Element, Length};
 
 const ENV_OPTS: &[&str] = &["local", "chroot"];
+const CPU_THREADS_MODE_OPTS: &[&str] = &["strict", "flexible"];
 const RAMDISK_MODE_OPTS: &[&str] = &["0755", "0775", "0700"];
 
 pub fn view<'a>(
@@ -103,6 +104,53 @@ pub fn view<'a>(
                 ),
             ]
             .spacing(12),
+            row![
+                field_pick(
+                    "global_cpu_threads_mode",
+                    Some(field_help::GLOBAL_CPU_THREADS_MODE),
+                    CPU_THREADS_MODE_OPTS,
+                    &config.build.global_cpu_threads_mode,
+                    app_theme,
+                    Message::BuildGlobalCpuThreadsMode,
+                ),
+                field_number(
+                    "global_cpu_threads_cap (optional)",
+                    Some(field_help::GLOBAL_CPU_THREADS_CAP),
+                    &config
+                        .build
+                        .global_cpu_threads_cap
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    app_theme,
+                    Message::BuildGlobalCpuThreadsCap,
+                ),
+            ]
+            .spacing(12),
+            row![
+                field_number(
+                    "maximum_cpu_threads_cap (flexible)",
+                    Some(field_help::MAXIMUM_CPU_THREADS_CAP),
+                    &config
+                        .build
+                        .maximum_cpu_threads_cap
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    app_theme,
+                    Message::BuildMaximumCpuThreadsCap,
+                ),
+                field_number(
+                    "default_compilation_threads (optional)",
+                    Some(field_help::DEFAULT_COMPILATION_THREADS),
+                    &config
+                        .build
+                        .default_compilation_threads
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    app_theme,
+                    Message::BuildDefaultCompilationThreads,
+                ),
+            ]
+            .spacing(12),
             field_checkbox(
                 "system_update_first",
                 Some(field_help::SYSTEM_UPDATE_FIRST),
@@ -184,14 +232,6 @@ pub fn view<'a>(
                 "false",
                 app_theme,
                 Message::InstallTestingPhaseArchPackages,
-            ),
-            field_text(
-                "self_update_github_url",
-                Some(field_help::SELF_UPDATE_GITHUB),
-                config.self_update_github_url.as_deref().unwrap_or(""),
-                "https://github.com/John-CPP/ABS",
-                app_theme,
-                Message::SelfUpdateGithubUrl,
             ),
             field_text(
                 "self_update_raw_url",

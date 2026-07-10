@@ -10,6 +10,8 @@ pub enum Page {
     Kernels,
     DefaultKernelConfig,
     KernelConfig,
+    Packages,
+    PackageConfig,
     AbsSettings,
     AppSettings,
 }
@@ -41,6 +43,8 @@ pub enum PathField {
 pub enum EditTarget {
     Default,
     Selected,
+    /// Package selected on the Packages page (no kernel-defaults seeding).
+    Package,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +52,13 @@ pub enum KStr {
     Source,
     BuildEnv,
     Ramdisk,
+    Alias,
+    Compiler,
+    UpstreamGithub,
+    PreUpdateCommand,
+    PostUpdateCommand,
+    CustomLocalBuildCommand,
+    CustomChrootBuildCommand,
     Cpusched,
     ProcessorOpt,
     LlvmLto,
@@ -80,6 +91,16 @@ pub enum KBool {
     PgoPerfDataOnRam,
     PgoVerifyBoot,
     CcHarder,
+    LtoSuffix,
+    GccSuffix,
+    Kcfi,
+}
+
+/// Tri-state (unset / true / false) per-package options.
+#[derive(Debug, Clone, Copy)]
+pub enum KOptBool {
+    Tests,
+    UpstreamPrereleases,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +116,11 @@ pub enum Message {
     OpenKernels,
     OpenDefaultConfig,
     OpenKernel(String),
+    OpenPackages,
+    OpenPackage(String),
+    NewPackageNameChanged(String),
+    PackageAdd,
+    PackageRemove(String),
     OpenAbsSettings,
     OpenAppSettings,
     Back,
@@ -114,6 +140,10 @@ pub enum Message {
     BuildDefaultCompiler(String),
     BuildConcurrentRepos(String),
     BuildConcurrentCompilations(String),
+    BuildGlobalCpuThreadsMode(String),
+    BuildGlobalCpuThreadsCap(String),
+    BuildMaximumCpuThreadsCap(String),
+    BuildDefaultCompilationThreads(String),
     BuildSystemUpdateFirst(bool),
     BuildIgnoreFailures(bool),
     BuildCompileFirstInstall(bool),
@@ -123,7 +153,6 @@ pub enum Message {
     CheckForUpdateOnStartup(Option<bool>),
     AutoUpdateOnStartup(Option<bool>),
     SelfUpdateAtUpdates(Option<bool>),
-    SelfUpdateGithubUrl(String),
     SelfUpdateRawUrl(String),
     SelfUpdateInstallPath(String),
     SelfUpdateUsePacman(Option<bool>),
@@ -159,6 +188,10 @@ pub enum Message {
     // Kernel editing
     SetKernelStr(EditTarget, KStr, String),
     SetKernelBool(EditTarget, KBool, bool),
+    SetPackageOptBool(EditTarget, KOptBool, Option<bool>),
+    PackageCompilationThreads(EditTarget, String),
+    PackageCompileAlone(EditTarget, bool),
+    PackageCompilationPriority(EditTarget, String),
     SetRamdiskTarget(EditTarget, RamdiskLetter, bool),
     CustomKernelChanged(String),
     // PGO

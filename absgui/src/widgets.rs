@@ -27,7 +27,10 @@ pub fn field_label_column<'a>(
 
 pub fn page_title(title: &str, app_theme: AppTheme) -> Element<'_, Message> {
     column![
-        text(title).size(26),
+        text(title).size(26).font(Font {
+            weight: iced::font::Weight::Semibold,
+            ..Font::DEFAULT
+        }),
         iced::widget::container(Space::new().height(Length::Fixed(3.0)))
             .width(Length::Fixed(48.0))
             .height(Length::Fixed(3.0))
@@ -42,7 +45,11 @@ pub fn card_section<'a>(
     app_theme: AppTheme,
     body: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    iced::widget::container(column![text(title).size(16), body.into()].spacing(12))
+    let heading = text(title).size(16).font(Font {
+        weight: iced::font::Weight::Semibold,
+        ..Font::DEFAULT
+    });
+    iced::widget::container(column![heading, body.into()].spacing(12))
         .padding(16)
         .width(Length::Fill)
         .style(style::card(app_theme))
@@ -197,7 +204,6 @@ pub fn encode_ramdisk_flags(workdir: bool, chroot: bool, packages: bool, profile
     s
 }
 
-#[allow(dead_code)]
 pub fn ramdisk_targets_field(
     target: EditTarget,
     workdir: bool,
@@ -309,8 +315,9 @@ pub fn packages_list_editor<'a>(
 ) -> Element<'a, Message> {
     let editor = text_editor(content)
         .font(Font::MONOSPACE)
-        .padding(8)
-        .height(Length::Fixed(120.0));
+        .size(14)
+        .padding(10)
+        .height(Length::Fixed(260.0));
     let editor = if enabled {
         editor.on_action(move |action| Message::PackageListEdited(field, action))
     } else {

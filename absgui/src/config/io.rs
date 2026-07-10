@@ -81,6 +81,56 @@ mod tests {
     }
 
     #[test]
+    fn package_fields_roundtrip_through_toml() {
+        let mut doc = ConfigDocument::default();
+        let pkg = crate::config::PackageSection {
+            source: Some("aur".into()),
+            alias: Some("firefox-bin".into()),
+            custom_local_build_command: Some("makepkg -s".into()),
+            custom_chroot_build_command: Some("makechrootpkg -r /x".into()),
+            tests: Some(false),
+            upstream_prereleases: Some(true),
+            compilation_threads: Some(8),
+            compile_alone: true,
+            compilation_priority: 5,
+            ..Default::default()
+        };
+        doc.packages.insert("firefox".into(), pkg);
+        let text = toml::to_string_pretty(&doc).expect("serialize");
+        let parsed: ConfigDocument = toml::from_str(&text).expect("parse");
+        let p = parsed.packages.get("firefox").unwrap();
+        assert_eq!(p.alias.as_deref(), Some("firefox-bin"));
+        assert_eq!(p.custom_local_build_command.as_deref(), Some("makepkg -s"));
+        assert_eq!(p.custom_chroot_build_command.as_deref(), Some("makechrootpkg -r /x"));
+        assert_eq!(p.tests, Some(false));
+        assert_eq!(p.upstream_prereleases, Some(true));
+        assert_eq!(p.compilation_threads, Some(8));
+        assert!(p.compile_alone);
+        assert_eq!(p.compilation_priority, 5);
+    }
+
+    #[test]
+    fn kernel_suffix_fields_roundtrip_through_toml() {
+        let mut doc = ConfigDocument::default();
+        doc.ensure_kernel_from_defaults("linux-cachyos");
+        let k = doc
+            .packages
+            .get_mut("linux-cachyos")
+            .unwrap()
+            .kernel
+            .as_mut()
+            .unwrap();
+        k.use_lto_suffix = Some("y".into());
+        k.use_kcfi = Some("y".into());
+        let text = toml::to_string_pretty(&doc).expect("serialize");
+        assert!(text.contains("_use_lto_suffix"));
+        let parsed: ConfigDocument = toml::from_str(&text).expect("parse");
+        let k = parsed.packages["linux-cachyos"].kernel.as_ref().unwrap();
+        assert_eq!(k.use_lto_suffix.as_deref(), Some("y"));
+        assert_eq!(k.use_kcfi.as_deref(), Some("y"));
+    }
+
+    #[test]
     fn package_lists_serialize_as_toml_arrays() {
         let doc = ConfigDocument {
             manual_update_packages: vec!["linux-cachyos".into(), "nvidia".into()],

@@ -324,10 +324,11 @@ fn install_pgo_auto_resume_service(package: &str) -> Result<(), String> {
     fs::create_dir_all(&unit_dir)
         .map_err(|e| format!("create {}: {e}", unit_dir.display()))?;
     let template = unit_dir.join("abs-pgo@.service");
+    // Note: no After=network-online.target — user units cannot order against that system
+    // target, and git/network steps in the pipeline fail with clear errors on their own.
     let unit = format!(
         "[Unit]\n\
          Description=Resume ABS PGO pipeline for %i after reboot\n\
-         After=network-online.target\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -545,6 +546,10 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
             }
         }
     }
+
+    // Re-check required tools on every resume: a system update between stages (or across the
+    // reboot) can remove perf/llvm-profgen, and failing here beats dying mid-stage.
+    preflight(&pgo, package, config);
 
     save_state(&state_path, &state);
     execute_current_stage(
@@ -923,6 +928,13 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
     } = ctx;
     let package = *package;
     let run_once = *run_once;
+    let kernel_cfg = || {
+        config
+            .packages
+            .get(package)
+            .and_then(|p| p.kernel.clone())
+            .unwrap_or_default()
+    };
     loop {
         save_state(state_path, state);
         let entry_stage = state.current_stage;
@@ -935,28 +947,20 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
 
         match state.current_stage {
             PgoStageId::Stage1Build => {
-                let kernel = config
-                    .packages
-                    .get(package)
-                    .and_then(|p| p.kernel.clone())
-                    .unwrap_or_default();
+                let kernel = kernel_cfg();
                 let mut env = stage1_env(&kernel);
                 merge_user_kernel_overrides(&mut env, &kernel);
-                run_pgo_build(
-                    package,
-                    cli,
-                    config,
-                    &PgoBuildContext {
-                        env_vars: env,
-                        makepkg_flags: "-f --skipinteg".to_string(),
-                        clean_src: false,
-                        clean_pkg: false,
-                        defer_pkgbuild_restore: true,
-                        skip_abs_install: false,
-                    },
-                    events,
-                );
-                record_installed_kernel(state, "linux-cachyos");
+                let build_ctx = PgoBuildContext {
+                    env_vars: env,
+                    makepkg_flags: "-f --skipinteg".to_string(),
+                    clean_src: false,
+                    clean_pkg: false,
+                    defer_pkgbuild_restore: true,
+                    skip_abs_install: false,
+                };
+                run_pgo_build(package, cli, config, &build_ctx, events);
+                let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
+                record_installed_kernel(state, &pkgbase);
                 transition(state, PgoStageId::WaitReboot1);
             }
             PgoStageId::Stage2Profile => {
@@ -968,37 +972,30 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 });
                 transition(state, PgoStageId::Stage2Build);
                 save_state(state_path, state);
-                if pgo_auto_enabled(pgo, cli) && !run_once {
-                    if let Err(e) = trigger_pgo_auto_resume_now(package) {
-                        die!("PGO auto-restart failed: {e}");
-                    }
+                if pgo_auto_enabled(pgo, cli)
+                    && !run_once
+                    && let Err(e) = trigger_pgo_auto_resume_now(package)
+                {
+                    die!("PGO auto-restart failed: {e}");
                 }
                 return;
             }
             PgoStageId::Stage2Build => {
                 restore_profiles_to_repo(state, pgo, &["kernel-compilation.afdo"]);
-                let kernel = config
-                    .packages
-                    .get(package)
-                    .and_then(|p| p.kernel.clone())
-                    .unwrap_or_default();
+                let kernel = kernel_cfg();
                 let mut env = stage2_build_env(&kernel, &pgo.afdo_profile_name);
                 merge_user_kernel_overrides(&mut env, &kernel);
-                run_pgo_build(
-                    package,
-                    cli,
-                    config,
-                    &PgoBuildContext {
-                        env_vars: env,
-                        makepkg_flags: "-f --skipinteg".to_string(),
-                        clean_src: true,
-                        clean_pkg: true,
-                        defer_pkgbuild_restore: true,
-                        skip_abs_install: false,
-                    },
-                    events,
-                );
-                record_installed_kernel(state, "linux-cachyos-lto");
+                let build_ctx = PgoBuildContext {
+                    env_vars: env,
+                    makepkg_flags: "-f --skipinteg".to_string(),
+                    clean_src: true,
+                    clean_pkg: true,
+                    defer_pkgbuild_restore: true,
+                    skip_abs_install: false,
+                };
+                run_pgo_build(package, cli, config, &build_ctx, events);
+                let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
+                record_installed_kernel(state, &pkgbase);
                 transition(state, PgoStageId::WaitReboot2);
             }
             PgoStageId::Stage3Profile => {
@@ -1010,10 +1007,11 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 });
                 transition(state, PgoStageId::Stage3Build);
                 save_state(state_path, state);
-                if pgo_auto_enabled(pgo, cli) && !run_once {
-                    if let Err(e) = trigger_pgo_auto_resume_now(package) {
-                        die!("PGO auto-restart failed: {e}");
-                    }
+                if pgo_auto_enabled(pgo, cli)
+                    && !run_once
+                    && let Err(e) = trigger_pgo_auto_resume_now(package)
+                {
+                    die!("PGO auto-restart failed: {e}");
                 }
                 return;
             }
@@ -1027,11 +1025,7 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                         "propeller_ld_profile.txt",
                     ],
                 );
-                let kernel = config
-                    .packages
-                    .get(package)
-                    .and_then(|p| p.kernel.clone())
-                    .unwrap_or_default();
+                let kernel = kernel_cfg();
                 let mut env = stage3_build_env(&kernel, &pgo.afdo_profile_name);
                 merge_user_kernel_overrides(&mut env, &kernel);
                 run_pgo_build(
@@ -1179,25 +1173,27 @@ fn run_pgo_build(
 
 fn record_installed_kernel(state: &mut PgoState, package_base: &str) {
     state.expected_package_base = Some(package_base.to_string());
+    state.expected_kernel_uname = None;
     if let Ok(out) = run_command_with_output("pacman", &["-Q", package_base], None::<&str>) {
         let parts: Vec<&str> = out.split_whitespace().collect();
         if parts.len() >= 2 {
             state.expected_kernel_uname = Some(format!("{}-{}", parts[1], infer_suffix(package_base)));
         }
     }
-    if state.expected_kernel_uname.is_none()
-        && let Ok(u) = run_command_with_output("uname", &["-r"], None::<&str>)
-    {
-        state.expected_kernel_uname = Some(u.trim().to_string());
+    // No fallback to the running `uname -r` here: that is the kernel we booted *before* this
+    // stage installed the new one, so recording it would make boot verification demand the
+    // wrong kernel. Verification can still match via /usr/lib/modules/<uname>/pkgbase.
+    if state.expected_kernel_uname.is_none() {
+        ewarn!(
+            "Could not determine installed version of {package_base}; boot verification will \
+             use the running kernel's pkgbase file"
+        );
     }
 }
 
+/// Uname localversion suffix for a kernel pkgbase (e.g. `linux-cachyos-bore-lto` → `cachyos-bore-lto`).
 fn infer_suffix(base: &str) -> &str {
-    if base.contains("lto") {
-        "cachyos-lto"
-    } else {
-        "cachyos"
-    }
+    base.strip_prefix("linux-").unwrap_or(base)
 }
 
 /// Pacman package names to pin with `--ignore` while a PGO pipeline is in progress, so `yay -Syu`
@@ -1302,18 +1298,17 @@ fn try_push_active_pgo_state(
 }
 
 fn kernel_hold_package_names(state: &PgoState) -> Vec<String> {
-    let mut names = vec![state.package.clone()];
-    let bases: Vec<String> = if let Some(base) = state.expected_package_base.as_deref() {
-        if base == "linux-cachyos" || base == "linux-cachyos-lto" {
-            vec!["linux-cachyos".into(), "linux-cachyos-lto".into()]
-        } else if base == state.package {
-            vec![state.package.clone()]
-        } else {
-            vec![base.to_string(), state.package.clone()]
-        }
-    } else {
-        vec![state.package.clone()]
-    };
+    // Hold both stage kernels of the pipeline: the plain stage-1 kernel and the -lto
+    // stage-2/3 kernel (whichever the package name denotes, derive its counterpart).
+    let mut bases = vec![state.package.clone()];
+    match state.package.strip_suffix("-lto") {
+        Some(plain) => bases.push(plain.to_string()),
+        None => bases.push(format!("{}-lto", state.package)),
+    }
+    if let Some(base) = state.expected_package_base.as_deref() {
+        bases.push(base.to_string());
+    }
+    let mut names = Vec::new();
     for base in &bases {
         for suffix in ["", "-dbg", "-headers"] {
             names.push(format!("{base}{suffix}"));
@@ -1349,19 +1344,44 @@ fn reboot_resume_message(state: &PgoState, package: &str) -> String {
 fn verify_boot_kernel(state: &PgoState, _pgo: &PgoConfig) {
     if !boot_matches_expected(state) {
         let running = running_kernel_uname();
-        let expected = state
+        let expected_base = state
+            .expected_package_base
+            .as_deref()
+            .unwrap_or("(unknown)");
+        let expected_uname = state
             .expected_kernel_uname
             .as_deref()
             .unwrap_or("(unknown)");
         die!(
-            "Boot verification failed: running '{running}', expected kernel matching '{expected}'. \
-             Select the correct bootloader entry and re-run --pgo-resume"
+            "Boot verification failed: running '{running}', expected the {expected_base} kernel \
+             (uname matching '{expected_uname}'). Select the correct bootloader entry and re-run \
+             --pgo-resume"
         );
     }
 }
 
 fn boot_matches_expected(state: &PgoState) -> bool {
     let running = running_kernel_uname();
+    if running.is_empty() {
+        return false;
+    }
+    let pkgbase = fs::read_to_string(format!("/usr/lib/modules/{running}/pkgbase")).ok();
+    boot_matches(state, &running, pkgbase.as_deref())
+}
+
+/// True when the running kernel matches the pipeline's expected stage kernel.
+///
+/// `running_pkgbase` is the content of `/usr/lib/modules/<uname -r>/pkgbase` (installed by Arch
+/// kernel packages) when available. It is the authoritative signal: version strings alone cannot
+/// distinguish the stage-1 kernel from the stage-2 `-lto` kernel of the same version, so relying
+/// on them could let stage 3 profile the wrong kernel.
+fn boot_matches(state: &PgoState, running: &str, running_pkgbase: Option<&str>) -> bool {
+    if let (Some(expected), Some(actual)) =
+        (state.expected_package_base.as_deref(), running_pkgbase)
+    {
+        return actual.trim() == expected;
+    }
+    // Fallback for kernels without a pkgbase file or old states: version-prefix match.
     if let Some(ref expected) = state.expected_kernel_uname {
         running.contains(expected.split('-').next().unwrap_or(expected))
     } else {
@@ -1462,6 +1482,8 @@ fn finish_profile_collection(
         Some(repo),
     )
     .map_err(|e| e.to_string())?;
+    // Brief grace period so perf finishes flushing buffers to perf.data before the
+    // profiling sysctls (kptr_restrict / perf_event_paranoid) are restored.
     std::thread::sleep(std::time::Duration::from_secs(2));
     sysctl_toggle(pgo, false)
 }
@@ -1507,7 +1529,7 @@ fn run_stage2_profile(
     } else {
         format!(
             "{} --binary={} --profile={} --format=extbinary --out={}",
-            pgo.afdo_tool,
+            sh_single_quote(&pgo.afdo_tool),
             sh_single_quote(&vmlinux.to_string_lossy()),
             sh_single_quote(&perf_data.to_string_lossy()),
             sh_single_quote(&profile_out.to_string_lossy()),
@@ -1555,7 +1577,7 @@ fn run_stage3_profile(
     let convert_cmd = format!(
         "{} --binary={} --profile={} --format=propeller --propeller_output_module_name \
          --out={} --propeller_symorder={}",
-        pgo.propeller_tool,
+        sh_single_quote(&pgo.propeller_tool),
         sh_single_quote(&vmlinux.to_string_lossy()),
         sh_single_quote(&perf_data.to_string_lossy()),
         sh_single_quote(&cc_out.to_string_lossy()),
@@ -1694,7 +1716,7 @@ fn profiling_quality_is_maximum(pgo: &PgoConfig) -> bool {
     )
 }
 
-fn resolved_benchmark_preset<'a>(pgo: &'a PgoConfig) -> &'a str {
+fn resolved_benchmark_preset(pgo: &PgoConfig) -> &str {
     if profiling_quality_is_maximum(pgo) {
         return "cachyos";
     }
@@ -2005,17 +2027,16 @@ fn restore_profiles_to_repo(state: &PgoState, pgo: &PgoConfig, names: &[&str]) {
         }
         let src = archive.join(name);
         if src.exists() {
-            if *name == "kernel-compilation.afdo" {
-                if let Ok(meta) = fs::metadata(&src)
-                    && meta.len() < MIN_AFDO_PROFILE_BYTES
-                {
-                    die!(
-                        "Archived AutoFDO profile '{}' is only {} bytes — re-run stage 2 profiling \
-                         after installing linux-cachyos-dbg",
-                        name,
-                        meta.len()
-                    );
-                }
+            if *name == "kernel-compilation.afdo"
+                && let Ok(meta) = fs::metadata(&src)
+                && meta.len() < MIN_AFDO_PROFILE_BYTES
+            {
+                die!(
+                    "Archived AutoFDO profile '{}' is only {} bytes — re-run stage 2 profiling \
+                     after installing linux-cachyos-dbg",
+                    name,
+                    meta.len()
+                );
             }
             blog!("Restoring profile {name} from archive...");
             if let Err(e) = fs::copy(&src, &dest) {
@@ -2267,6 +2288,79 @@ mod tests {
         assert!(!PgoStageId::Done.label().is_empty());
         assert_eq!(PgoStageId::Stage2Build.label(), "Stage 2: AutoFDO build");
         assert_eq!(PgoStageId::Stage3Build.label(), "Stage 3: final build");
+    }
+
+    fn state_with(package: &str, base: Option<&str>, uname: Option<&str>) -> PgoState {
+        PgoState {
+            package: package.into(),
+            repo_dir: "/tmp".into(),
+            current_stage: PgoStageId::WaitReboot1,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: uname.map(str::to_string),
+            expected_package_base: base.map(str::to_string),
+            stage_history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn boot_matches_uses_pkgbase_file_to_tell_stage_kernels_apart() {
+        // Same version, different pkgbase: only the pkgbase file can tell these apart.
+        let state = state_with(
+            "linux-cachyos",
+            Some("linux-cachyos-lto"),
+            Some("6.15.4-2-cachyos-lto"),
+        );
+        assert!(super::boot_matches(
+            &state,
+            "6.15.4-2-cachyos-lto",
+            Some("linux-cachyos-lto\n")
+        ));
+        // Booted the stage-1 kernel of the same version: must NOT match.
+        assert!(!super::boot_matches(
+            &state,
+            "6.15.4-2-cachyos",
+            Some("linux-cachyos")
+        ));
+    }
+
+    #[test]
+    fn boot_matches_falls_back_to_version_prefix_without_pkgbase_file() {
+        let state = state_with(
+            "linux-cachyos",
+            Some("linux-cachyos"),
+            Some("6.15.4-2-cachyos"),
+        );
+        assert!(super::boot_matches(&state, "6.15.4-2-cachyos", None));
+        assert!(!super::boot_matches(&state, "6.14.0-1-cachyos", None));
+        // Neither an expected uname nor a pkgbase file: never match.
+        let empty = state_with("linux-cachyos", None, None);
+        assert!(!super::boot_matches(&empty, "6.15.4-2-cachyos", None));
+    }
+
+    #[test]
+    fn infer_suffix_handles_kernel_variants() {
+        assert_eq!(super::infer_suffix("linux-cachyos"), "cachyos");
+        assert_eq!(super::infer_suffix("linux-cachyos-lto"), "cachyos-lto");
+        assert_eq!(
+            super::infer_suffix("linux-cachyos-bore-lto"),
+            "cachyos-bore-lto"
+        );
+        assert_eq!(super::infer_suffix("linux-zen"), "zen");
+    }
+
+    #[test]
+    fn kernel_hold_package_names_cover_variant_stage_kernels() {
+        let state = state_with(
+            "linux-cachyos-bore",
+            Some("linux-cachyos-bore"),
+            Some("6.15.4-2-cachyos-bore"),
+        );
+        let names = super::kernel_hold_package_names(&state);
+        assert!(names.contains(&"linux-cachyos-bore".to_string()));
+        assert!(names.contains(&"linux-cachyos-bore-lto".to_string()));
+        assert!(names.contains(&"linux-cachyos-bore-lto-headers".to_string()));
+        assert!(!names.contains(&"linux-cachyos".to_string()));
     }
 
     #[test]

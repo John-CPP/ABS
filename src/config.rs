@@ -26,8 +26,6 @@ pub struct Config {
     pub check_for_update_on_startup: bool,
     #[serde(default = "default_auto_update_on_startup")]
     pub auto_update_on_startup: bool,
-    #[serde(default = "default_self_update_github_url")]
-    pub self_update_github_url: String,
     #[serde(default = "default_self_update_raw_url")]
     pub self_update_raw_url: String,
     #[serde(default = "default_self_update_install_path")]
@@ -71,10 +69,6 @@ fn default_self_update_at_updates() -> bool {
 
 fn default_install_testing_phase_archlinux_packages() -> bool {
     false
-}
-
-fn default_self_update_github_url() -> String {
-    "https://github.com/John-CPP/ABS".to_string()
 }
 
 fn default_self_update_install_path() -> String {
@@ -199,6 +193,14 @@ fn default_clean_chroot_after_compilation() -> bool {
     true
 }
 
+fn default_global_cpu_threads_mode() -> String {
+    "strict".to_string()
+}
+
+fn default_compilation_priority() -> usize {
+    1
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BuildConfig {
     pub default_environment: String,
@@ -229,12 +231,23 @@ pub struct BuildConfig {
     /// devtools chroot when no other chroot build is running (avoids unbounded chroot growth).
     #[serde(default = "default_clean_chroot_after_compilation")]
     pub clean_chroot_after_compilation: bool,
+    /// How concurrent compilation thread sums are capped: `"strict"` or `"flexible"`.
+    #[serde(default = "default_global_cpu_threads_mode")]
+    pub global_cpu_threads_mode: String,
+    /// Strict: hard max sum of active threads. Flexible: soft pairing target.
+    #[serde(default)]
+    pub global_cpu_threads_cap: Option<usize>,
+    /// Flexible mode only: hard ceiling for concurrent thread sum.
+    #[serde(default)]
+    pub maximum_cpu_threads_cap: Option<usize>,
+    /// Fallback `-j` for packages without per-package `compilation_threads`.
+    #[serde(default)]
+    pub default_compilation_threads: Option<usize>,
 
     // Optional self-update fields for backwards-compatibility/placement under [build]
     pub check_for_update_on_startup: Option<bool>,
     pub auto_update_on_startup: Option<bool>,
     pub self_update_at_updates: Option<bool>,
-    pub self_update_github_url: Option<String>,
     pub self_update_raw_url: Option<String>,
     pub self_update_install_path: Option<String>,
     pub install_testing_phase_archlinux_packages: Option<bool>,
@@ -301,6 +314,15 @@ pub struct PackageConfig {
     /// Multi-stage kernel PGO pipeline (AutoFDO + Propeller).
     #[serde(default)]
     pub pgo: Option<PgoConfig>,
+    /// Sacred per-package `-j` thread count (never reduced by the scheduler).
+    #[serde(default)]
+    pub compilation_threads: Option<usize>,
+    /// When true, no other package compiles concurrently with this one.
+    #[serde(default)]
+    pub compile_alone: bool,
+    /// Higher value → scheduled earlier among ready packages.
+    #[serde(default = "default_compilation_priority")]
+    pub compilation_priority: usize,
 }
 
 /// GUI-friendly kernel build options; each field maps to a CachyOS PKGBUILD env var.
@@ -706,9 +728,6 @@ impl Config {
         if let Some(val) = config.build.self_update_at_updates {
             config.self_update_at_updates = val;
         }
-        if let Some(val) = &config.build.self_update_github_url {
-            config.self_update_github_url = val.clone();
-        }
         if let Some(val) = &config.build.self_update_raw_url {
             config.self_update_raw_url = val.clone();
         }
@@ -730,6 +749,30 @@ impl Config {
                 "Invalid [build] default_environment: {:?} (expected \"local\" or \"chroot\")",
                 env
             );
+        }
+        match self.build.global_cpu_threads_mode.as_str() {
+            "flexible" => {
+                if let (Some(soft), Some(hard)) = (
+                    self.build.global_cpu_threads_cap,
+                    self.build.maximum_cpu_threads_cap,
+                ) && hard < soft
+                {
+                    die!(
+                        "Invalid [build] maximum_cpu_threads_cap ({hard}) must be >= global_cpu_threads_cap ({soft})"
+                    );
+                }
+            }
+            "strict" => {
+                if self.build.maximum_cpu_threads_cap.is_some() {
+                    crate::ewarn!(
+                        "[build] maximum_cpu_threads_cap is ignored in \"strict\" mode (only used by \"flexible\")."
+                    );
+                }
+            }
+            cpu_mode => die!(
+                "Invalid [build] global_cpu_threads_mode: {:?} (expected \"strict\" or \"flexible\")",
+                cpu_mode
+            ),
         }
         for (pkg_name, pkg) in &self.packages {
             if let Some(be) = &pkg.build_env {
@@ -871,6 +914,31 @@ impl Config {
             "  clean_chroot_after_compilation: {}",
             self.build.clean_chroot_after_compilation
         );
+        println!(
+            "  global_cpu_threads_mode: {}",
+            self.build.global_cpu_threads_mode
+        );
+        println!(
+            "  global_cpu_threads_cap: {}",
+            self.build
+                .global_cpu_threads_cap
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string())
+        );
+        println!(
+            "  maximum_cpu_threads_cap: {}",
+            self.build
+                .maximum_cpu_threads_cap
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string())
+        );
+        println!(
+            "  default_compilation_threads: {}",
+            self.build
+                .default_compilation_threads
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string())
+        );
 
         println!("\n{}", "System Update".green().bold());
         println!(
@@ -959,7 +1027,6 @@ impl Config {
         println!("  check_for_update_on_startup: {}", self.check_for_update_on_startup);
         println!("  auto_update_on_startup: {}", self.auto_update_on_startup);
         println!("  self_update_at_updates: {}", self.self_update_at_updates);
-        println!("  self_update_github_url: {}", self.self_update_github_url);
         println!("  self_update_raw_url: {}", self.self_update_raw_url);
         println!("  self_update_install_path: {}", self.self_update_install_path);
         println!(
@@ -1016,6 +1083,15 @@ impl Config {
             if let Some(code) = &cfg.ramdisk {
                 println!("    ramdisk: {} (w=workdir, c=chroot, p=packages)", code);
             }
+            if let Some(n) = cfg.compilation_threads {
+                println!("    compilation_threads: {}", n);
+            }
+            if cfg.compile_alone {
+                println!("    compile_alone: true");
+            }
+            if cfg.compilation_priority != default_compilation_priority() {
+                println!("    compilation_priority: {}", cfg.compilation_priority);
+            }
         }
     }
 }
@@ -1023,6 +1099,52 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn test_parse_cpu_scheduler_config() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+global_cpu_threads_mode = "flexible"
+global_cpu_threads_cap = 10
+maximum_cpu_threads_cap = 15
+default_compilation_threads = 4
+
+[system_update]
+command_to_update_repositories = "pacman -Su"
+command_to_perform_system_update = "pacman -Syu"
+command_to_perform_system_update_no_refresh = "pacman -Su"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages.linux-cachyos]
+compilation_threads = 8
+compile_alone = true
+compilation_priority = 10
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.build.global_cpu_threads_mode, "flexible");
+        assert_eq!(config.build.global_cpu_threads_cap, Some(10));
+        assert_eq!(config.build.maximum_cpu_threads_cap, Some(15));
+        assert_eq!(config.build.default_compilation_threads, Some(4));
+        let pkg = config.packages.get("linux-cachyos").unwrap();
+        assert_eq!(pkg.compilation_threads, Some(8));
+        assert!(pkg.compile_alone);
+        assert_eq!(pkg.compilation_priority, 10);
+    }
 
     #[test]
     fn test_parse_install_testing_packages_under_build() {
@@ -1273,4 +1395,3 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
         assert!(config.build.clean_chroot_after_compilation);
     }
 }
-

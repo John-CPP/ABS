@@ -11,6 +11,10 @@ pub fn is_glob_pattern(pattern: &str) -> bool {
 }
 
 pub fn package_matches_pattern(name: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
     if !is_glob_pattern(pattern) {
         return name == pattern;
     }
@@ -118,6 +122,13 @@ mod tests {
     fn exact_pattern_matches_only_same_name() {
         assert!(package_matches_pattern("qemu-full", "qemu-full"));
         assert!(!package_matches_pattern("qemu-common", "qemu-full"));
+    }
+
+    #[test]
+    fn patterns_are_trimmed() {
+        assert!(package_matches_pattern("qbittorrent-nox", "qbittorrent-nox "));
+        assert!(package_matches_pattern("qbittorrent-nox", " qbittorrent-nox"));
+        assert!(!package_matches_pattern("qbittorrent-nox", "  "));
     }
 
     #[test]

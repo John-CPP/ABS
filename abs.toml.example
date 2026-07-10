@@ -6,7 +6,6 @@ config_version = 1
 # check_for_update_on_startup = true
 # auto_update_on_startup = false
 # self_update_at_updates = false
-# self_update_github_url = "https://github.com/John-CPP/ABS"
 # self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"
 # self_update_use_pacman = true   # default: auto (use pacman when abs/absgui packages are installed)
 # self_update_install_path = "/usr/bin/abs"  # fallback when self_update_use_pacman = false
@@ -75,6 +74,11 @@ fast_aur_rpc_update_checks = true
 system_update_first = true
 # After each chroot (makechrootpkg) build, remove working copies and reset the devtools chroot when idle
 clean_chroot_after_compilation = true
+# CPU-aware scheduler: strict = hard cap on sum of active threads; flexible = soft cap + optional burst
+# global_cpu_threads_mode = "strict"
+# global_cpu_threads_cap = 10
+# maximum_cpu_threads_cap = 15   # flexible mode only
+# default_compilation_threads = 5
 
 [system_update]
 command_to_update_repositories = "sudo pacman -Sy"
@@ -112,6 +116,9 @@ default = "arch"
 # [packages.linux-cachyos]
 # source = "aur"
 # build_env = "local"
+# compilation_threads = 8
+# compile_alone = true
+# compilation_priority = 10
 # ramdisk = "w"
 #
 # [packages.linux-cachyos.kernel]

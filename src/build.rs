@@ -86,20 +86,29 @@ pub struct PgoBuildContext {
     pub skip_abs_install: bool,
 }
 
-/// Mirror CachyOS `linux-cachyos` PKGBUILD `pkgbase=linux-$_pkgsuffix` from PGO env vars.
-pub fn pgo_pkgbase_from_env(env: &HashMap<String, String>) -> String {
+/// Mirror the CachyOS kernel PKGBUILD `pkgbase=linux-$_pkgsuffix` naming from the PGO env vars,
+/// starting from the package being built so kernel variants (e.g. `linux-cachyos-bore` →
+/// `linux-cachyos-bore-lto`) resolve correctly instead of assuming `linux-cachyos`.
+pub fn pgo_pkgbase_from_env(package: &str, env: &HashMap<String, String>) -> String {
+    // `linux-cachyos-lto` / `-gcc` are suffix builds of the plain PKGBUILD, so strip the
+    // suffix first and re-apply it per the stage env (stage 1 builds the plain kernel).
+    let base = package
+        .strip_suffix("-lto")
+        .or_else(|| package.strip_suffix("-gcc"))
+        .unwrap_or(package)
+        .trim();
+    let base = if base.is_empty() { "linux-cachyos" } else { base };
     let llvm_lto = env.get("_use_llvm_lto").map(String::as_str).unwrap_or("thin");
     let is_lto = matches!(llvm_lto, "thin" | "full" | "thin-dist");
     let lto_suffix = env.get("_use_lto_suffix").map(String::as_str).unwrap_or("no");
     let gcc_suffix = env.get("_use_gcc_suffix").map(String::as_str).unwrap_or("yes");
-    let pkgsuffix = if is_lto && lto_suffix == "yes" {
-        "cachyos-lto"
+    if is_lto && lto_suffix == "yes" {
+        format!("{base}-lto")
     } else if !is_lto && gcc_suffix == "yes" {
-        "cachyos-gcc"
+        format!("{base}-gcc")
     } else {
-        "cachyos"
-    };
-    format!("linux-{pkgsuffix}")
+        base.to_string()
+    }
 }
 
 fn chroot_rootfs_is_complete(rootfs: &Path) -> bool {
@@ -379,13 +388,12 @@ fn run_build_with_key_retry(
                 }
                 if newly_found.is_empty()
                     && err.to_ascii_lowercase().contains("pgp")
+                    && let Ok(text) = std::fs::read_to_string(repo_dir.join("PKGBUILD"))
                 {
-                    if let Ok(text) = std::fs::read_to_string(repo_dir.join("PKGBUILD")) {
-                        for key in parse_validpgpkeys(&text) {
-                            let short = gpg_key_short_id(&key).to_string();
-                            if seen_keys.insert(short.clone()) {
-                                newly_found.push(short);
-                            }
+                    for key in parse_validpgpkeys(&text) {
+                        let short = gpg_key_short_id(&key).to_string();
+                        if seen_keys.insert(short.clone()) {
+                            newly_found.push(short);
                         }
                     }
                 }
@@ -953,6 +961,7 @@ pub fn process_package(
     config: &Config,
     defer_install: bool,
     chroot_copy: Option<&str>,
+    compilation_threads: Option<usize>,
 ) -> bool {
     let pkg = spec.name.as_str();
     let pkg_config = config.packages.get(pkg);
@@ -1104,6 +1113,8 @@ pub fn process_package(
 
     let build_env = effective_cfg.build_env.clone();
     let skip_tests = effective_cfg.skip_tests;
+    let threads = compilation_threads
+        .or_else(|| crate::build_env::resolve_package_threads(pkg, config, cli));
 
     let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, false) {
         Ok(guard) => guard,
@@ -1138,9 +1149,29 @@ pub fn process_package(
         ensure_pkgsource_pgp_keys(build_dir);
         blog!("Building locally with makepkg...");
 
+        let mut env_prefix = ramdisk_srcdest_env(repo_dir, &ramdisk_targets);
+        // Keeps the wrapper makepkg.conf alive until the build command finished.
+        let mut _limiter_guard = None;
+        if let Some(n) = threads {
+            match crate::build_env::write_local_limiter_conf(pkg, n) {
+                Ok(guard) => {
+                    env_prefix = format!("{} {env_prefix}", guard.env_assignment());
+                    _limiter_guard = Some(guard);
+                }
+                Err(e) => {
+                    if config.build.ignore_compilation_failures {
+                        ewarn!("Parallel limiter setup failed for {}: {}", pkg, e);
+                        restore_pkgbuild(repo_dir);
+                        return false;
+                    }
+                    die!("Parallel limiter setup failed for {}: {}", pkg, e);
+                }
+            }
+        }
+
         let mut build_cmd = format!(
             "{}PKGDEST=\"{}\" makepkg --syncdeps --noconfirm --needed -f",
-            ramdisk_srcdest_env(repo_dir, &ramdisk_targets),
+            env_prefix,
             config.paths.ready_made_packages_path
         );
         if cli.clean && !ramdisk_targets.build_workdir {
@@ -1191,6 +1222,16 @@ pub fn process_package(
             }
             die!("Chroot sync failed for {}: {}", pkg, e);
         }
+        if let Err(e) =
+            crate::build_env::apply_chroot_parallel_dropin(&chrootdir, &copy_name, threads)
+        {
+            if config.build.ignore_compilation_failures {
+                ewarn!("Chroot parallel limiter setup failed for {}: {}", pkg, e);
+                restore_pkgbuild(repo_dir);
+                return false;
+            }
+            die!("Chroot parallel limiter setup failed for {}: {}", pkg, e);
+        }
         ensure_pkgsource_pgp_keys(build_dir);
         let mut build_cmd = format!(
             "PKGDEST=\"{}\" makechrootpkg -r \"{}\" -d \"{}\"",
@@ -1214,7 +1255,12 @@ pub fn process_package(
             live_output: true,
             heartbeat_label: Some("makechrootpkg"),
         };
-        if let Err(e) = run_build_with_key_retry(&build_cmd, repo_dir, chroot_opts) {
+        let chroot_result = run_build_with_key_retry(&build_cmd, repo_dir, chroot_opts);
+        if let Err(e) = crate::build_env::apply_chroot_parallel_dropin(&chrootdir, &copy_name, None)
+        {
+            vlog!("Failed to remove chroot parallel drop-in: {}", e);
+        }
+        if let Err(e) = chroot_result {
             if config.build.ignore_compilation_failures {
                 ewarn!("makechrootpkg failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -1258,6 +1304,7 @@ fn format_pgo_makepkg_cmd(
     pgo: &PgoBuildContext,
     repo_dir: &Path,
     targets: &ramdisk::RamdiskTargets,
+    limiter_env: Option<String>,
 ) -> String {
     let env_prefix: String = pgo
         .env_vars
@@ -1273,6 +1320,9 @@ fn format_pgo_makepkg_cmd(
     let mut parts = Vec::new();
     if !srcdest.is_empty() {
         parts.push(srcdest.trim().to_string());
+    }
+    if let Some(env) = limiter_env {
+        parts.push(env);
     }
     if !env_prefix.is_empty() {
         parts.push(env_prefix);
@@ -1398,7 +1448,21 @@ pub fn process_package_pgo(
         .map(WorkdirGuard::build_dir)
         .unwrap_or(repo_dir);
 
-    let mut build_cmd = format_pgo_makepkg_cmd(config, pgo, repo_dir, &ramdisk_targets);
+    let threads = crate::build_env::resolve_package_threads(pkg, config, cli);
+    // Keeps the wrapper makepkg.conf alive until the build command finished.
+    let limiter_guard = match threads.map(|n| crate::build_env::write_local_limiter_conf(pkg, n)) {
+        Some(Ok(guard)) => Some(guard),
+        Some(Err(e)) => die!("Parallel limiter setup failed for {}: {}", pkg, e),
+        None => None,
+    };
+
+    let mut build_cmd = format_pgo_makepkg_cmd(
+        config,
+        pgo,
+        repo_dir,
+        &ramdisk_targets,
+        limiter_guard.as_ref().map(|g| g.env_assignment()),
+    );
     if workdir_guard.as_ref().is_some_and(WorkdirGuard::uses_ramdisk) {
         build_cmd = strip_makepkg_cleanbuild_in_shell(&build_cmd);
     }
@@ -1415,7 +1479,7 @@ pub fn process_package_pgo(
     }
 
     if !pgo.skip_abs_install && !cli.compile_only {
-        let pkgbase = pgo_pkgbase_from_env(&pgo.env_vars);
+        let pkgbase = pgo_pkgbase_from_env(pkg, &pgo.env_vars);
         blog!("PGO stage installs packages for pkgbase {pkgbase}");
         crate::install::install_pgo_artifacts(
             pkg,
@@ -1452,7 +1516,7 @@ pub fn process_kernel_oneshot(package: &str, cli: &Cli, config: &Config) -> bool
     }
 
     blog!("One-shot kernel build for {} (no PGO)", package);
-    process_package(&spec, cli, config, false, None)
+    process_package(&spec, cli, config, false, None, None)
 }
 
 #[cfg(test)]
@@ -1577,14 +1641,40 @@ mod tests {
             ("_use_lto_suffix".into(), "no".into()),
             ("_use_gcc_suffix".into(), "no".into()),
         ]);
-        assert_eq!(super::pgo_pkgbase_from_env(&stage1), "linux-cachyos");
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos", &stage1),
+            "linux-cachyos"
+        );
 
         let stage2 = HashMap::from([
             ("_use_llvm_lto".into(), "thin".into()),
             ("_use_lto_suffix".into(), "yes".into()),
             ("_use_gcc_suffix".into(), "no".into()),
         ]);
-        assert_eq!(super::pgo_pkgbase_from_env(&stage2), "linux-cachyos-lto");
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos", &stage2),
+            "linux-cachyos-lto"
+        );
+
+        // Kernel variants keep their own suffix instead of collapsing to linux-cachyos.
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos-bore", &stage1),
+            "linux-cachyos-bore"
+        );
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos-bore", &stage2),
+            "linux-cachyos-bore-lto"
+        );
+        // A package already named with the -lto suffix builds the plain kernel at stage 1
+        // and does not double the suffix at stage 2.
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos-lto", &stage1),
+            "linux-cachyos"
+        );
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos-lto", &stage2),
+            "linux-cachyos-lto"
+        );
     }
 
     #[test]

@@ -8,17 +8,17 @@ use crate::list_editors::{self, ListEditors, PackageListField};
 use crate::config::{config_path, load_config, save_config, ConfigDocument, PackageSection};
 use crate::dialog;
 use crate::field_help;
-use crate::messages::{EditTarget, KBool, KStr, Message, Page, PathField, RamdiskLetter};
+use crate::messages::{EditTarget, KBool, KOptBool, KStr, Message, Page, PathField, RamdiskLetter};
 use crate::style;
 use crate::views::abs_settings;
 use crate::widgets::{
-    card_section, encode_ramdisk_flags, field_checkbox, field_path, field_pick, field_text,
-    parse_ramdisk_flags, kernel_ramdisk_targets_field, page_title, PathField as WPathField,
-    PathKind as WPathKind,
+    card_section, encode_ramdisk_flags, field_checkbox, field_number, field_path, field_pick,
+    field_text, optional_bool_field, parse_ramdisk_flags, kernel_ramdisk_targets_field,
+    page_title, ramdisk_targets_field, PathField as WPathField, PathKind as WPathKind,
 };
 use iced::event;
 use iced::widget::{
-    button, column, container, image, row, scrollable, text, text_editor, text_input, Space,
+    button, column, container, image, row, rule, scrollable, text, text_editor, text_input, Space,
 };
 use iced::{clipboard, window, time};
 use iced::{
@@ -139,6 +139,8 @@ pub struct App {
     status_message: Option<String>,
     selected_kernel: Option<String>,
     custom_kernel: String,
+    selected_package: Option<String>,
+    new_package_name: String,
     pgo_status: Option<PgoStatus>,
     pgo_status_error: Option<String>,
     /// Phase selected in the PGO UI (used by Start from current phase).
@@ -201,6 +203,8 @@ impl App {
                 status_message: None,
                 selected_kernel: None,
                 custom_kernel: String::new(),
+                selected_package: None,
+                new_package_name: String::new(),
                 pgo_status: None,
                 pgo_status_error: None,
                 pgo_selected_stage: pgo_first_phase_key().to_string(),
@@ -537,6 +541,10 @@ impl App {
                 .selected_kernel
                 .as_ref()
                 .and_then(|n| self.config.packages.get(n)),
+            EditTarget::Package => self
+                .selected_package
+                .as_ref()
+                .and_then(|n| self.config.packages.get(n)),
         }
     }
 
@@ -548,6 +556,10 @@ impl App {
                 self.config.ensure_kernel_from_defaults(&name);
                 self.config.packages.get_mut(&name)
             }
+            EditTarget::Package => {
+                let name = self.selected_package.clone()?;
+                Some(self.config.packages.entry(name).or_default())
+            }
         }
     }
 
@@ -555,9 +567,50 @@ impl App {
         match message {
             Message::OpenKernels => self.page = Page::Kernels,
             Message::OpenDefaultConfig => self.page = Page::DefaultKernelConfig,
+            Message::OpenPackages => self.page = Page::Packages,
+            Message::OpenPackage(name) => {
+                self.selected_package = Some(name);
+                self.page = Page::PackageConfig;
+            }
+            Message::NewPackageNameChanged(v) => self.new_package_name = v,
+            Message::PackageAdd => {
+                let name = self.new_package_name.trim().to_string();
+                if name.is_empty() {
+                    return Task::none();
+                }
+                if self.config.packages.contains_key(&name) {
+                    self.status_message =
+                        Some(format!("{name} is already configured — opening it."));
+                } else {
+                    self.config
+                        .packages
+                        .insert(name.clone(), PackageSection::default());
+                    self.status_message = Some(format!(
+                        "Added [packages.{name}] — configure it below and click Save config."
+                    ));
+                }
+                self.new_package_name.clear();
+                self.selected_package = Some(name);
+                self.page = Page::PackageConfig;
+            }
+            Message::PackageRemove(name) => {
+                self.config.packages.remove(&name);
+                if self.selected_package.as_deref() == Some(name.as_str()) {
+                    self.selected_package = None;
+                    self.page = Page::Packages;
+                }
+                self.status_message = Some(format!(
+                    "Removed [packages.{name}] — click Save config to write abs.toml."
+                ));
+            }
             Message::OpenAbsSettings => self.page = Page::AbsSettings,
             Message::OpenAppSettings => self.page = Page::AppSettings,
-            Message::Back => self.page = Page::Kernels,
+            Message::Back => {
+                self.page = match self.page {
+                    Page::PackageConfig => Page::Packages,
+                    _ => Page::Kernels,
+                };
+            }
             Message::OpenKernel(name) => {
                 self.config.ensure_kernel_from_defaults(&name);
                 self.selected_kernel = Some(name);
@@ -627,6 +680,18 @@ impl App {
                     self.config.build.concurrent_compilations_limit = n;
                 }
             }
+            Message::BuildGlobalCpuThreadsMode(v) => {
+                self.config.build.global_cpu_threads_mode = v;
+            }
+            Message::BuildGlobalCpuThreadsCap(v) => {
+                self.config.build.global_cpu_threads_cap = parse_opt_usize(&v);
+            }
+            Message::BuildMaximumCpuThreadsCap(v) => {
+                self.config.build.maximum_cpu_threads_cap = parse_opt_usize(&v);
+            }
+            Message::BuildDefaultCompilationThreads(v) => {
+                self.config.build.default_compilation_threads = parse_opt_usize(&v);
+            }
             Message::BuildSystemUpdateFirst(v) => self.config.build.system_update_first = v,
             Message::BuildIgnoreFailures(v) => self.config.build.ignore_compilation_failures = v,
             Message::BuildCompileFirstInstall(v) => {
@@ -642,9 +707,6 @@ impl App {
             Message::CheckForUpdateOnStartup(v) => self.config.check_for_update_on_startup = v,
             Message::AutoUpdateOnStartup(v) => self.config.auto_update_on_startup = v,
             Message::SelfUpdateAtUpdates(v) => self.config.self_update_at_updates = v,
-            Message::SelfUpdateGithubUrl(v) => {
-                self.config.self_update_github_url = opt_str(v);
-            }
             Message::SelfUpdateRawUrl(v) => self.config.self_update_raw_url = opt_str(v),
             Message::SelfUpdateInstallPath(v) => {
                 self.config.self_update_install_path = opt_str(v);
@@ -771,6 +833,31 @@ impl App {
             Message::SetKernelBool(target, field, value) => {
                 if let Some(pkg) = self.target_pkg_mut(target) {
                     set_kbool(pkg, field, value);
+                }
+            }
+            Message::SetPackageOptBool(target, field, value) => {
+                if let Some(pkg) = self.target_pkg_mut(target) {
+                    match field {
+                        KOptBool::Tests => pkg.tests = value,
+                        KOptBool::UpstreamPrereleases => pkg.upstream_prereleases = value,
+                    }
+                }
+            }
+            Message::PackageCompilationThreads(target, value) => {
+                if let Some(pkg) = self.target_pkg_mut(target) {
+                    pkg.compilation_threads = parse_opt_usize(&value);
+                }
+            }
+            Message::PackageCompileAlone(target, value) => {
+                if let Some(pkg) = self.target_pkg_mut(target) {
+                    pkg.compile_alone = value;
+                }
+            }
+            Message::PackageCompilationPriority(target, value) => {
+                if let Some(pkg) = self.target_pkg_mut(target) {
+                    if let Ok(n) = value.trim().parse::<usize>() {
+                        pkg.compilation_priority = n.max(1);
+                    }
                 }
             }
             Message::SetRamdiskTarget(target, letter, enabled) => {
@@ -1114,15 +1201,22 @@ impl App {
             Page::Kernels => self.view_kernels(theme),
             Page::DefaultKernelConfig => self.view_default_config(theme),
             Page::KernelConfig => self.view_kernel_config(theme),
+            Page::Packages => self.view_packages(theme),
+            Page::PackageConfig => self.view_package_config(theme),
             Page::AbsSettings => abs_settings::view(&self.config, &self.list_editors, theme),
             Page::AppSettings => self.view_app_settings(theme),
         };
 
+        // Cap the form width so fields stay readable on wide/maximized windows.
         let body = row![
             self.view_sidebar(theme),
-            scrollable(container(content).padding(24).width(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill),
+            scrollable(
+                container(container(content).max_width(940).padding(24))
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill),
         ]
         .height(Length::Fill);
 
@@ -1146,8 +1240,16 @@ impl App {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            Space::new().height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(12.0)),
+            rule::horizontal(1),
+            Space::new().height(Length::Fixed(12.0)),
             nav_btn("Kernels", kernels_active, theme, Message::OpenKernels),
+            nav_btn(
+                "Packages",
+                matches!(self.page, Page::Packages | Page::PackageConfig),
+                theme,
+                Message::OpenPackages,
+            ),
             nav_btn(
                 "ABS settings",
                 self.page == Page::AbsSettings,
@@ -1160,9 +1262,14 @@ impl App {
                 theme,
                 Message::OpenAppSettings,
             ),
+            Space::new().height(Length::Fill),
+            text(concat!("absgui ", env!("CARGO_PKG_VERSION")))
+                .size(11)
+                .color(style::muted(theme)),
         ]
         .spacing(6)
-        .padding(16);
+        .padding(16)
+        .height(Length::Fill);
 
         container(nav)
             .width(Length::Fixed(200.0))
@@ -1172,21 +1279,28 @@ impl App {
     }
 
     fn view_status_bar(&self, theme: AppTheme) -> Element<'_, Message> {
+        let palette = style::iced_theme(theme).palette();
         let left = if let Some(ref msg) = self.status_message {
-            text(msg.clone()).size(12)
+            let lower = msg.to_ascii_lowercase();
+            let is_error = ["fail", "error", "abort"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            text(msg.clone()).size(12).color(if is_error {
+                palette.danger
+            } else {
+                palette.primary
+            })
         } else if let Some(ref err) = self.config_error {
             text(format!("Config error: {err}"))
                 .size(12)
-                .color(style::muted(theme))
+                .color(palette.danger)
         } else {
             text(self.config_path.display().to_string())
                 .size(12)
                 .color(style::muted(theme))
         };
         let right = if self.busy {
-            text("running abs…")
-                .size(12)
-                .color(style::iced_theme(theme).palette().primary)
+            text("running abs…").size(12).color(palette.primary)
         } else {
             text("").size(12)
         };
@@ -1336,6 +1450,147 @@ impl App {
         .into()
     }
 
+    fn view_packages(&self, theme: AppTheme) -> Element<'_, Message> {
+        let mut col = column![
+            page_title("Packages", theme),
+            text(
+                "Per-package overrides from [packages.*] in abs.toml. Any package ABS builds can \
+                 be configured here — kernels too, but their kernel/PGO options live on the \
+                 Kernels page. Changes are written when you click Save config."
+            )
+            .size(12)
+            .color(style::muted(theme)),
+        ]
+        .spacing(14);
+
+        let add_name = self.new_package_name.trim().to_string();
+        let add_btn = button(text("+ Add package").size(14)).style(button::primary);
+        let add_btn = if add_name.is_empty() {
+            add_btn
+        } else {
+            add_btn.on_press(Message::PackageAdd)
+        };
+        col = col.push(card_section(
+            "Add package configuration",
+            theme,
+            row![
+                text_input("e.g. firefox, qemu-desktop, paru", &self.new_package_name)
+                    .on_input(Message::NewPackageNameChanged)
+                    .on_submit(Message::PackageAdd)
+                    .padding(8)
+                    .width(Length::Fill),
+                add_btn,
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        ));
+
+        let mut names: Vec<_> = self.config.packages.keys().cloned().collect();
+        names.sort();
+        if names.is_empty() {
+            col = col.push(card_section(
+                "Configured packages",
+                theme,
+                text("No per-package configuration yet — add one above.")
+                    .size(12)
+                    .color(style::muted(theme)),
+            ));
+            return col.into();
+        }
+
+        let mut rows = column![].spacing(8);
+        for name in names {
+            let pkg = &self.config.packages[&name];
+            let mut tags: Vec<String> = Vec::new();
+            if let Some(src) = &pkg.source {
+                tags.push(src.clone());
+            }
+            if let Some(env) = &pkg.build_env {
+                tags.push(env.clone());
+            }
+            if let Some(n) = pkg.compilation_threads {
+                tags.push(format!("-j{n}"));
+            }
+            if pkg.compile_alone {
+                tags.push("alone".into());
+            }
+            let is_kernel = pkg.kernel.is_some() || pkg.pgo.is_some();
+            let mut item = row![text(name.clone()).size(14).width(Length::Fill)]
+                .spacing(8)
+                .align_y(Alignment::Center);
+            if !tags.is_empty() {
+                item = item.push(
+                    container(text(tags.join(" · ")).size(11))
+                        .padding(pill_padding())
+                        .style(style::tag(theme)),
+                );
+            }
+            if is_kernel {
+                item = item.push(
+                    container(text("kernel").size(11))
+                        .padding(pill_padding())
+                        .style(style::tag_muted(theme)),
+                );
+            }
+            item = item.push(
+                button(text("Edit").size(13))
+                    .style(button::secondary)
+                    .on_press(Message::OpenPackage(name.clone())),
+            );
+            item = item.push(
+                button(text("Remove").size(13))
+                    .style(button::danger)
+                    .on_press(Message::PackageRemove(name)),
+            );
+            rows = rows.push(item);
+        }
+        col = col.push(card_section("Configured packages", theme, rows));
+        col.into()
+    }
+
+    fn view_package_config(&self, theme: AppTheme) -> Element<'_, Message> {
+        let name = self
+            .selected_package
+            .clone()
+            .unwrap_or_else(|| "—".to_string());
+        let Some(pkg) = self.target_pkg(EditTarget::Package) else {
+            return text("No package selected.").into();
+        };
+        let is_kernel = pkg.kernel.is_some() || pkg.pgo.is_some();
+
+        let mut col = column![row![
+            button(text("← Packages").size(14))
+                .style(button::secondary)
+                .on_press(Message::Back),
+            text(name.clone()).size(22).width(Length::Fill),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),]
+        .spacing(16);
+
+        if is_kernel {
+            col = col.push(
+                text("This package also has kernel/PGO options — edit those on the Kernels page.")
+                    .size(12)
+                    .color(style::muted(theme)),
+            );
+        }
+
+        col = col.push(package_form(EditTarget::Package, pkg, theme));
+        col = col.push(
+            row![
+                button(text("Save config").size(14))
+                    .style(button::primary)
+                    .on_press(Message::SaveConfig),
+                button(text("Remove package").size(14))
+                    .style(button::danger)
+                    .on_press(Message::PackageRemove(name)),
+            ]
+            .spacing(8),
+        );
+        col.into()
+    }
+
     fn view_app_settings(&self, theme: AppTheme) -> Element<'_, Message> {
         let current = match self.gui_settings.theme {
             AppTheme::Dark => "Dark",
@@ -1460,8 +1715,6 @@ impl App {
                     .padding(pill_padding())
                     .style(if is_selected {
                         button::primary
-                    } else if is_saved {
-                        button::secondary
                     } else {
                         button::secondary
                     })
@@ -1708,6 +1961,30 @@ fn kernel_form<'a>(
                 theme,
                 move |v| Message::SetKernelBool(target, KBool::CcHarder, v),
             ),
+            row![
+                field_checkbox(
+                    "-lto name suffix (_use_lto_suffix)",
+                    Some(field_help::LTO_SUFFIX),
+                    kbool_value(pkg, KBool::LtoSuffix),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::LtoSuffix, v),
+                ),
+                field_checkbox(
+                    "-gcc name suffix (_use_gcc_suffix)",
+                    Some(field_help::GCC_SUFFIX),
+                    kbool_value(pkg, KBool::GccSuffix),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::GccSuffix, v),
+                ),
+                field_checkbox(
+                    "Kernel CFI (_use_kcfi)",
+                    Some(field_help::KCFI),
+                    kbool_value(pkg, KBool::Kcfi),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::Kcfi, v),
+                ),
+            ]
+            .spacing(16),
         ]
         .spacing(12),
     );
@@ -1735,6 +2012,33 @@ fn kernel_form<'a>(
                 ),
             ]
             .spacing(12),
+            row![
+                field_number(
+                    "compilation_threads (optional)",
+                    Some(field_help::PACKAGE_COMPILATION_THREADS),
+                    &pkg
+                        .compilation_threads
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    theme,
+                    move |v| Message::PackageCompilationThreads(target, v),
+                ),
+                field_number(
+                    "compilation_priority",
+                    Some(field_help::PACKAGE_COMPILATION_PRIORITY),
+                    &pkg.compilation_priority.to_string(),
+                    theme,
+                    move |v| Message::PackageCompilationPriority(target, v),
+                ),
+            ]
+            .spacing(12),
+            field_checkbox(
+                "compile_alone",
+                Some(field_help::PACKAGE_COMPILE_ALONE),
+                pkg.compile_alone,
+                theme,
+                move |v| Message::PackageCompileAlone(target, v),
+            ),
             kernel_ramdisk_targets_field(target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r, theme),
         ]
         .spacing(12),
@@ -1949,6 +2253,174 @@ fn kernel_form<'a>(
     column![kernel, abs_card, pgo].spacing(16).into()
 }
 
+/// Full per-package editor (everything `[packages.NAME]` supports except kernel/PGO tables).
+fn package_form<'a>(
+    target: EditTarget,
+    pkg: &'a PackageSection,
+    theme: AppTheme,
+) -> Element<'a, Message> {
+    let ramdisk_str = kstr_value(pkg, KStr::Ramdisk);
+    let (ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r) = parse_ramdisk_flags(&ramdisk_str);
+
+    let source_build = card_section(
+        "Source & build",
+        theme,
+        column![
+            row![
+                field_pick(
+                    "source",
+                    Some(field_help::SOURCE),
+                    SOURCE_OPTS,
+                    &kstr_value(pkg, KStr::Source),
+                    theme,
+                    move |v| Message::SetKernelStr(target, KStr::Source, v),
+                ),
+                field_pick(
+                    "build_env",
+                    Some(field_help::BUILD_ENV),
+                    ENV_OPTS,
+                    &kstr_value(pkg, KStr::BuildEnv),
+                    theme,
+                    move |v| Message::SetKernelStr(target, KStr::BuildEnv, v),
+                ),
+            ]
+            .spacing(12),
+            row![
+                field_text(
+                    "compiler (optional)",
+                    Some(field_help::PACKAGE_COMPILER),
+                    &kstr_value(pkg, KStr::Compiler),
+                    "gcc14",
+                    theme,
+                    move |v| Message::SetKernelStr(target, KStr::Compiler, v),
+                ),
+                field_text(
+                    "alias (optional)",
+                    Some(field_help::PACKAGE_ALIAS),
+                    &kstr_value(pkg, KStr::Alias),
+                    "upstream-package-name",
+                    theme,
+                    move |v| Message::SetKernelStr(target, KStr::Alias, v),
+                ),
+            ]
+            .spacing(12),
+            optional_bool_field(
+                "tests",
+                Some(field_help::PACKAGE_TESTS),
+                pkg.tests,
+                "makepkg default",
+                theme,
+                move |v| Message::SetPackageOptBool(target, KOptBool::Tests, v),
+            ),
+            ramdisk_targets_field(target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r, theme),
+        ]
+        .spacing(12),
+    );
+
+    let scheduling = card_section(
+        "Compilation scheduling",
+        theme,
+        column![
+            row![
+                field_number(
+                    "compilation_threads (optional)",
+                    Some(field_help::PACKAGE_COMPILATION_THREADS),
+                    &pkg
+                        .compilation_threads
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    theme,
+                    move |v| Message::PackageCompilationThreads(target, v),
+                ),
+                field_number(
+                    "compilation_priority",
+                    Some(field_help::PACKAGE_COMPILATION_PRIORITY),
+                    &pkg.compilation_priority.to_string(),
+                    theme,
+                    move |v| Message::PackageCompilationPriority(target, v),
+                ),
+            ]
+            .spacing(12),
+            field_checkbox(
+                "compile_alone",
+                Some(field_help::PACKAGE_COMPILE_ALONE),
+                pkg.compile_alone,
+                theme,
+                move |v| Message::PackageCompileAlone(target, v),
+            ),
+        ]
+        .spacing(12),
+    );
+
+    let commands = card_section(
+        "Commands & hooks",
+        theme,
+        column![
+            field_text(
+                "custom_local_build_command (optional)",
+                Some(field_help::PACKAGE_CUSTOM_LOCAL_CMD),
+                &kstr_value(pkg, KStr::CustomLocalBuildCommand),
+                "makepkg -si --noconfirm",
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::CustomLocalBuildCommand, v),
+            ),
+            field_text(
+                "custom_chroot_build_command (optional)",
+                Some(field_help::PACKAGE_CUSTOM_CHROOT_CMD),
+                &kstr_value(pkg, KStr::CustomChrootBuildCommand),
+                "makechrootpkg -r /path/to/chroot",
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::CustomChrootBuildCommand, v),
+            ),
+            field_text(
+                "pre_update_command (optional)",
+                Some(field_help::PACKAGE_PRE_UPDATE_CMD),
+                &kstr_value(pkg, KStr::PreUpdateCommand),
+                "systemctl stop myservice",
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::PreUpdateCommand, v),
+            ),
+            field_text(
+                "post_update_command (optional)",
+                Some(field_help::PACKAGE_POST_UPDATE_CMD),
+                &kstr_value(pkg, KStr::PostUpdateCommand),
+                "systemctl restart myservice",
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::PostUpdateCommand, v),
+            ),
+        ]
+        .spacing(12),
+    );
+
+    let upstream = card_section(
+        "Upstream version checks",
+        theme,
+        column![
+            field_text(
+                "upstream_github (optional)",
+                Some(field_help::PACKAGE_UPSTREAM_GITHUB),
+                &kstr_value(pkg, KStr::UpstreamGithub),
+                "owner/repo",
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::UpstreamGithub, v),
+            ),
+            optional_bool_field(
+                "upstream_prereleases",
+                Some(field_help::PACKAGE_UPSTREAM_PRERELEASES),
+                pkg.upstream_prereleases,
+                "false",
+                theme,
+                move |v| Message::SetPackageOptBool(target, KOptBool::UpstreamPrereleases, v),
+            ),
+        ]
+        .spacing(12),
+    );
+
+    column![source_build, scheduling, commands, upstream]
+        .spacing(16)
+        .into()
+}
+
 fn nav_btn(
     label: &'static str,
     active: bool,
@@ -1989,6 +2461,15 @@ fn opt_str(value: String) -> Option<String> {
     }
 }
 
+fn parse_opt_usize(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse().ok()
+    }
+}
+
 fn validate_pgo_start(section: &PackageSection, package: &str) -> Result<(), String> {
     let pgo = section
         .pgo
@@ -2018,6 +2499,13 @@ fn kstr_value(pkg: &PackageSection, field: KStr) -> String {
         KStr::Source => pkg.source.clone(),
         KStr::BuildEnv => pkg.build_env.clone(),
         KStr::Ramdisk => pkg.ramdisk.clone(),
+        KStr::Alias => pkg.alias.clone(),
+        KStr::Compiler => pkg.compiler.clone(),
+        KStr::UpstreamGithub => pkg.upstream_github.clone(),
+        KStr::PreUpdateCommand => pkg.pre_update_command.clone(),
+        KStr::PostUpdateCommand => pkg.post_update_command.clone(),
+        KStr::CustomLocalBuildCommand => pkg.custom_local_build_command.clone(),
+        KStr::CustomChrootBuildCommand => pkg.custom_chroot_build_command.clone(),
         KStr::Cpusched => kernel.and_then(|k| k.cpusched.clone()),
         KStr::ProcessorOpt => kernel.and_then(|k| k.processor_opt.clone()),
         KStr::LlvmLto => kernel.and_then(|k| k.use_llvm_lto.clone()),
@@ -2137,6 +2625,13 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
         KStr::Source => pkg.source = opt,
         KStr::BuildEnv => pkg.build_env = opt,
         KStr::Ramdisk => pkg.ramdisk = opt,
+        KStr::Alias => pkg.alias = opt,
+        KStr::Compiler => pkg.compiler = opt,
+        KStr::UpstreamGithub => pkg.upstream_github = opt,
+        KStr::PreUpdateCommand => pkg.pre_update_command = opt,
+        KStr::PostUpdateCommand => pkg.post_update_command = opt,
+        KStr::CustomLocalBuildCommand => pkg.custom_local_build_command = opt,
+        KStr::CustomChrootBuildCommand => pkg.custom_chroot_build_command = opt,
         KStr::Cpusched => pkg.kernel.get_or_insert_with(Default::default).cpusched = opt,
         KStr::ProcessorOpt => pkg.kernel.get_or_insert_with(Default::default).processor_opt = opt,
         KStr::LlvmLto => pkg.kernel.get_or_insert_with(Default::default).use_llvm_lto = opt,
@@ -2175,6 +2670,21 @@ fn kbool_value(pkg: &PackageSection, field: KBool) -> bool {
             .as_ref()
             .and_then(|k| k.cc_harder.as_deref())
             .is_some_and(is_truthy),
+        KBool::LtoSuffix => pkg
+            .kernel
+            .as_ref()
+            .and_then(|k| k.use_lto_suffix.as_deref())
+            .is_some_and(is_truthy),
+        KBool::GccSuffix => pkg
+            .kernel
+            .as_ref()
+            .and_then(|k| k.use_gcc_suffix.as_deref())
+            .is_some_and(is_truthy),
+        KBool::Kcfi => pkg
+            .kernel
+            .as_ref()
+            .and_then(|k| k.use_kcfi.as_deref())
+            .is_some_and(is_truthy),
     }
 }
 
@@ -2192,6 +2702,18 @@ fn set_kbool(pkg: &mut PackageSection, field: KBool, value: bool) {
         }
         KBool::CcHarder => {
             pkg.kernel.get_or_insert_with(Default::default).cc_harder =
+                if value { Some("y".into()) } else { None }
+        }
+        KBool::LtoSuffix => {
+            pkg.kernel.get_or_insert_with(Default::default).use_lto_suffix =
+                if value { Some("y".into()) } else { None }
+        }
+        KBool::GccSuffix => {
+            pkg.kernel.get_or_insert_with(Default::default).use_gcc_suffix =
+                if value { Some("y".into()) } else { None }
+        }
+        KBool::Kcfi => {
+            pkg.kernel.get_or_insert_with(Default::default).use_kcfi =
                 if value { Some("y".into()) } else { None }
         }
     }

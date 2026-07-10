@@ -251,7 +251,16 @@ packages = false
 | `compile_first_install_after`      | Build all packages first, then install — useful for unattended runs              |
 | `clean_install_by_default`         | Remove `src/` and `pkg/` before every compile                                    |
 | `clean_chroot_after_compilation`   | Reset devtools chroot after each chroot build (default: `true`)                  |
+| `concurrent_compilations_limit`    | Max packages building at once (default: `1`)                                     |
+| `global_cpu_threads_mode`          | `strict` or `flexible` — how concurrent `-j` sums are capped (default: `strict`) |
+| `global_cpu_threads_cap`           | Max sum of active compilation threads (strict hard cap; flexible soft target)  |
+| `maximum_cpu_threads_cap`          | Flexible mode only: hard ceiling above the soft cap                              |
+| `default_compilation_threads`      | Default `-j` for packages without `compilation_threads` (override with `abs -j`) |
 | `concurrent_repos_downloads_limit` | Maximum number of repository clones/updates to sync concurrently (default: `10`) |
+
+When `compilation_threads` (or `-j`) is set, ABS applies parallel limiters (`MAKEFLAGS`, `NPROC`, `CMAKE_BUILD_PARALLEL_LEVEL`, `NINJAFLAGS`, `CARGO_BUILD_JOBS`, `MAX_JOBS`). For local/PGO builds it generates a temporary wrapper `makepkg.conf` (sourcing your normal config chain first) and passes it via `MAKEPKG_CONF`; for chroot builds it writes `makepkg.conf.d/abs-parallel.conf` into the worker copy. Both override distro defaults such as `MAKEFLAGS="-j$(nproc)"`.
+
+PKGBUILDs that hardcode `make -j$(nproc)` ignore these env vars. Packages without any thread setting are not counted against `global_cpu_threads_cap` / `maximum_cpu_threads_cap`; only the `concurrent_compilations_limit` slot count constrains them.
 
 
 ### Self-Updates config keys
@@ -264,7 +273,6 @@ These are root-level properties (but are also parsed under the `[build]` section
 | `check_for_update_on_startup` | Check for newer ABS versions silently in the background at startup, notifying at exit if newer (default: `true`)                        |
 | `auto_update_on_startup`      | Check for newer ABS versions and automatically self-update synchronously at startup (default: `false`)                                  |
 | `self_update_at_updates`      | Check for newer ABS versions synchronously when `-U` is used and update before system packages (default: `false`)                       |
-| `self_update_github_url`      | The repository URL used to clone when self-updating (default: `"https://github.com/John-CPP/ABS"`)                                      |
 | `self_update_raw_url`         | The raw Cargo.toml URL used to parse the latest version (default: `"https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"`) |
 | `self_update_use_pacman`      | When `true`, `--self-update` runs `makepkg` in `aur/` and upgrades pacman packages. When `false`, copies the `abs` binary to `self_update_install_path`. Unset = auto-detect from installed packages. |
 | `self_update_install_path`    | Fallback binary path when not using pacman packages (default: `"/usr/bin/abs"`)                                                         |

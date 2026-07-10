@@ -162,14 +162,7 @@ pub fn fetch_pgo_status(package: &str) -> Result<PgoStatus, String> {
 }
 
 fn shell_quote(s: &str) -> String {
-    if s.is_empty()
-        || s.chars()
-            .any(|c| c.is_whitespace() || c == '\'' || c == '\\' || "\"$`!".contains(c))
-    {
-        format!("'{}'", s.replace('\'', "'\"'\"'"))
-    } else {
-        s.to_string()
-    }
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 pub fn format_abs_pgo_command(
@@ -323,12 +316,13 @@ pub fn launch_in_terminal(command: &str, pid_file: Option<&Path>) -> Result<Stri
 }
 
 fn command_exists(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let path = Path::new(name);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    })
 }
 
 /// Find a graphical askpass program so sudo can prompt for a password from the GUI (there is no
@@ -749,4 +743,15 @@ pub fn ensure_event_log_path(path: &Path) -> Result<(), String> {
         .open(path)
         .map_err(|e| format!("create event log file {}: {e}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_always_quotes_shell_metacharacters() {
+        assert_eq!(shell_quote("kernel; touch /tmp/pwned"), "'kernel; touch /tmp/pwned'");
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
 }

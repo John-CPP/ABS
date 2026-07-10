@@ -5,6 +5,9 @@ use colored::Colorize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/John-CPP/ABS.git";
+const OFFICIAL_REPOSITORY_BRANCH: &str = "master";
+
 /// Parse `version` for the workspace `abs` package from raw Cargo.toml text.
 fn parse_cargo_toml_version(text: &str) -> Option<String> {
     parse_cargo_toml_package_version(text, "abs")
@@ -33,10 +36,10 @@ fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String>
             matches_name = name == package;
             continue;
         }
-        if matches_name {
-            if let Some(version) = trimmed.strip_prefix("version = ") {
-                return Some(version.trim().trim_matches('"').to_string());
-            }
+        if matches_name
+            && let Some(version) = trimmed.strip_prefix("version = ")
+        {
+            return Some(version.trim().trim_matches('"').to_string());
         }
     }
     None
@@ -169,15 +172,33 @@ fn run_pacman_self_update(repo_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn sync_source_repo(config: &Config) -> Result<PathBuf, String> {
+fn source_version_matches(repo_dir: &Path, expected_version: &str) -> Result<bool, String> {
+    let cargo_toml = repo_dir.join("Cargo.toml");
+    let text = fs::read_to_string(&cargo_toml)
+        .map_err(|e| format!("read {}: {e}", cargo_toml.display()))?;
+    Ok(parse_cargo_toml_version(&text).as_deref() == Some(expected_version))
+}
+
+fn remote_is_official(repo_dir: &Path) -> bool {
+    run_command_with_output_silent("git", &["remote", "get-url", "origin"], Some(repo_dir))
+        .map(|url| url.trim() == OFFICIAL_REPOSITORY_URL)
+        .unwrap_or(false)
+}
+
+fn sync_source_repo(config: &Config, expected_version: &str) -> Result<PathBuf, String> {
     let packages_path = config.paths.packages_path.clone();
     let abs_dir = PathBuf::from(&packages_path).join("abs");
 
     let mut repo_ok = false;
-    if abs_dir.exists() && abs_dir.join(".git").exists() {
+    if abs_dir.exists() && abs_dir.join(".git").exists() && remote_is_official(&abs_dir) {
         blog!("Updating ABS repository in {}...", abs_dir.display());
-        if run_command("git", &["fetch", "--depth=1"], Some(&abs_dir)).is_ok()
-            && run_command("git", &["reset", "--hard", "origin/master"], Some(&abs_dir)).is_ok()
+        if run_command(
+            "git",
+            &["fetch", "--depth=1", "origin", OFFICIAL_REPOSITORY_BRANCH],
+            Some(&abs_dir),
+        )
+        .is_ok()
+            && run_command("git", &["reset", "--hard", "FETCH_HEAD"], Some(&abs_dir)).is_ok()
         {
             repo_ok = true;
         } else {
@@ -185,13 +206,14 @@ fn sync_source_repo(config: &Config) -> Result<PathBuf, String> {
             let _ = fs::remove_dir_all(&abs_dir);
         }
     } else if abs_dir.exists() {
+        vlog!("Existing self-update checkout has an unexpected origin. Re-cloning the official repository...");
         let _ = fs::remove_dir_all(&abs_dir);
     }
 
     if !repo_ok {
         blog!(
             "Cloning latest repository source from {}...",
-            config.self_update_github_url
+            OFFICIAL_REPOSITORY_URL
         );
         fs::create_dir_all(&packages_path)
             .map_err(|e| format!("Failed to create packages directory: {}", e))?;
@@ -200,11 +222,17 @@ fn sync_source_repo(config: &Config) -> Result<PathBuf, String> {
             &[
                 "clone",
                 "--depth=1",
-                &format!("{}.git", config.self_update_github_url),
+                OFFICIAL_REPOSITORY_URL,
                 abs_dir.to_str().unwrap(),
             ],
             None::<&str>,
         )?;
+    }
+
+    if !source_version_matches(&abs_dir, expected_version)? {
+        return Err(format!(
+            "official repository source version does not match checked update version {expected_version}"
+        ));
     }
 
     Ok(abs_dir)
@@ -297,7 +325,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         env!("CARGO_PKG_VERSION").yellow()
     );
 
-    let repo_dir = sync_source_repo(config)?;
+    let repo_dir = sync_source_repo(config, &latest)?;
 
     if should_use_pacman_update(config) {
         match run_pacman_self_update(&repo_dir) {

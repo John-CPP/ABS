@@ -56,17 +56,36 @@ pub const KERNEL_CATALOG: &[(&str, &str, &str)] = &[
     ),
 ];
 
+// Palette: slate neutrals with a calm blue accent.
+// Dark: soft graphite surfaces, no pure black; light: airy slate with white cards.
+
+/// Accent color (buttons, active nav, highlights).
+/// Light uses a muted denim blue: enough presence for buttons without glaring contrast.
 pub fn primary(theme: AppTheme) -> Color {
     match theme {
-        AppTheme::Dark => Color::from_rgb8(0x46, 0xe6, 0xa0),
-        AppTheme::Light => Color::from_rgb8(0x05, 0x96, 0x69),
+        AppTheme::Dark => Color::from_rgb8(0x60, 0xa5, 0xfa),
+        AppTheme::Light => Color::from_rgb8(0x4a, 0x72, 0xb4),
     }
+}
+
+/// Softer accent for tinted text on accent-tinted backgrounds.
+fn primary_soft(theme: AppTheme) -> Color {
+    match theme {
+        AppTheme::Dark => Color::from_rgb8(0x93, 0xc5, 0xfd),
+        AppTheme::Light => Color::from_rgb8(0x3c, 0x5f, 0x9a),
+    }
+}
+
+/// Translucent accent for tag/selection backgrounds.
+fn primary_tint(theme: AppTheme, alpha: f32) -> Color {
+    let p = primary(theme);
+    Color { a: alpha, ..p }
 }
 
 pub fn muted(theme: AppTheme) -> Color {
     match theme {
-        AppTheme::Dark => Color::from_rgb8(0xa8, 0xb0, 0xba),
-        AppTheme::Light => Color::from_rgb8(0x64, 0x74, 0x8b),
+        AppTheme::Dark => Color::from_rgb8(0x94, 0xa3, 0xb8),
+        AppTheme::Light => Color::from_rgb8(0x5d, 0x6b, 0x7e),
     }
 }
 
@@ -75,23 +94,23 @@ pub fn iced_theme(theme: AppTheme) -> Theme {
         AppTheme::Dark => Theme::custom(
             "ABS Dark",
             iced::theme::Palette {
-                background: Color::from_rgb8(0x0f, 0x12, 0x16),
-                text: Color::from_rgb8(0xee, 0xf1, 0xf5),
+                background: Color::from_rgb8(0x13, 0x17, 0x1d),
+                text: Color::from_rgb8(0xe6, 0xea, 0xf0),
                 primary: primary(AppTheme::Dark),
-                success: primary(AppTheme::Dark),
-                warning: Color::from_rgb8(0xff, 0xc1, 0x4e),
-                danger: Color::from_rgb8(0xf0, 0x5d, 0x5d),
+                success: Color::from_rgb8(0x34, 0xd3, 0x99),
+                warning: Color::from_rgb8(0xfb, 0xbf, 0x24),
+                danger: Color::from_rgb8(0xf8, 0x71, 0x71),
             },
         ),
         AppTheme::Light => Theme::custom(
             "ABS Light",
             iced::theme::Palette {
-                background: Color::from_rgb8(0xec, 0xf0, 0xf4),
-                text: Color::from_rgb8(0x1e, 0x29, 0x3b),
+                background: Color::from_rgb8(0xf3, 0xf4, 0xf7),
+                text: Color::from_rgb8(0x2a, 0x33, 0x40),
                 primary: primary(AppTheme::Light),
-                success: primary(AppTheme::Light),
-                warning: Color::from_rgb8(0xd9, 0x77, 0x06),
-                danger: Color::from_rgb8(0xdc, 0x26, 0x26),
+                success: Color::from_rgb8(0x2e, 0x8b, 0x6b),
+                warning: Color::from_rgb8(0xc2, 0x76, 0x1c),
+                danger: Color::from_rgb8(0xc4, 0x4a, 0x4a),
             },
         ),
     }
@@ -99,22 +118,23 @@ pub fn iced_theme(theme: AppTheme) -> Theme {
 
 fn surface(theme: AppTheme) -> Color {
     match theme {
-        AppTheme::Dark => Color::from_rgb8(0x16, 0x1b, 0x22),
-        AppTheme::Light => Color::from_rgb8(0xff, 0xff, 0xff),
+        AppTheme::Dark => Color::from_rgb8(0x1a, 0x20, 0x28),
+        // Slightly off-white: keeps cards visible on the gray background without glare.
+        AppTheme::Light => Color::from_rgb8(0xfc, 0xfc, 0xfd),
     }
 }
 
 fn surface_border(theme: AppTheme) -> Color {
     match theme {
-        AppTheme::Dark => Color::from_rgb8(0x28, 0x30, 0x3a),
-        AppTheme::Light => Color::from_rgb8(0xcb, 0xd5, 0xe1),
+        AppTheme::Dark => Color::from_rgb8(0x2b, 0x33, 0x3f),
+        AppTheme::Light => Color::from_rgb8(0xe1, 0xe4, 0xea),
     }
 }
 
 fn sidebar_bg(theme: AppTheme) -> Color {
     match theme {
-        AppTheme::Dark => Color::from_rgb8(0x0a, 0x0d, 0x11),
-        AppTheme::Light => Color::from_rgb8(0xe2, 0xe8, 0xf0),
+        AppTheme::Dark => Color::from_rgb8(0x0e, 0x11, 0x16),
+        AppTheme::Light => Color::from_rgb8(0xea, 0xec, 0xf1),
     }
 }
 
@@ -144,14 +164,11 @@ pub fn sidebar(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
 
 pub fn tag(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(match app_theme {
-            AppTheme::Dark => Color::from_rgba(0.27, 0.9, 0.63, 0.18),
-            AppTheme::Light => Color::from_rgb8(0xd1, 0xfa, 0xe5),
-        })),
-        text_color: Some(match app_theme {
-            AppTheme::Dark => Color::from_rgb8(0x46, 0xe6, 0xa0),
-            AppTheme::Light => Color::from_rgb8(0x04, 0x78, 0x57),
-        }),
+        background: Some(Background::Color(primary_tint(app_theme, match app_theme {
+            AppTheme::Dark => 0.16,
+            AppTheme::Light => 0.12,
+        }))),
+        text_color: Some(primary_soft(app_theme)),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -164,8 +181,8 @@ pub fn tag(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
 pub fn tag_muted(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(match app_theme {
-            AppTheme::Dark => Color::from_rgb8(0x22, 0x28, 0x30),
-            AppTheme::Light => Color::from_rgb8(0xf1, 0xf5, 0xf9),
+            AppTheme::Dark => Color::from_rgb8(0x25, 0x2c, 0x36),
+            AppTheme::Light => Color::from_rgb8(0xed, 0xf0, 0xf5),
         })),
         text_color: Some(muted(app_theme)),
         border: Border {
@@ -180,14 +197,11 @@ pub fn tag_muted(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
 /// Current step in the PGO timeline — strong accent so it stays visible at a glance.
 pub fn pgo_stage_active(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(match app_theme {
-            AppTheme::Dark => Color::from_rgba(0.27, 0.9, 0.63, 0.28),
-            AppTheme::Light => Color::from_rgb8(0xa7, 0xf3, 0xd0),
-        })),
-        text_color: Some(match app_theme {
-            AppTheme::Dark => Color::from_rgb8(0x6e, 0xff, 0xb8),
-            AppTheme::Light => Color::from_rgb8(0x02, 0x5f, 0x45),
-        }),
+        background: Some(Background::Color(primary_tint(app_theme, match app_theme {
+            AppTheme::Dark => 0.24,
+            AppTheme::Light => 0.16,
+        }))),
+        text_color: Some(primary_soft(app_theme)),
         border: Border {
             color: primary(app_theme),
             width: 2.0,
@@ -200,19 +214,13 @@ pub fn pgo_stage_active(app_theme: AppTheme) -> impl Fn(&Theme) -> container::St
 /// Completed PGO timeline step.
 pub fn pgo_stage_done(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(match app_theme {
-            AppTheme::Dark => Color::from_rgba(0.27, 0.9, 0.63, 0.10),
-            AppTheme::Light => Color::from_rgb8(0xe6, 0xf9, 0xf0),
-        })),
-        text_color: Some(match app_theme {
-            AppTheme::Dark => Color::from_rgb8(0x8b, 0x9a, 0xa8),
-            AppTheme::Light => Color::from_rgb8(0x4b, 0x5e, 0x70),
-        }),
+        background: Some(Background::Color(primary_tint(app_theme, match app_theme {
+            AppTheme::Dark => 0.08,
+            AppTheme::Light => 0.07,
+        }))),
+        text_color: Some(muted(app_theme)),
         border: Border {
-            color: match app_theme {
-                AppTheme::Dark => Color::from_rgba(0.27, 0.9, 0.63, 0.35),
-                AppTheme::Light => Color::from_rgb8(0x6e, 0xe7, 0xb7),
-            },
+            color: primary_tint(app_theme, 0.35),
             width: 1.0,
             radius: 6.0.into(),
         },
@@ -224,7 +232,7 @@ pub fn nav_active(app_theme: AppTheme) -> impl Fn(&Theme, button::Status) -> but
     move |_theme, _status| button::Style {
         background: Some(Background::Color(primary(app_theme))),
         text_color: match app_theme {
-            AppTheme::Dark => Color::from_rgb8(0x0c, 0x10, 0x0e),
+            AppTheme::Dark => Color::from_rgb8(0x0d, 0x14, 0x20),
             AppTheme::Light => Color::from_rgb8(0xff, 0xff, 0xff),
         },
         border: Border {
@@ -242,15 +250,15 @@ pub fn nav_inactive(app_theme: AppTheme) -> impl Fn(&Theme, button::Status) -> b
         button::Style {
             background: Some(Background::Color(if hovered {
                 match app_theme {
-                    AppTheme::Dark => Color::from_rgb8(0x1e, 0x24, 0x2c),
-                    AppTheme::Light => Color::from_rgb8(0xcb, 0xd5, 0xe1),
+                    AppTheme::Dark => Color::from_rgb8(0x20, 0x27, 0x31),
+                    AppTheme::Light => Color::from_rgb8(0xdd, 0xe1, 0xe8),
                 }
             } else {
                 Color::TRANSPARENT
             })),
             text_color: match app_theme {
-                AppTheme::Dark => Color::from_rgb8(0xd2, 0xd7, 0xdd),
-                AppTheme::Light => Color::from_rgb8(0x33, 0x41, 0x55),
+                AppTheme::Dark => Color::from_rgb8(0xc9, 0xd1, 0xdb),
+                AppTheme::Light => Color::from_rgb8(0x39, 0x46, 0x58),
             },
             border: Border {
                 color: Color::TRANSPARENT,
@@ -265,8 +273,8 @@ pub fn nav_inactive(app_theme: AppTheme) -> impl Fn(&Theme, button::Status) -> b
 pub fn log_surface(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(match app_theme {
-            AppTheme::Dark => Color::from_rgb8(0x0c, 0x0f, 0x14),
-            AppTheme::Light => Color::from_rgb8(0xf1, 0xf5, 0xf9),
+            AppTheme::Dark => Color::from_rgb8(0x0e, 0x11, 0x16),
+            AppTheme::Light => Color::from_rgb8(0xee, 0xf1, 0xf6),
         })),
         border: Border {
             color: surface_border(app_theme),
@@ -280,22 +288,22 @@ pub fn log_surface(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
 
 pub fn log_text(app_theme: AppTheme) -> Color {
     match app_theme {
-        AppTheme::Dark => Color::from_rgb8(0xe6, 0xed, 0xf3),
-        AppTheme::Light => Color::from_rgb8(0x1e, 0x29, 0x3b),
+        AppTheme::Dark => Color::from_rgb8(0xdd, 0xe4, 0xec),
+        AppTheme::Light => Color::from_rgb8(0x1c, 0x24, 0x30),
     }
 }
 
 pub fn log_hint(app_theme: AppTheme) -> Color {
     match app_theme {
-        AppTheme::Dark => Color::from_rgb8(0x9d, 0xa7, 0xb3),
-        AppTheme::Light => Color::from_rgb8(0x47, 0x55, 0x69),
+        AppTheme::Dark => Color::from_rgb8(0x93, 0x9e, 0xac),
+        AppTheme::Light => Color::from_rgb8(0x4c, 0x59, 0x6c),
     }
 }
 
 pub fn log_editor(app_theme: AppTheme) -> impl Fn(&Theme, text_editor::Status) -> text_editor::Style {
     let bg = match app_theme {
-        AppTheme::Dark => Color::from_rgb8(0x0c, 0x0f, 0x14),
-        AppTheme::Light => Color::from_rgb8(0xf1, 0xf5, 0xf9),
+        AppTheme::Dark => Color::from_rgb8(0x0e, 0x11, 0x16),
+        AppTheme::Light => Color::from_rgb8(0xee, 0xf1, 0xf6),
     };
     let fg = log_text(app_theme);
     move |_theme, _status| text_editor::Style {
@@ -307,10 +315,10 @@ pub fn log_editor(app_theme: AppTheme) -> impl Fn(&Theme, text_editor::Status) -
         },
         placeholder: log_hint(app_theme),
         value: fg,
-        selection: match app_theme {
-            AppTheme::Dark => Color::from_rgba(0.27, 0.9, 0.63, 0.35),
-            AppTheme::Light => Color::from_rgb8(0xbb, 0xf7, 0xd0),
-        },
+        selection: primary_tint(app_theme, match app_theme {
+            AppTheme::Dark => 0.35,
+            AppTheme::Light => 0.25,
+        }),
     }
 }
 

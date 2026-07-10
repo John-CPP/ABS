@@ -18,6 +18,12 @@ pub const HUGEPAGE: &str =
     "Transparent hugepage policy: always or madvise. Maps to _hugepage.";
 pub const CC_HARDER: &str =
     "Enable stricter compiler flags in the PKGBUILD (_cc_harder). May increase build time.";
+pub const LTO_SUFFIX: &str =
+    "Append -lto to the package name (_use_lto_suffix). One-shot builds only; PGO stages manage suffixes themselves.";
+pub const GCC_SUFFIX: &str =
+    "Append -gcc to the package name when building with GCC (_use_gcc_suffix).";
+pub const KCFI: &str =
+    "Enable kernel Control Flow Integrity (_use_kcfi). Requires a Clang/LLVM build.";
 
 // --- Per-package ABS build ---
 
@@ -25,17 +31,31 @@ pub const SOURCE: &str =
     "Where ABS fetches the PKGBUILD: aur, cachyos, or arch official repos.";
 pub const BUILD_ENV: &str =
     "Build environment: local (host makepkg) or chroot (isolated rootfs).";
-#[allow(dead_code)]
+pub const PACKAGE_ALIAS: &str =
+    "Alternate upstream package name checked for updates (e.g. the repo package this AUR package tracks).";
+pub const PACKAGE_COMPILER: &str =
+    "Named compiler set from [compilers] used for this package; empty = default_compiler / makepkg default.";
+pub const PACKAGE_TESTS: &str =
+    "Run the PKGBUILD check() phase. Default follows makepkg; false passes --nocheck.";
+pub const PACKAGE_UPSTREAM_GITHUB: &str =
+    "GitHub owner/repo (or URL) checked on -R/-RU when the PKGBUILD lags behind upstream releases.";
+pub const PACKAGE_UPSTREAM_PRERELEASES: &str =
+    "Also consider GitHub prereleases when choosing the newest upstream version.";
+pub const PACKAGE_PRE_UPDATE_CMD: &str =
+    "Shell command run before this package is built (e.g. stop a service).";
+pub const PACKAGE_POST_UPDATE_CMD: &str =
+    "Shell command run after this package is installed (e.g. restart a service).";
+pub const PACKAGE_CUSTOM_LOCAL_CMD: &str =
+    "Replaces the makepkg invocation for local builds. Runs in the package directory; empty = default makepkg.";
+pub const PACKAGE_CUSTOM_CHROOT_CMD: &str =
+    "Replaces the makechrootpkg invocation for chroot builds. Runs in the package directory; empty = default.";
 pub const RAMDISK_TARGETS: &str =
     "Place parts of the build on tmpfs (ramdisk). Letters combine into the ramdisk= value in abs.toml.";
-#[allow(dead_code)]
 pub const RAMDISK_W: &str =
     "Build workdir (src/, pkg/) on tmpfs — speeds compile I/O for large trees like the kernel.";
 pub const RAMDISK_C: &str = "Chroot root filesystem on tmpfs — faster package installs inside chroot.";
-#[allow(dead_code)]
 pub const RAMDISK_P: &str =
     "Git clone / extract under packages_path on tmpfs. Uses a lot of RAM; enable only if you have spare memory.";
-#[allow(dead_code)]
 pub const RAMDISK_R: &str =
     "PGO profile collection scratch (perf.data) on tmpfs; profiles are still copied to profiles_archive_dir after each stage.";
 
@@ -121,6 +141,20 @@ pub const FAST_AUR_RPC: &str =
     "Use fast AUR RPC checks for update detection (fewer requests, may miss edge cases).";
 pub const CLEAN_CHROOT_AFTER: &str =
     "Remove chroot build artifacts after each successful chroot compilation.";
+pub const GLOBAL_CPU_THREADS_MODE: &str =
+    "CPU thread cap mode: strict (hard cap) or flexible (soft cap with optional burst ceiling).";
+pub const GLOBAL_CPU_THREADS_CAP: &str =
+    "Max sum of active compilation threads across concurrent builds (strict hard cap; flexible soft target).";
+pub const MAXIMUM_CPU_THREADS_CAP: &str =
+    "Flexible mode only: hard ceiling when pairing exceeds the soft cap.";
+pub const DEFAULT_COMPILATION_THREADS: &str =
+    "Default -j for packages without per-package compilation_threads (overridable with abs -j).";
+pub const PACKAGE_COMPILATION_THREADS: &str =
+    "Per-package -j thread count (sacred; scheduler never reduces it).";
+pub const PACKAGE_COMPILE_ALONE: &str =
+    "When true, this package runs with no other package compiling at the same time.";
+pub const PACKAGE_COMPILATION_PRIORITY: &str =
+    "Higher value schedules this package earlier among ready builds.";
 
 // --- Self-update & startup ---
 
@@ -130,7 +164,6 @@ pub const SELF_UPDATE_AT_UPDATES: &str =
     "Also check for ABS updates when running repository update commands.";
 pub const INSTALL_TESTING: &str =
     "Allow installing Arch testing/staging packages when resolving dependencies.";
-pub const SELF_UPDATE_GITHUB: &str = "GitHub repository URL used to discover new ABS releases.";
 pub const SELF_UPDATE_RAW: &str =
     "Raw URL of Cargo.toml checked for the latest version string.";
 pub const SELF_UPDATE_INSTALL: &str = "Fallback path for the abs binary when not using pacman packages (legacy manual install).";

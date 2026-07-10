@@ -77,6 +77,10 @@ pub struct Cli {
     #[arg(long)]
     pub repo: Option<String>,
 
+    /// Default compilation thread count (`-j`) for this run (does not override per-package settings)
+    #[arg(short = 'j', long = "jobs", value_name = "N")]
+    pub jobs: Option<usize>,
+
     /// Only install already built artifacts from READY_MADE_PACKAGES_PATH
     #[arg(long, action = ArgAction::SetTrue)]
     pub install_only: bool,
