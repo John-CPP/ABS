@@ -6,7 +6,7 @@ config_version = 1
 # check_for_update_on_startup = true
 # auto_update_on_startup = false
 # self_update_at_updates = false
-# self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"
+# self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml"
 # self_update_use_pacman = true   # default: auto (use pacman when abs/absgui packages are installed)
 # self_update_install_path = "/usr/bin/abs"  # fallback when self_update_use_pacman = false
 # If false, checks for newer versions of Arch Linux or CachyOS packages using stable pacman sync databases instead of git.

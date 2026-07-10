@@ -273,7 +273,7 @@ These are root-level properties (but are also parsed under the `[build]` section
 | `check_for_update_on_startup` | Check for newer ABS versions silently in the background at startup, notifying at exit if newer (default: `true`)                        |
 | `auto_update_on_startup`      | Check for newer ABS versions and automatically self-update synchronously at startup (default: `false`)                                  |
 | `self_update_at_updates`      | Check for newer ABS versions synchronously when `-U` is used and update before system packages (default: `false`)                       |
-| `self_update_raw_url`         | The raw Cargo.toml URL used to parse the latest version (default: `"https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml"`) |
+| `self_update_raw_url`         | The raw Cargo.toml URL used to parse the latest version (default: `"https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml"`) |
 | `self_update_use_pacman`      | When `true`, `--self-update` runs `makepkg` in `aur/` and upgrades pacman packages. When `false`, copies the `abs` binary to `self_update_install_path`. Unset = auto-detect from installed packages. |
 | `self_update_install_path`    | Fallback binary path when not using pacman packages (default: `"/usr/bin/abs"`)                                                         |
 

@@ -237,7 +237,7 @@ pub fn view<'a>(
                 "self_update_raw_url",
                 Some(field_help::SELF_UPDATE_RAW),
                 config.self_update_raw_url.as_deref().unwrap_or(""),
-                "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml",
+                "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml",
                 app_theme,
                 Message::SelfUpdateRawUrl,
             ),

@@ -76,7 +76,7 @@ fn default_self_update_install_path() -> String {
 }
 
 fn default_self_update_raw_url() -> String {
-    "https://raw.githubusercontent.com/John-CPP/ABS/master/Cargo.toml".to_string()
+    "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml".to_string()
 }
 
 fn default_ramdisk_enabled() -> bool {

@@ -6,7 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/John-CPP/ABS.git";
-const OFFICIAL_REPOSITORY_BRANCH: &str = "master";
+/// `HEAD` resolves to the remote's default branch, so updates keep working across branch renames.
+const OFFICIAL_REPOSITORY_BRANCH: &str = "HEAD";
 
 /// Parse `version` for the workspace `abs` package from raw Cargo.toml text.
 fn parse_cargo_toml_version(text: &str) -> Option<String> {
@@ -73,7 +74,8 @@ pub fn check_for_update(raw_url: &str) -> Result<(bool, String), String> {
 }
 
 fn pacman_installed(pkg: &str) -> bool {
-    run_command_quiet("pacman", &["-Q", pkg], None::<&str>).is_ok()
+    // Silent even at normal verbosity: this is an internal probe, not user-facing output.
+    run_command_with_output_silent("pacman", &["-Q", pkg], None::<&str>).is_ok()
 }
 
 fn should_use_pacman_update(config: &Config) -> bool {
@@ -364,6 +366,16 @@ name = "abs"
 version = "1.3.4"
 "#;
         assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("1.3.4"));
+    }
+
+    /// A stale absgui version breaks `cargo build --locked` in the AUR PKGBUILD after a
+    /// release bump, which makes pacman self-updates fail for every user.
+    #[test]
+    fn workspace_member_versions_stay_in_sync() {
+        let gui_manifest = include_str!("../absgui/Cargo.toml");
+        let gui_version = parse_cargo_toml_package_version(gui_manifest, "absgui")
+            .expect("absgui Cargo.toml has a version");
+        assert_eq!(gui_version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
