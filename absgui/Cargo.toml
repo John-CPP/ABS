@@ -1,6 +1,6 @@
 [package]
 name = "absgui"
-version = "1.3.5"
+version = "1.3.6"
 edition = "2021"
 license = "CC-BY-4.0"
 description = "GUI for ABS — Arch/CachyOS package builder"

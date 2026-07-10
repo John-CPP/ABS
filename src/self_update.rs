@@ -48,7 +48,7 @@ fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String>
 
 /// Fetch the latest version from raw GitHub Cargo.toml
 fn fetch_latest_version(raw_url: &str) -> Result<String, String> {
-    vlog!("Fetching latest version from {}...", raw_url);
+    vlog!("Checking upstream ABS release at {}...", raw_url);
     let start = std::time::Instant::now();
     let out = run_command_with_output_silent(
         "curl",
@@ -60,7 +60,7 @@ fn fetch_latest_version(raw_url: &str) -> Result<String, String> {
         ],
         None::<&str>,
     )?;
-    vlog!("Fetched latest version in {:?}", start.elapsed());
+    vlog!("Upstream ABS version check finished in {:?}", start.elapsed());
     parse_cargo_toml_version(&out)
         .ok_or_else(|| "Failed to parse version from remote Cargo.toml".to_string())
 }

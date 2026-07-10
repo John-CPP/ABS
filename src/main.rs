@@ -348,7 +348,7 @@ fn main() {
     let raw_url = config.self_update_raw_url.clone();
     // Skip redundant background update checks if we are running synchronous auto-updates,
     // or about to start an interactive build (PGO / kernel) where curl output would race with
-    // `sudo -v` on the same terminal.
+    // `sudo -v` on the same terminal, or when the invocation will exit immediately (e.g. `abs -v`).
     let skip_background = config.auto_update_on_startup
         || (config.self_update_at_updates && cli.system_update)
         || cli.pgo.is_some()
@@ -357,7 +357,8 @@ fn main() {
         || cli.pgo_abort.is_some()
         || cli.pgo_restart.is_some()
         || cli.pgo_goto
-        || cli.kernel_build.is_some();
+        || cli.kernel_build.is_some()
+        || (!will_run_without_packages(&cli) && cli.packages.is_empty());
     if config.check_for_update_on_startup && !skip_background {
         std::thread::spawn(move || {
             if let Ok((true, latest)) = self_update::check_for_update(&raw_url)
@@ -440,6 +441,14 @@ fn main() {
     let _ramdisk_shutdown = RamdiskShutdown;
     ramdisk::install_exit_handlers();
 
+    if cli.system_update && cli.install_only {
+        die!("--install-only cannot be used with -U");
+    }
+
+    if !will_run_without_packages(&cli) && cli.packages.is_empty() {
+        die_no_packages(&cli);
+    }
+
     if !cli.dry_run {
         if let Err(e) = prime_sudo_for_session() {
             ewarn!(
@@ -448,10 +457,6 @@ fn main() {
             );
         }
         spawn_sudo_keepalive();
-    }
-
-    if cli.system_update && cli.install_only {
-        die!("--install-only cannot be used with -U");
     }
 
     if cli.install_keys {
@@ -543,7 +548,7 @@ fn main() {
         let package_specs = parse_package_specs(&cli.packages);
 
         if package_specs.is_empty() {
-            die!("No packages specified.");
+            die_no_packages(&cli);
         }
 
         let skipped_install_after_compile_fail = run_compilations(package_specs.clone(), &cli, &config, defer_install_pass);
@@ -562,6 +567,24 @@ fn main() {
                 env!("CARGO_PKG_VERSION").yellow()
             );
         }
+}
+
+/// True when abs will do real work without naming packages on the command line (`-U`, `-R`, `-k`, …).
+fn will_run_without_packages(cli: &Cli) -> bool {
+    cli.system_update
+        || (cli.force_repo_update && cli.packages.is_empty())
+        || cli.install_keys
+        || cli.remove_chroot
+        || cli.clean_all
+}
+
+fn die_no_packages(cli: &Cli) -> ! {
+    if cli.verbose {
+        die!(
+            "No packages specified. (-v is verbose mode; use --version or --check-update for ABS version.)"
+        );
+    }
+    die!("No packages specified.");
 }
 
 fn run_compilations(
