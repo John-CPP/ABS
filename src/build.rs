@@ -824,6 +824,19 @@ pub fn should_run_manual_prebuild(
     }
 }
 
+/// Whether to force a rebuild even when PKGDEST already has matching artifacts.
+/// Precedence: CLI `-n` > per-package config > `[build].ignore_already_made_packages`.
+fn should_ignore_already_made(pkg: &str, cli: &Cli, config: &Config) -> bool {
+    if cli.force_build {
+        return true;
+    }
+    config
+        .packages
+        .get(pkg)
+        .and_then(|pc| pc.ignore_already_made_packages)
+        .unwrap_or(config.build.ignore_already_made_packages)
+}
+
 struct EffectiveConfig {
     build_env: String,
     skip_tests: bool,
@@ -1032,6 +1045,28 @@ pub fn process_package(
     )
     .pkg_dir;
     let repo_dir = repo_dir_path.as_path();
+
+    // Reuse PKGDEST artifacts when present unless -n / config forces a rebuild.
+    // Require artifact version >= PKGBUILD so a stale ready package (e.g. 5.2.3-1.2) does not
+    // skip rebuilding after upstream bumps pkgrel (5.2.3-2).
+    let src_ver = read_pkg_full_version_from_dir(repo_dir).ok();
+    if !should_ignore_already_made(pkg, cli, config)
+        && crate::install::has_ready_made_artifacts(
+            pkg,
+            base_pkg_name,
+            &config.paths.ready_made_packages_path,
+            src_ver.as_deref(),
+        )
+    {
+        blog!(
+            "Already-made packages found for {}; skipping compilation (use -n to rebuild)",
+            pkg
+        );
+        if !cli.compile_only && !install_deferred_this_run {
+            crate::install::install_artifacts(pkg, base_pkg_name, Some(repo_dir), config);
+        }
+        return true;
+    }
 
     // Bash `process_package` order: `prepare_repo` → `PRE_UPDATE_COMMANDS` → `prepare_sums_pkgrel` → build …
     // Rust mirrors that **except** we snapshot `PKGBUILD` here first (Bash has no separate backup file).
@@ -1696,5 +1731,137 @@ mod tests {
         std::fs::create_dir_all(tmp.join("root/var/lib/pacman/local")).unwrap();
         assert!(super::chroot_rootfs_is_complete(&tmp.join("root")));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn minimal_cli(force_build: bool) -> crate::cli::Cli {
+        crate::cli::Cli {
+            download_only: false,
+            local_build: false,
+            chroot_build: false,
+            compile_only: false,
+            no_check: false,
+            force_build,
+            clean: false,
+            clean_all: false,
+            use_sudo_clean: false,
+            remove_chroot: false,
+            install_keys: false,
+            update_sums: false,
+            verbose: false,
+            silent: false,
+            force_repo_update: false,
+            system_update: false,
+            repo: None,
+            jobs: None,
+            install_only: false,
+            clean_install: false,
+            dry_run: true,
+            list: false,
+            configure: None,
+            check_update: false,
+            self_update: false,
+            help: None,
+            ramdisk: None,
+            packages: vec![],
+            pgo: None,
+            pgo_resume: None,
+            pgo_status: None,
+            pgo_abort: None,
+            pgo_keep_stage: false,
+            pgo_restart: None,
+            pgo_stage: None,
+            pgo_once: false,
+            pgo_goto: false,
+            pgo_auto: false,
+            kernel_build: None,
+            ramdisk_shutdown: false,
+            json: false,
+            event_log: None,
+            purge: false,
+            yes: false,
+            no_wait: false,
+        }
+    }
+
+    fn config_with_ignore(
+        global: bool,
+        per_pkg: Option<bool>,
+    ) -> crate::config::Config {
+        let per_pkg_toml = match per_pkg {
+            Some(true) => "\n[packages.firefox]\nignore_already_made_packages = true\n",
+            Some(false) => "\n[packages.firefox]\nignore_already_made_packages = false\n",
+            None => "\n[packages]\n",
+        };
+        let toml_content = format!(
+            r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+ignore_already_made_packages = {global}
+
+[system_update]
+command_to_update_repositories = "pacman -Su"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+{per_pkg_toml}
+"#
+        );
+        toml::from_str(&toml_content).unwrap()
+    }
+
+    #[test]
+    fn should_ignore_already_made_precedence() {
+        // Default: respect artifacts (do not ignore).
+        let config = config_with_ignore(false, None);
+        assert!(!super::should_ignore_already_made(
+            "firefox",
+            &minimal_cli(false),
+            &config
+        ));
+
+        // Global true.
+        let config = config_with_ignore(true, None);
+        assert!(super::should_ignore_already_made(
+            "firefox",
+            &minimal_cli(false),
+            &config
+        ));
+
+        // Per-package false overrides global true.
+        let config = config_with_ignore(true, Some(false));
+        assert!(!super::should_ignore_already_made(
+            "firefox",
+            &minimal_cli(false),
+            &config
+        ));
+
+        // Per-package true overrides global false.
+        let config = config_with_ignore(false, Some(true));
+        assert!(super::should_ignore_already_made(
+            "firefox",
+            &minimal_cli(false),
+            &config
+        ));
+
+        // CLI -n wins over per-package false.
+        let config = config_with_ignore(false, Some(false));
+        assert!(super::should_ignore_already_made(
+            "firefox",
+            &minimal_cli(true),
+            &config
+        ));
     }
 }

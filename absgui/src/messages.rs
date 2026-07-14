@@ -148,6 +148,7 @@ pub enum Message {
     BuildIgnoreFailures(bool),
     BuildCompileFirstInstall(bool),
     BuildCleanInstallDefault(bool),
+    BuildIgnoreAlreadyMade(bool),
     BuildFastAurRpc(bool),
     BuildCleanChrootAfter(bool),
     CheckForUpdateOnStartup(Option<bool>),

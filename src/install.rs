@@ -7,19 +7,27 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-fn package_name_from_file(pkg_file: &Path) -> Option<String> {
+fn package_name_and_version_from_file(pkg_file: &Path) -> Option<(String, String)> {
     let output = run_command_with_output(
         "pacman",
         &["-Qp", pkg_file.to_string_lossy().as_ref()],
         None::<&str>,
     )
     .ok()?;
-    output.split_whitespace().next().map(|s| s.to_string())
+    let mut parts = output.split_whitespace();
+    let name = parts.next()?.to_string();
+    let ver = parts.next()?.to_string();
+    Some((name, ver))
+}
+
+fn package_name_from_file(pkg_file: &Path) -> Option<String> {
+    package_name_and_version_from_file(pkg_file).map(|(name, _)| name)
 }
 
 fn parse_pkgname_and_version(filename: &str) -> Option<(String, String)> {
     // Standard format is: <pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>
     // e.g. libntfs-3g-2026.2.25-1.2-x86_64.pkg.tar.zst
+    // Epoch (when non-zero) is embedded in pkgver: libfilezilla-1:0.56.1-1.2-x86_64.pkg.tar.zst
     let base = if let Some(idx) = filename.find(".pkg.tar.") {
         &filename[..idx]
     } else {
@@ -34,6 +42,15 @@ fn parse_pkgname_and_version(filename: &str) -> Option<(String, String)> {
     let pkgver = parts[len - 3];
     let pkgname = parts[..len - 3].join("-");
     Some((pkgname, format!("{}-{}", pkgver, pkgrel)))
+}
+
+/// Version for a ready artifact: prefer `pacman -Qp`, else parse the filename.
+fn artifact_version(path: &Path) -> Option<String> {
+    if let Some((_, ver)) = package_name_and_version_from_file(path) {
+        return Some(ver);
+    }
+    let fname = path.file_name()?.to_str()?;
+    parse_pkgname_and_version(fname).map(|(_, ver)| ver)
 }
 
 fn resolve_packagelist_line(
@@ -62,9 +79,10 @@ fn resolve_packagelist_line(
         return Some(p);
     }
 
-    // Fuzzy matching fallback for bumped/modified versions (e.g. pkgrel bumped during build)
+    // Fuzzy matching fallback for bumped/modified versions (e.g. pkgrel bumped during build).
+    // Never accept an artifact older than the packagelist target (avoids offering stale builds).
     let filename = p.file_name()?.to_str()?;
-    let (target_name, _) = parse_pkgname_and_version(filename)?;
+    let (target_name, target_ver) = parse_pkgname_and_version(filename)?;
 
     let mut best_match: Option<(PathBuf, String)> = None;
     if let Ok(entries) = fs::read_dir(ready_packages_path) {
@@ -75,16 +93,21 @@ fn resolve_packagelist_line(
             }
             if let Some(fname) = path.file_name().and_then(|n| n.to_str())
                 && let Some((name, ver)) = parse_pkgname_and_version(fname)
-                    && name == target_name {
-                        if let Some((_, best_ver)) = &best_match {
-                            if let Ok(cmp) = crate::utils::vercmp(&ver, best_ver)
-                                && cmp > 0 {
-                                    best_match = Some((path, ver));
-                                }
-                        } else {
-                            best_match = Some((path, ver));
-                        }
+                && name == target_name
+                && crate::utils::vercmp(&ver, &target_ver)
+                    .ok()
+                    .is_some_and(|c| c >= 0)
+            {
+                if let Some((_, best_ver)) = &best_match {
+                    if let Ok(cmp) = crate::utils::vercmp(&ver, best_ver)
+                        && cmp > 0
+                    {
+                        best_match = Some((path, ver));
                     }
+                } else {
+                    best_match = Some((path, ver));
+                }
+            }
         }
     }
 
@@ -211,6 +234,44 @@ fn collect_candidate_files_from_pkgdest_legacy(
     files.sort();
     files.dedup();
     files
+}
+
+/// True when PKGDEST already has at least one matching `.pkg.tar.*` for this package.
+///
+/// Uses name-prefix matching (no `makepkg --packagelist`), so it is safe before PKGBUILD mutation.
+/// When `min_version` is set, the primary package (`base_pkg_name` / `pkg_input`) must have an
+/// artifact at that version or newer — stale ready packages must not skip a rebuild after an
+/// upstream pkgrel/pkgver bump.
+pub fn has_ready_made_artifacts(
+    pkg_input: &str,
+    base_pkg_name: &str,
+    ready_packages_path: &str,
+    min_version: Option<&str>,
+) -> bool {
+    let files =
+        collect_candidate_files_from_pkgdest_legacy(pkg_input, base_pkg_name, ready_packages_path);
+    if files.is_empty() {
+        return false;
+    }
+    let Some(min_ver) = min_version else {
+        return true;
+    };
+
+    files.iter().any(|path| {
+        let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some((name, parsed_ver)) = parse_pkgname_and_version(fname) else {
+            return false;
+        };
+        if name != base_pkg_name && name != pkg_input {
+            return false;
+        }
+        let ver = artifact_version(path).unwrap_or(parsed_ver);
+        crate::utils::vercmp(&ver, min_ver)
+            .ok()
+            .is_some_and(|c| c >= 0)
+    })
 }
 
 fn collect_candidate_files(
@@ -594,6 +655,16 @@ mod tests {
         let resolved = resolve_packagelist_line(line, &repo_dir, ready_dir.to_str().unwrap());
         assert_eq!(resolved, Some(built_file));
 
+        // Older ready artifact must not satisfy a newer packagelist target.
+        let stale_only = ready_dir.join("qbittorrent-5.2.3-1.2-x86_64.pkg.tar.zst");
+        fs::write(&stale_only, "fake").unwrap();
+        let newer_line =
+            "/media/storage/packages/abs/ready/qbittorrent-5.2.3-2-x86_64.pkg.tar.zst";
+        assert_eq!(
+            resolve_packagelist_line(newer_line, &repo_dir, ready_dir.to_str().unwrap()),
+            None
+        );
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
@@ -621,5 +692,90 @@ mod tests {
             "linux-cachyos-lto-dbg",
             "linux-cachyos-lto"
         ));
+    }
+
+    #[test]
+    fn has_ready_made_artifacts_detects_pkgdest_prefix() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "abs_test_ready_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ready_dir = temp_dir.join("ready");
+        fs::create_dir_all(&ready_dir).unwrap();
+        let ready = ready_dir.to_str().unwrap();
+
+        assert!(!has_ready_made_artifacts(
+            "firefox",
+            "firefox",
+            ready,
+            None
+        ));
+
+        let artifact = ready_dir.join("firefox-140.0-1-x86_64.pkg.tar.zst");
+        fs::write(&artifact, "fake").unwrap();
+        assert!(has_ready_made_artifacts(
+            "firefox",
+            "firefox",
+            ready,
+            None
+        ));
+        // Alias/input name also matches when base name is in the filename prefix.
+        assert!(has_ready_made_artifacts(
+            "firefox-bin",
+            "firefox",
+            ready,
+            None
+        ));
+        assert!(!has_ready_made_artifacts(
+            "thunderbird",
+            "thunderbird",
+            ready,
+            None
+        ));
+
+        // Same or newer ready version may skip rebuild; older must not.
+        assert!(has_ready_made_artifacts(
+            "firefox",
+            "firefox",
+            ready,
+            Some("140.0-1")
+        ));
+        assert!(!has_ready_made_artifacts(
+            "firefox",
+            "firefox",
+            ready,
+            Some("140.0-2")
+        ));
+        // Split-package sibling alone does not satisfy the primary package check.
+        let nox = ready_dir.join("firefox-nox-140.0-2-x86_64.pkg.tar.zst");
+        fs::write(&nox, "fake").unwrap();
+        assert!(!has_ready_made_artifacts(
+            "firefox",
+            "firefox",
+            ready,
+            Some("140.0-2")
+        ));
+        // Bumped abs pkgrel (.2) satisfies unbumped PKGBUILD version.
+        let bumped = ready_dir.join("firefox-140.0-2.2-x86_64.pkg.tar.zst");
+        fs::write(&bumped, "fake").unwrap();
+        assert!(has_ready_made_artifacts(
+            "firefox",
+            "firefox",
+            ready,
+            Some("140.0-2")
+        ));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn parse_pkgname_handles_epoch_in_filename() {
+        assert_eq!(
+            parse_pkgname_and_version("libfilezilla-1:0.56.1-1.2-x86_64.pkg.tar.zst"),
+            Some(("libfilezilla".to_string(), "1:0.56.1-1.2".to_string()))
+        );
     }
 }

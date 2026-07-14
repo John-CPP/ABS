@@ -95,7 +95,7 @@ abs [FLAGS] [PACKAGE...]
 | `-h`                 | Chroot `makechrootpkg` build                                             |
 | `-o`                 | Compile only; skip install                                               |
 | `-t`                 | Skip tests (`--nocheck`)                                                 |
-| `-n`                 | Force rebuild                                                            |
+| `-n`                 | Force rebuild even if package artifacts already exist in PKGDEST         |
 | `-c`                 | Re-clone package repo                                                    |
 | `-u`                 | Run `updpkgsums` before build                                            |
 | `-e`                 | Full clean                                                               |
@@ -250,6 +250,7 @@ packages = false
 | `ignore_compilation_failures`      | Log warning and continue on build failure instead of aborting                    |
 | `compile_first_install_after`      | Build all packages first, then install — useful for unattended runs              |
 | `clean_install_by_default`         | Remove `src/` and `pkg/` before every compile                                    |
+| `ignore_already_made_packages`     | Always rebuild even if matching artifacts exist in `ready_made_packages_path` (default: `false`; use `-n` per run). Per-package override: `[packages.NAME] ignore_already_made_packages` |
 | `clean_chroot_after_compilation`   | Reset devtools chroot after each chroot build (default: `true`)                  |
 | `concurrent_compilations_limit`    | Max packages building at once (default: `1`)                                     |
 | `global_cpu_threads_mode`          | `strict` or `flexible` — how concurrent `-j` sums are capped (default: `strict`) |

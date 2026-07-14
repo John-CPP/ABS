@@ -180,6 +180,13 @@ pub fn view<'a>(
                 Message::BuildCleanInstallDefault,
             ),
             field_checkbox(
+                "ignore_already_made_packages",
+                Some(field_help::IGNORE_ALREADY_MADE),
+                config.build.ignore_already_made_packages,
+                app_theme,
+                Message::BuildIgnoreAlreadyMade,
+            ),
+            field_checkbox(
                 "fast_aur_rpc_update_checks",
                 Some(field_help::FAST_AUR_RPC),
                 config.build.fast_aur_rpc_update_checks,

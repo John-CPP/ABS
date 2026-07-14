@@ -137,6 +137,8 @@ pub const COMPILE_FIRST_INSTALL: &str =
     "After a successful compile, install the package before moving to dependents.";
 pub const CLEAN_INSTALL_DEFAULT: &str =
     "Default for clean install (-C) when not specified on the command line.";
+pub const IGNORE_ALREADY_MADE: &str =
+    "Always rebuild even when a ready package at the PKGBUILD version (or newer) already exists. When off, skip compilation and reuse those artifacts (unless -n). Stale older ready packages do not skip a rebuild.";
 pub const FAST_AUR_RPC: &str =
     "Use fast AUR RPC checks for update detection (fewer requests, may miss edge cases).";
 pub const CLEAN_CHROOT_AFTER: &str =

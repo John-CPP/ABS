@@ -140,6 +140,7 @@ mod tests {
                 ignore_compilation_failures: false,
                 compile_first_install_after: false,
                 clean_install_by_default: false,
+                ignore_already_made_packages: false,
                 concurrent_repos_downloads_limit: 1,
                 concurrent_compilations_limit: 1,
                 fast_aur_rpc_update_checks: false,

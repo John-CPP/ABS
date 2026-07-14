@@ -700,6 +700,9 @@ impl App {
             Message::BuildCleanInstallDefault(v) => {
                 self.config.build.clean_install_by_default = v;
             }
+            Message::BuildIgnoreAlreadyMade(v) => {
+                self.config.build.ignore_already_made_packages = v;
+            }
             Message::BuildFastAurRpc(v) => self.config.build.fast_aur_rpc_update_checks = v,
             Message::BuildCleanChrootAfter(v) => {
                 self.config.build.clean_chroot_after_compilation = v;

@@ -93,6 +93,8 @@ pub struct BuildSection {
     pub compile_first_install_after: bool,
     #[serde(default)]
     pub clean_install_by_default: bool,
+    #[serde(default)]
+    pub ignore_already_made_packages: bool,
     #[serde(default = "default_ten")]
     pub concurrent_repos_downloads_limit: usize,
     #[serde(default = "default_one")]
@@ -139,6 +141,7 @@ impl Default for BuildSection {
             ignore_compilation_failures: false,
             compile_first_install_after: false,
             clean_install_by_default: false,
+            ignore_already_made_packages: false,
             concurrent_repos_downloads_limit: default_ten(),
             concurrent_compilations_limit: 1,
             fast_aur_rpc_update_checks: true,
@@ -293,6 +296,8 @@ pub struct PackageSection {
     pub compile_alone: bool,
     #[serde(default = "default_compilation_priority", skip_serializing_if = "is_default_priority")]
     pub compilation_priority: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_already_made_packages: Option<bool>,
     // Tables last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<KernelSection>,

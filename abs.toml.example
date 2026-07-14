@@ -65,6 +65,9 @@ default_environment = "local"
 ignore_compilation_failures = false
 compile_first_install_after = false
 clean_install_by_default = false
+# When false (default), skip compilation if matching .pkg.tar.* already exist in
+# ready_made_packages_path and install those instead (unless -o). Use -n or set true to force rebuild.
+ignore_already_made_packages = false
 concurrent_repos_downloads_limit = 10
 # Maximum number of clean chroot compilations to run concurrently
 concurrent_compilations_limit = 1
@@ -103,6 +106,8 @@ default = "arch"
 # upstream_prereleases = true
 # build_env = "local"
 # tests = true
+# Override [build].ignore_already_made_packages for this package (true = always rebuild).
+# ignore_already_made_packages = true
 # pre_update_command = "rm -rf mozbuild"
 # post_update_command = ""
 # Per-package ramdisk targets when [ramdisk].enabled = true (replaces global build_workdir/chroot/packages for this package):

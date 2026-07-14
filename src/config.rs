@@ -213,6 +213,11 @@ pub struct BuildConfig {
     /// Before **`makepkg`**, remove **`src/`** and **`pkg/`** in the package directory. **`--clean-install`** enables the same for that invocation even when this is false.
     #[serde(default)]
     pub clean_install_by_default: bool,
+    /// When true, always rebuild even if version-matching artifacts already exist in
+    /// `ready_made_packages_path`. When false (default), skip compilation and reuse those
+    /// artifacts (still install unless `-o`). Overridden by `-n` and per-package settings.
+    #[serde(default)]
+    pub ignore_already_made_packages: bool,
     /// Maximum number of repository directories to sync concurrently.
     #[serde(default = "default_concurrent_repos_downloads_limit")]
     pub concurrent_repos_downloads_limit: usize,
@@ -323,6 +328,10 @@ pub struct PackageConfig {
     /// Higher value → scheduled earlier among ready packages.
     #[serde(default = "default_compilation_priority")]
     pub compilation_priority: usize,
+    /// When set, overrides `[build].ignore_already_made_packages` for this package.
+    /// `true` = always rebuild; `false` = reuse PKGDEST artifacts when present.
+    #[serde(default)]
+    pub ignore_already_made_packages: Option<bool>,
 }
 
 /// GUI-friendly kernel build options; each field maps to a CachyOS PKGBUILD env var.
@@ -891,6 +900,10 @@ impl Config {
             self.build.clean_install_by_default
         );
         println!(
+            "  ignore_already_made_packages: {}",
+            self.build.ignore_already_made_packages
+        );
+        println!(
             "  concurrent_repos_downloads_limit: {}",
             self.build.concurrent_repos_downloads_limit
         );
@@ -1092,6 +1105,9 @@ impl Config {
             if cfg.compilation_priority != default_compilation_priority() {
                 println!("    compilation_priority: {}", cfg.compilation_priority);
             }
+            if let Some(v) = cfg.ignore_already_made_packages {
+                println!("    ignore_already_made_packages: {}", v);
+            }
         }
     }
 }
@@ -1144,6 +1160,48 @@ compilation_priority = 10
         assert_eq!(pkg.compilation_threads, Some(8));
         assert!(pkg.compile_alone);
         assert_eq!(pkg.compilation_priority, 10);
+        assert!(!config.build.ignore_already_made_packages);
+        assert!(pkg.ignore_already_made_packages.is_none());
+    }
+
+    #[test]
+    fn test_parse_ignore_already_made_packages() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+ignore_already_made_packages = true
+
+[system_update]
+command_to_update_repositories = "pacman -Su"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages.firefox]
+ignore_already_made_packages = false
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.build.ignore_already_made_packages);
+        assert_eq!(
+            config
+                .packages
+                .get("firefox")
+                .and_then(|p| p.ignore_already_made_packages),
+            Some(false)
+        );
     }
 
     #[test]
