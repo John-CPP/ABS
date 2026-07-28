@@ -43,6 +43,7 @@ size = "16G"
 # Directory permissions for the tmpfs mount root (octal, e.g. 0755).
 mode = "0755"
 # During each build, symlink src/ and pkg/ under the package directory to per-package dirs on tmpfs (compile I/O in RAM).
+# Also redirects ccache / TMPDIR / Cargo / Go / npm / pip caches onto `$mount_point/cache` so they do not write to the SSD.
 # Default for all packages when no per-package override is set. Use per-package `ramdisk = "wcp"` to override.
 build_workdir = false
 # Use tmpfs for chroot_base_path during makechrootpkg (-h) builds instead of the disk path in [paths].

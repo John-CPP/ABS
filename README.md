@@ -191,7 +191,7 @@ Optional tmpfs/ramdisk support to speed up compiles and reduce disk wear. Disk `
 | `mount_point`              | Absolute path for the tmpfs mount (default: `/run/abs-ram`)                                                              |
 | `size`                     | tmpfs size passed to `mount -o size=` (default: `16G`)                                                                   |
 | `mode`                     | Directory mode for the mount (default: `0755`)                                                                           |
-| `build_workdir`            | Symlink each package's `src/` and `pkg/` to tmpfs during builds (default: `false`)                                       |
+| `build_workdir`            | Symlink each package's `src/` and `pkg/` to tmpfs during builds; also redirects ccache/TMPDIR/Cargo/Go/npm/pip caches to `$mount_point/cache` (default: `false`) |
 | `chroot`                   | Use tmpfs for `chroot_base_path` during chroot builds (default: `false`)                                                 |
 | `packages`                 | Move entire `packages_path` to tmpfs — high RAM use (default: `false`)                                                   |
 | `seed_chroot_from`         | Optional disk path to `rsync` into the ram chroot before first use (full copy). **Unset = fresh `mkarchroot` on RAM**    |

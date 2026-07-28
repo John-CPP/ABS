@@ -62,7 +62,7 @@ pub const RAMDISK_R: &str =
 pub const KERNEL_RAMDISK_TARGETS: &str =
     "Kernel/PGO ramdisk options. PKGBUILD and source tarballs stay on disk unless repo-on-ramdisk (p) is enabled.";
 pub const KERNEL_RAMDISK_W: &str =
-    "Compile on ramdisk: git repo and downloads stay on disk; src/ and pkg/ (extracted tree) use tmpfs.";
+    "Compile on ramdisk: git repo and downloads stay on disk; src/ and pkg/ (extracted tree) use tmpfs. Also redirects ccache, TMPDIR, and other build caches to the ramdisk.";
 pub const KERNEL_RAMDISK_P: &str =
     "Repo on ramdisk: clone the full git tree on tmpfs (re-downloads on each PGO stage — not recommended).";
 pub const KERNEL_RAMDISK_R: &str =
@@ -200,7 +200,7 @@ pub const RAMDISK_ENABLED: &str =
 pub const RAMDISK_MOUNT: &str = "Filesystem path where the tmpfs ramdisk is mounted.";
 pub const RAMDISK_SIZE: &str = "Tmpfs size limit (e.g. 16G). Passed to mount -o size=.";
 pub const RAMDISK_MODE: &str = "Directory permissions mode for the mount point (octal).";
-pub const RAMDISK_GLOBAL_W: &str = "Default: put build workdirs (src/, pkg/) on tmpfs for packages that use ramdisk w.";
+pub const RAMDISK_GLOBAL_W: &str = "Default: put build workdirs (src/, pkg/) on tmpfs for packages that use ramdisk w. Also redirects ccache/TMPDIR and similar caches onto the ramdisk.";
 pub const RAMDISK_GLOBAL_C: &str = "Default: put chroot rootfs on tmpfs for packages that use ramdisk c.";
 pub const RAMDISK_GLOBAL_P: &str =
     "Default: clone sources under packages_path on tmpfs for packages that use ramdisk p.";
