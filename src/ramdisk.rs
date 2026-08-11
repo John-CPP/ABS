@@ -5,7 +5,6 @@ use crate::utils::{
     resolve_path_for_deletion, run_command, validate_config_path,
 };
 use crate::{blog, die, ewarn, is_dry_run_mode, vlog};
-use colored::Colorize;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
@@ -579,10 +578,87 @@ fn unmount_tmpfs(mount_point: &Path, unmount_on_shutdown: bool) {
 }
 
 fn ramdisk_mount_subdirs(mount_point: &Path) -> Vec<PathBuf> {
-    ["work", "chroot", "packages"]
+    ["work", "chroot", "packages", "cache"]
         .iter()
         .map(|sub| mount_point.join(sub))
         .collect()
+}
+
+/// Subdirectories under `$mount/cache/` for compiler/tool scratch when `w` is active.
+const BUILD_CACHE_SUBDIRS: &[&str] = &[
+    "ccache",
+    "ccache-tmp",
+    "tmp",
+    "sccache",
+    "go-build",
+    "gomod",
+    "cargo",
+    "npm",
+    "pip",
+];
+
+fn prepare_build_cache_tree(cache_root: &Path) -> Result<(), String> {
+    ensure_ramdisk_subdir(cache_root)?;
+    for sub in BUILD_CACHE_SUBDIRS {
+        ensure_ramdisk_subdir(&cache_root.join(sub))?;
+    }
+    Ok(())
+}
+
+/// Format shell env assignments that redirect compiler/tool caches onto `cache_root`.
+///
+/// Used when compilation runs on tmpfs (`w`) so ccache and similar do not hammer the SSD.
+pub fn format_build_cache_env(cache_root: &Path) -> String {
+    let q = |p: PathBuf| crate::utils::sh_single_quote(&p.to_string_lossy());
+    format!(
+        "XDG_CACHE_HOME={root} \
+CCACHE_DIR={ccache} \
+CCACHE_TEMPDIR={ccache_tmp} \
+SCCACHE_DIR={sccache} \
+TMPDIR={tmp} \
+TEMP={tmp} \
+TMP={tmp} \
+GOCACHE={go} \
+GOMODCACHE={gomod} \
+CARGO_HOME={cargo} \
+npm_config_cache={npm} \
+NPM_CONFIG_CACHE={npm} \
+PIP_CACHE_DIR={pip} ",
+        root = q(cache_root.to_path_buf()),
+        ccache = q(cache_root.join("ccache")),
+        ccache_tmp = q(cache_root.join("ccache-tmp")),
+        sccache = q(cache_root.join("sccache")),
+        tmp = q(cache_root.join("tmp")),
+        go = q(cache_root.join("go-build")),
+        gomod = q(cache_root.join("gomod")),
+        cargo = q(cache_root.join("cargo")),
+        npm = q(cache_root.join("npm")),
+        pip = q(cache_root.join("pip")),
+    )
+}
+
+/// When `w` (build workdir) is active, create `$mount/cache/` and return env assignments
+/// redirecting ccache / TMPDIR / language build caches onto the ramdisk.
+pub fn build_cache_env(targets: &RamdiskTargets) -> String {
+    if !targets.build_workdir {
+        return String::new();
+    }
+    let Some(session) = session_ref() else {
+        return String::new();
+    };
+    let cache_root = session.mount_point.join("cache");
+    if let Err(e) = prepare_build_cache_tree(&cache_root) {
+        crate::ewarn!(
+            "Failed to prepare ramdisk build cache at {}: {e}",
+            cache_root.display()
+        );
+        return String::new();
+    }
+    blog!(
+        "Ramdisk (w): redirecting build caches (ccache, TMPDIR, …) → {}",
+        cache_root.display()
+    );
+    format_build_cache_env(&cache_root)
 }
 
 /// Install Ctrl+C / SIGTERM handlers that unmount the ramdisk before exiting.
@@ -591,6 +667,8 @@ pub fn install_exit_handlers() {
         return;
     }
     let on_interrupt = || {
+        // Clear any in-progress `\r` progress line so the warning is not glued to leftover text.
+        eprint!("\r\x1b[2K");
         eprintln!(
             "==> WARNING: Interrupted (abs {}); stopping builds (ramdisk kept mounted for retry)...",
             env!("CARGO_PKG_VERSION")
@@ -607,25 +685,37 @@ pub fn install_exit_handlers() {
     if let Err(e) = ctrlc::set_handler(on_interrupt) {
         ewarn!("Failed to install ramdisk interrupt handler: {}", e);
     }
+
+    // SIGTERM: only flip an AtomicBool in the handler (async-signal-safe). A watcher thread
+    // performs the same cleanup as Ctrl+C — never allocate/lock/print inside the signal handler.
+    static SIGTERM_REQUESTED: AtomicBool = AtomicBool::new(false);
     unsafe {
+        // SAFETY: handler only stores to an AtomicBool; no locks, alloc, or I/O.
         extern "C" fn on_sigterm(_: libc::c_int) {
-            eprintln!(
-                "==> WARNING: Terminated (abs {}); stopping builds (ramdisk kept mounted for retry)...",
-                env!("CARGO_PKG_VERSION")
-            );
-            crate::utils::terminate_foreground_children();
-            if let Some(session) = session_ref() {
-                crate::utils::kill_processes_with_cwd_under(&session.mount_point, "ramdisk");
-            }
-            crate::pkgbuild::restore_pending_pkgbuilds();
-            crate::utils::restore_terminal();
-            shutdown_on_interrupt();
-            unsafe {
-                libc::_exit(143);
-            }
+            SIGTERM_REQUESTED.store(true, Ordering::SeqCst);
         }
         libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
     }
+    std::thread::spawn(|| {
+        loop {
+            if SIGTERM_REQUESTED.swap(false, Ordering::SeqCst) {
+                eprint!("\r\x1b[2K");
+                eprintln!(
+                    "==> WARNING: Terminated (abs {}); stopping builds (ramdisk kept mounted for retry)...",
+                    env!("CARGO_PKG_VERSION")
+                );
+                crate::utils::terminate_foreground_children();
+                if let Some(session) = session_ref() {
+                    crate::utils::kill_processes_with_cwd_under(&session.mount_point, "ramdisk");
+                }
+                crate::pkgbuild::restore_pending_pkgbuilds();
+                crate::utils::restore_terminal();
+                shutdown_on_interrupt();
+                std::process::exit(143);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
 }
 
 /// Mount tmpfs when a package task needs ramdisk targets (`w`/`c`/`p`/`r`). No-op when no target
@@ -635,7 +725,11 @@ pub fn ensure_for_targets(config: &Config, targets: &RamdiskTargets) -> Result<(
     if !targets.any() {
         return Ok(());
     }
-    if session_ref().is_some() {
+
+    // Hold the session lock for check+mount so parallel workers cannot both pass
+    // `session_ref().is_none()` and remount/reclaim tmpfs while the other is cloning onto it.
+    let mut guard = session_lock().lock().unwrap();
+    if guard.is_some() {
         return Ok(());
     }
 
@@ -646,10 +740,12 @@ pub fn ensure_for_targets(config: &Config, targets: &RamdiskTargets) -> Result<(
         );
     }
 
-    mount_session(config)
+    let session = mount_session(config)?;
+    *guard = Some(session);
+    Ok(())
 }
 
-fn mount_session(config: &Config) -> Result<(), String> {
+fn mount_session(config: &Config) -> Result<RamdiskSession, String> {
     let available = mem_available_mb()?;
     if available < config.ramdisk.min_free_ram_mb {
         die!(
@@ -679,14 +775,11 @@ fn mount_session(config: &Config) -> Result<(), String> {
     let extra = ramdisk_mount_subdirs(&mount_point);
     append_deletable_roots(&extra)?;
 
-    let session = RamdiskSession {
+    Ok(RamdiskSession {
         config: config.ramdisk.clone(),
         mount_point,
         unmount_on_shutdown,
-    };
-
-    *session_lock().lock().unwrap() = Some(session);
-    Ok(())
+    })
 }
 
 pub fn is_session_active() -> bool {
@@ -993,6 +1086,18 @@ mod tests {
     fn pgo_scratch_path_under_mount() {
         let p = pgo_scratch_path(Path::new("/run/abs-ram"), "linux-cachyos");
         assert_eq!(p, PathBuf::from("/run/abs-ram/pgo-scratch/linux-cachyos"));
+    }
+
+    #[test]
+    fn format_build_cache_env_sets_ccache_and_tmpdir() {
+        let env = format_build_cache_env(Path::new("/run/abs-ram/cache"));
+        assert!(env.contains("CCACHE_DIR='/run/abs-ram/cache/ccache'"));
+        assert!(env.contains("CCACHE_TEMPDIR='/run/abs-ram/cache/ccache-tmp'"));
+        assert!(env.contains("TMPDIR='/run/abs-ram/cache/tmp'"));
+        assert!(env.contains("XDG_CACHE_HOME='/run/abs-ram/cache'"));
+        assert!(env.contains("CARGO_HOME='/run/abs-ram/cache/cargo'"));
+        assert!(env.contains("GOCACHE='/run/abs-ram/cache/go-build'"));
+        assert!(env.ends_with(' '));
     }
 
     #[test]

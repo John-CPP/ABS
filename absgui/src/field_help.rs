@@ -193,6 +193,18 @@ pub const SYS_IGNORE_FLAG: &str = "Flag passed to pacman to skip specific packag
 pub const SYS_IGNORE_PACKAGES: &str =
     "Package names excluded from system upgrades (paired with ignore_flag). Supports globs such as qemu*.";
 
+// --- Held packages ---
+
+pub const HELD_PACKAGES: &str =
+    "Packages pinned to a fixed pkgver-pkgrel. Ignored during system update and not version-compared on -R/-RU. Rebuild with abs <pkg> or when on_packages_updated triggers drift (checked on -U).";
+pub const HELD_NAME: &str = "Package name to hold.";
+pub const HELD_VERSION: &str =
+    "Pinned version as pkgver-pkgrel (epoch allowed in pkgver, e.g. 1:0.56.1-1).";
+pub const HELD_TRIGGERS: &str =
+    "Comma-separated triggers: name or name=pkgver-pkgrel. When these packages change outside ABS, -U recompiles the held package. Use Snapshot triggers to fill blank versions from pacman -Q.";
+pub const HELD_CHECK: &str =
+    "Compare held and trigger versions to currently installed packages (runs abs --hold-check).";
+
 // --- Ramdisk (global) ---
 
 pub const RAMDISK_ENABLED: &str =

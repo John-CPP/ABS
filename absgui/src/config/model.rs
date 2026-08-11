@@ -36,6 +36,10 @@ pub struct ConfigDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_install_packages_after_compilation: Option<Vec<String>>,
 
+    /// Packages pinned to a fixed pkgver-pkgrel (mirrors CLI `held_packages`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_packages: Vec<HeldPackage>,
+
     // Tables (declared last).
     pub paths: PathsSection,
     #[serde(default)]
@@ -55,6 +59,66 @@ pub struct ConfigDocument {
 
 fn default_config_version() -> u32 {
     1
+}
+
+/// A package held at a fixed version with optional auto-recompile triggers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HeldPackage {
+    pub name: String,
+    /// `pkgver-pkgrel` (epoch may be embedded in pkgver).
+    pub version: String,
+    #[serde(default)]
+    pub auto_recompile_trigger: AutoRecompileTrigger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutoRecompileTrigger {
+    /// Trigger package name -> last recorded installed version.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub on_packages_updated: HashMap<String, String>,
+}
+
+impl HeldPackage {
+    /// Serialize triggers as `name=version` (or bare `name`) entries, comma-separated.
+    pub fn triggers_text(&self) -> String {
+        let mut pairs: Vec<_> = self
+            .auto_recompile_trigger
+            .on_packages_updated
+            .iter()
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        pairs
+            .into_iter()
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parse triggers from commas and/or newlines (`name` or `name=version`).
+    pub fn set_triggers_from_text(&mut self, text: &str) {
+        let mut map = HashMap::new();
+        for part in text.split(|c: char| c == ',' || c == '\n') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((name, ver)) = part.split_once('=') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    map.insert(name.to_string(), ver.trim().to_string());
+                }
+            } else {
+                map.insert(part.to_string(), String::new());
+            }
+        }
+        self.auto_recompile_trigger.on_packages_updated = map;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,6 +552,7 @@ impl Default for ConfigDocument {
             manual_update_packages: Vec::new(),
             skip_install_packages: Vec::new(),
             skip_install_packages_after_compilation: None,
+            held_packages: Vec::new(),
             paths: PathsSection::default(),
             ramdisk: RamdiskSection::default(),
             build: BuildSection::default(),

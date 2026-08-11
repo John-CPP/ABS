@@ -103,7 +103,15 @@ fn pacman_packages_to_upgrade() -> Vec<&'static str> {
     pkgs
 }
 
-fn find_pkg_artifact(aur_dir: &Path, pkg: &str) -> Result<PathBuf, String> {
+/// True when `filename` is a non-debug package for `pkg` at `pkgver` (any pkgrel/arch).
+/// e.g. `abs-1.3.7-1-x86_64.pkg.tar.zst` for pkg=`abs`, pkgver=`1.3.7`.
+fn is_pkg_artifact_for_version(filename: &str, pkg: &str, pkgver: &str) -> bool {
+    filename.starts_with(&format!("{pkg}-{pkgver}-"))
+        && filename.ends_with(".pkg.tar.zst")
+        && !filename.contains("-debug-")
+}
+
+fn find_pkg_artifacts_for_version(aur_dir: &Path, pkg: &str, pkgver: &str) -> Result<Vec<PathBuf>, String> {
     let mut matches = Vec::new();
     for entry in fs::read_dir(aur_dir).map_err(|e| format!("read {}: {e}", aur_dir.display()))? {
         let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
@@ -114,20 +122,55 @@ fn find_pkg_artifact(aur_dir: &Path, pkg: &str) -> Result<PathBuf, String> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.starts_with(&format!("{pkg}-"))
-            && name.ends_with(".pkg.tar.zst")
-            && !name.contains("-debug-")
-        {
+        if is_pkg_artifact_for_version(name, pkg, pkgver) {
             matches.push(path);
         }
     }
     matches.sort();
-    matches
-        .pop()
-        .ok_or_else(|| format!("no built package artifact for {pkg} in {}", aur_dir.display()))
+    Ok(matches)
 }
 
-fn run_pacman_self_update(repo_dir: &Path) -> Result<(), String> {
+fn find_pkg_artifact(aur_dir: &Path, pkg: &str, pkgver: &str) -> Result<PathBuf, String> {
+    find_pkg_artifacts_for_version(aur_dir, pkg, pkgver)?
+        .pop()
+        .ok_or_else(|| {
+            format!(
+                "no built package artifact for {pkg} {pkgver} in {}",
+                aur_dir.display()
+            )
+        })
+}
+
+/// Split-package leftovers for this `pkgver` block `makepkg` without `-f`.
+/// Remove them only when we are about to rebuild (not when reusing a complete set).
+fn remove_pkg_artifacts_for_version(aur_dir: &Path, pkgver: &str) -> Result<(), String> {
+    for pkg in ["abs", "absgui", "abs-full"] {
+        for path in find_pkg_artifacts_for_version(aur_dir, pkg, pkgver)? {
+            fs::remove_file(&path).map_err(|e| {
+                format!("failed to remove leftover {}: {e}", path.display())
+            })?;
+            vlog!("Removed leftover package artifact {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn try_ready_pkg_artifacts(
+    aur_dir: &Path,
+    pkgs: &[&str],
+    pkgver: &str,
+) -> Option<Vec<PathBuf>> {
+    let mut artifacts = Vec::with_capacity(pkgs.len());
+    for pkg in pkgs {
+        match find_pkg_artifact(aur_dir, pkg, pkgver) {
+            Ok(path) => artifacts.push(path),
+            Err(_) => return None,
+        }
+    }
+    Some(artifacts)
+}
+
+fn run_pacman_self_update(repo_dir: &Path, expected_version: &str) -> Result<(), String> {
     let aur_dir = repo_dir.join("aur");
     if !aur_dir.join("PKGBUILD").exists() {
         return Err(format!(
@@ -136,18 +179,29 @@ fn run_pacman_self_update(repo_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    blog!("Building pacman packages from {}...", aur_dir.display());
-    run_command(
-        "makepkg",
-        &["-Csr", "--noconfirm"],
-        Some(&aur_dir),
-    )?;
-
     let to_install = pacman_packages_to_upgrade();
-    let mut artifacts = Vec::new();
-    for pkg in &to_install {
-        artifacts.push(find_pkg_artifact(&aur_dir, pkg)?);
-    }
+    let artifacts = if let Some(ready) = try_ready_pkg_artifacts(&aur_dir, &to_install, expected_version)
+    {
+        blog!(
+            "Using already-built pacman packages for {}...",
+            expected_version
+        );
+        ready
+    } else {
+        // Partial same-version artifacts make makepkg exit with "already been built".
+        remove_pkg_artifacts_for_version(&aur_dir, expected_version)?;
+        blog!("Building pacman packages from {}...", aur_dir.display());
+        run_command(
+            "makepkg",
+            &["-Csr", "--noconfirm"],
+            Some(&aur_dir),
+        )?;
+        let mut built = Vec::new();
+        for pkg in &to_install {
+            built.push(find_pkg_artifact(&aur_dir, pkg, expected_version)?);
+        }
+        built
+    };
 
     blog!(
         "Installing pacman package(s): {}",
@@ -330,7 +384,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
     let repo_dir = sync_source_repo(config, &latest)?;
 
     if should_use_pacman_update(config) {
-        match run_pacman_self_update(&repo_dir) {
+        match run_pacman_self_update(&repo_dir, &latest) {
             Ok(()) => {
                 blog!(
                     "ABS successfully updated to version {} via pacman!",
@@ -366,6 +420,36 @@ name = "abs"
 version = "1.3.4"
 "#;
         assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("1.3.4"));
+    }
+
+    #[test]
+    fn detects_ready_pkg_artifact_for_version() {
+        assert!(is_pkg_artifact_for_version(
+            "abs-1.3.7-1-x86_64.pkg.tar.zst",
+            "abs",
+            "1.3.7"
+        ));
+        assert!(is_pkg_artifact_for_version(
+            "absgui-1.3.7-1-x86_64.pkg.tar.zst",
+            "absgui",
+            "1.3.7"
+        ));
+        assert!(!is_pkg_artifact_for_version(
+            "abs-1.3.6-1-x86_64.pkg.tar.zst",
+            "abs",
+            "1.3.7"
+        ));
+        assert!(!is_pkg_artifact_for_version(
+            "abs-1.3.7-debug-1-x86_64.pkg.tar.zst",
+            "abs",
+            "1.3.7"
+        ));
+        // Prefix collision: absgui must not match pkg "abs"
+        assert!(!is_pkg_artifact_for_version(
+            "absgui-1.3.7-1-x86_64.pkg.tar.zst",
+            "abs",
+            "1.3.7"
+        ));
     }
 
     /// A stale absgui version breaks `cargo build --locked` in the AUR PKGBUILD after a

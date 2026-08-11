@@ -4,8 +4,10 @@ mod build_env;
 mod cli;
 mod compile_scheduler;
 mod config;
+mod config_edit;
 mod dep_graph;
 mod git;
+mod held;
 mod install;
 mod package_spec;
 mod package_pattern;
@@ -18,6 +20,7 @@ mod self_update;
 mod system;
 mod upstream;
 mod utils;
+mod wizard;
 
 use std::sync::{Arc, Mutex};
 
@@ -244,6 +247,7 @@ fn run_deferred_install_phase(
 #[macro_export]
 macro_rules! die {
     ($($arg:tt)*) => {{
+        use colored::Colorize;
         eprintln!("{} {}", "==> ERROR:".red(), format!($($arg)*));
         $crate::pkgbuild::restore_pending_pkgbuilds();
         $crate::utils::wait_before_exit_if_needed();
@@ -255,7 +259,7 @@ macro_rules! die {
 #[macro_export]
 macro_rules! ewarn {
     ($($arg:tt)*) => {
-        eprintln!("{} {}", "==> WARNING:".yellow(), format!($($arg)*));
+        $crate::utils::emit_ewarn(&format!($($arg)*));
     };
 }
 
@@ -263,7 +267,7 @@ macro_rules! ewarn {
 macro_rules! blog {
     ($($arg:tt)*) => {
         if $crate::verbosity() >= $crate::Verbosity::Normal {
-            println!("{} {}", "==>".blue(), format!($($arg)*));
+            $crate::utils::emit_blog(&format!($($arg)*));
         }
     };
 }
@@ -309,6 +313,31 @@ fn main() {
     }
 
     let config = config::Config::load_config();
+
+    if cli.wizard.is_some() {
+        wizard::run_wizard(&cli, &config);
+        return;
+    }
+    if cli.list_add.is_some() {
+        wizard::run_list_add(&cli);
+        return;
+    }
+    if cli.list_remove.is_some() {
+        wizard::run_list_remove(&cli);
+        return;
+    }
+    if cli.hold.is_some() {
+        wizard::run_hold_cli(&cli, &config);
+        return;
+    }
+    if !cli.unhold.is_empty() {
+        wizard::run_unhold(&cli);
+        return;
+    }
+    if cli.hold_check {
+        wizard::run_hold_check(&cli, &config);
+        return;
+    }
 
     if cli.check_update {
         match self_update::check_for_update(&config.self_update_raw_url) {
@@ -510,9 +539,20 @@ fn main() {
             .map(|s| s.name)
             .collect();
 
+        // Detect trigger drift from packages updated outside ABS since last snapshot.
+        let mut held_rebuild: Vec<package_spec::PackageSpec> = held_specs_for_drifts(&config);
+        let mut held_queued: HashSet<String> =
+            held_rebuild.iter().map(|s| s.name.clone()).collect();
+
         if config.build.system_update_first {
             blog!("Performing system update before compilation...");
             system::run_system_update(&config, system::SystemUpdateMode::PerformUpdateWithRefresh);
+            // Pacman may have updated trigger packages during -Syu.
+            for spec in held_specs_for_drifts(&config) {
+                if held_queued.insert(spec.name.clone()) {
+                    held_rebuild.push(spec);
+                }
+            }
         }
 
         if cli.force_repo_update {
@@ -525,15 +565,30 @@ fn main() {
             if cli_package_names.contains(pkg) {
                 continue;
             }
+            if held_queued.contains(pkg) {
+                continue;
+            }
             if build::should_run_manual_prebuild(pkg, &cli, &config) {
                 system_specs.push(package_spec::PackageSpec::plain(pkg));
             }
         }
+        system_specs.extend(held_rebuild);
 
-        let skipped_install_after_compile_fail = run_compilations(system_specs.clone(), &cli, &config, defer_install_pass);
+        if system_specs.is_empty() {
+            refresh_held_trigger_versions_from_system(&config);
+        }
+
+        let skipped_install_after_compile_fail =
+            run_compilations(system_specs.clone(), &cli, &config, defer_install_pass);
 
         if defer_install_pass {
-            run_deferred_install_phase(&system_specs, &skipped_install_after_compile_fail, &cli, &config, false);
+            run_deferred_install_phase(
+                &system_specs,
+                &skipped_install_after_compile_fail,
+                &cli,
+                &config,
+                false,
+            );
         }
 
         if !config.build.system_update_first {
@@ -543,6 +598,18 @@ fn main() {
                 system::SystemUpdateMode::PerformUpdateWithRefresh
             };
             system::run_system_update(&config, mode);
+            // Reload so trigger snapshots match what the first compile pass wrote.
+            let config_after = config::Config::load_config();
+            let post_held = held_specs_for_drifts(&config_after);
+            if !post_held.is_empty() {
+                blog!("Recompiling held packages after system update (trigger drift)...");
+                let skipped = run_compilations(post_held.clone(), &cli, &config_after, defer_install_pass);
+                if defer_install_pass {
+                    run_deferred_install_phase(&post_held, &skipped, &cli, &config_after, false);
+                }
+            } else {
+                refresh_held_trigger_versions_from_system(&config_after);
+            }
         }
     } else {
         let package_specs = parse_package_specs(&cli.packages);
@@ -593,5 +660,51 @@ fn run_compilations(
     config: &config::Config,
     defer_install_pass: bool,
 ) -> std::collections::HashSet<String> {
-    compile_scheduler::run_compilations(specs, cli, config, defer_install_pass)
+    let mut specs = specs;
+    held::apply_held_overrides_to_specs(&mut specs, config);
+    let result = compile_scheduler::run_compilations(specs, cli, config, defer_install_pass);
+    // Refresh trigger version snapshots for any installed packages that are triggers.
+    refresh_held_trigger_versions_from_system(config);
+    result
+}
+
+/// After compiles/installs (or system updates), persist current `pacman -Q` versions for
+/// any package that appears as an `on_packages_updated` trigger.
+fn refresh_held_trigger_versions_from_system(config: &config::Config) {
+    let triggers = held::all_trigger_names(config);
+    if triggers.is_empty() {
+        return;
+    }
+    let names: Vec<String> = triggers.into_iter().collect();
+    let snapshot = held::snapshot_trigger_versions(&names);
+    if snapshot.is_empty() {
+        return;
+    }
+    if config_edit::update_trigger_versions(&snapshot) {
+        vlog!("Updated held_packages on_packages_updated trigger versions in config");
+    }
+}
+
+/// Collect held packages whose triggers drifted; log and return compile specs.
+fn held_specs_for_drifts(config: &config::Config) -> Vec<package_spec::PackageSpec> {
+    let drifts = held::detect_trigger_drifts(config);
+    if drifts.is_empty() {
+        return Vec::new();
+    }
+    for d in &drifts {
+        blog!(
+            "Held package {} @ {}: on_packages_updated trigger drift — will recompile",
+            d.held_name,
+            d.held_version
+        );
+        for (trig, saved, installed) in &d.changed {
+            blog!(
+                "  {}: saved={} installed={}",
+                trig,
+                saved,
+                installed.as_deref().unwrap_or("(missing)")
+            );
+        }
+    }
+    held::specs_for_trigger_drifts(&drifts)
 }

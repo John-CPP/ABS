@@ -1,10 +1,10 @@
 use crate::utils::{check_sudo_removal, run_command};
-use crate::{die, ewarn, vlog};
-use colored::Colorize;
+use crate::{blog, die, ewarn, vlog};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 /// One `abs` process may call `prepare_repo(..., force_update: true)` many times for the same
@@ -157,6 +157,63 @@ impl PrepareRepoResult {
     }
 }
 
+/// True when `dir` looks like a usable git working tree / clone (survives Ctrl+C mid-clone checks).
+fn is_usable_git_repo(dir: &Path) -> bool {
+    if !dir.join(".git").exists() {
+        return false;
+    }
+    Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Remove a partial/corrupt clone left behind by an interrupted `git clone`.
+fn scrub_incomplete_git_repo(repo_dir: &Path, label: &str) -> Result<(), String> {
+    if !repo_dir.exists() {
+        return Ok(());
+    }
+    if is_usable_git_repo(repo_dir) {
+        return Ok(());
+    }
+    ewarn!(
+        "Incomplete git repository at {} (often left by Ctrl+C during clone); removing so {} can be re-cloned...",
+        repo_dir.display(),
+        label
+    );
+    check_sudo_removal(repo_dir)
+}
+
+/// `git clone` with one automatic scrub+retry if the destination was left half-written.
+fn clone_git_repo(clone_url: &str, repo_dir: &Path) -> Result<(), String> {
+    let dest = repo_dir.to_string_lossy().to_string();
+    // `-q` avoids "Cloning into..." / progress on the shared parallel console; ABS already logs.
+    let attempt = || run_command("git", &["clone", "-q", clone_url, &dest], None::<&str>);
+    if let Err(e) = attempt() {
+        // Interrupted clones often leave a broken dest; wipe and try once more.
+        let _ = check_sudo_removal(repo_dir);
+        if let Err(e2) = attempt() {
+            return Err(format!(
+                "git clone failed for {clone_url} → {} ({e}); retry after scrub also failed: {e2}",
+                repo_dir.display()
+            ));
+        }
+    }
+    if !is_usable_git_repo(repo_dir) {
+        let _ = check_sudo_removal(repo_dir);
+        return Err(format!(
+            "git clone produced an unusable repository at {}",
+            repo_dir.display()
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_repo(
     pkg_name: &str,
@@ -182,24 +239,24 @@ pub fn prepare_repo(
             }
         }
 
+        if let Err(e) = scrub_incomplete_git_repo(&repo_dir, base_pkg_name) {
+            die!("Failed to remove incomplete repository {}: {}", repo_dir.display(), e);
+        }
+
         if !repo_dir.exists() {
             let clone_url = format!("{}/{}.git", repo_url.trim_end_matches('/'), base_pkg_name);
-            vlog!(
+            blog!(
                 "Cloning {} package repo {}...",
                 repo_key.to_uppercase(),
                 base_pkg_name
             );
-            if let Err(e) = git_run(
-                "git",
-                &["clone", &clone_url, repo_dir.to_string_lossy().as_ref()],
-                None,
-            ) {
+            if let Err(e) = clone_git_repo(&clone_url, &repo_dir) {
                 die!("Failed to clone repository {}: {}", clone_url, e);
             }
             sync_action = RepoSyncAction::Cloned;
             shared_repo_remote_note_updated(&repo_dir);
         } else if force_update
-            && repo_dir.join(".git").exists()
+            && is_usable_git_repo(&repo_dir)
             && !shared_repo_remote_already_updated(&repo_dir)
         {
             vlog!(
@@ -207,7 +264,7 @@ pub fn prepare_repo(
                 repo_key.to_uppercase(),
                 base_pkg_name
             );
-            match git_run("git", &["pull", "--ff-only"], Some(repo_dir.as_path())) {
+            match git_run("git", &["pull", "--ff-only", "-q"], Some(repo_dir.as_path())) {
                 Ok(()) => {
                     sync_action = RepoSyncAction::Updated;
                     shared_repo_remote_note_updated(&repo_dir);
@@ -231,20 +288,25 @@ pub fn prepare_repo(
         }
     }
 
-    if !repo_dir.join(".git").exists() {
-        vlog!("Cloning repository '{}'...", repo_name);
-        if let Err(e) = git_run(
-            "git",
-            &["clone", repo_url, repo_dir.to_string_lossy().as_ref()],
-            None,
-        ) {
+    if let Err(e) = scrub_incomplete_git_repo(&repo_dir, repo_name) {
+        die!("Failed to remove incomplete repository {}: {}", repo_dir.display(), e);
+    }
+
+    if !is_usable_git_repo(&repo_dir) {
+        if repo_dir.exists()
+            && let Err(e) = check_sudo_removal(&repo_dir)
+        {
+            die!("Failed to clean repository directory: {}", e);
+        }
+        blog!("Cloning repository '{}'...", repo_name);
+        if let Err(e) = clone_git_repo(repo_url, &repo_dir) {
             die!("Failed to clone repository {}: {}", repo_url, e);
         }
         sync_action = RepoSyncAction::Cloned;
         shared_repo_remote_note_updated(&repo_dir);
     } else if force_update && !shared_repo_remote_already_updated(&repo_dir) {
         loop {
-            if git_run("git", &["pull", "--ff-only"], Some(repo_dir.as_path())).is_ok() {
+            if git_run("git", &["pull", "--ff-only", "-q"], Some(repo_dir.as_path())).is_ok() {
                 sync_action = RepoSyncAction::Updated;
                 shared_repo_remote_note_updated(&repo_dir);
                 break;
@@ -275,11 +337,7 @@ pub fn prepare_repo(
                     if let Err(e) = check_sudo_removal(&repo_dir) {
                         die!("Failed to clean repository directory: {}", e);
                     }
-                    if let Err(e) = run_command(
-                        "git",
-                        &["clone", repo_url, repo_dir.to_string_lossy().as_ref()],
-                        None::<&str>,
-                    ) {
+                    if let Err(e) = clone_git_repo(repo_url, &repo_dir) {
                         die!("Failed to clone repository {}: {}", repo_url, e);
                     }
                     sync_action = RepoSyncAction::Cloned;
@@ -312,8 +370,10 @@ pub fn prepare_repo(
 
 #[cfg(test)]
 mod tests {
-    use super::find_pkg_dir_in_list;
+    use super::{find_pkg_dir_in_list, is_usable_git_repo};
+    use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
 
     fn dirs(names: &[&str]) -> Vec<PathBuf> {
         names.iter().map(|n| PathBuf::from("/repo").join(n)).collect()
@@ -345,5 +405,40 @@ mod tests {
     fn no_match_returns_none() {
         let list = dirs(&["firefox", "vim"]);
         assert!(find_pkg_dir_in_list(&list, "mesa").is_none());
+    }
+
+    #[test]
+    fn is_usable_git_repo_rejects_partial_clone_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "abs_partial_git_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+        // `.git` exists but is not a valid repo (no HEAD/config) — classic Ctrl+C mid-clone.
+        assert!(!is_usable_git_repo(&tmp));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_usable_git_repo_accepts_real_git_init() {
+        let tmp = std::env::temp_dir().join(format!(
+            "abs_real_git_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let status = Command::new("git")
+            .args(["init"])
+            .current_dir(&tmp)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(is_usable_git_repo(&tmp));
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

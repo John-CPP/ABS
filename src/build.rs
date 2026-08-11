@@ -36,6 +36,15 @@ fn ramdisk_srcdest_env(repo_dir: &Path, targets: &ramdisk::RamdiskTargets) -> St
     )
 }
 
+/// Env prefix for local/PGO makepkg: persistent SRCDEST (when needed) plus ramdisk cache redirects.
+fn ramdisk_makepkg_env_prefix(repo_dir: &Path, targets: &ramdisk::RamdiskTargets) -> String {
+    format!(
+        "{}{}",
+        ramdisk_srcdest_env(repo_dir, targets),
+        ramdisk::build_cache_env(targets)
+    )
+}
+
 fn normalize_repo_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -373,7 +382,7 @@ fn run_build_with_key_retry(
     let mut seen_keys: HashSet<String> = HashSet::new();
 
     loop {
-        match run_shell_in_dir_with_tee(repo_dir, build_cmd, opts) {
+        match run_shell_in_dir_with_tee(repo_dir, build_cmd, &opts) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if pkgbuild_phase_failed_re.is_match(&err) {
@@ -413,6 +422,28 @@ fn run_build_with_key_retry(
                 crate::blog!("Retrying build after importing PGP keys...");
             }
         }
+    }
+}
+
+/// Build shell opts; when parallel console isolation is active, always attach `[pkg]` prefixes
+/// and avoid per-build `script` PTYs (those share the terminal and wipe labels).
+fn shell_run_opts_for_pkg(
+    pkg: &str,
+    live_output: bool,
+    heartbeat_label: Option<&'static str>,
+) -> ShellRunOpts {
+    let output_label = if crate::utils::parallel_console_mode() {
+        // Prefer TLS label from the worker; fall back to the package name.
+        Some(
+            crate::utils::current_output_label().unwrap_or_else(|| pkg.to_string()),
+        )
+    } else {
+        crate::utils::current_output_label()
+    };
+    ShellRunOpts {
+        live_output,
+        heartbeat_label,
+        output_label,
     }
 }
 
@@ -790,6 +821,10 @@ pub fn report_manual_update_versions(config: &Config, cli: &Cli) {
     vlog!("PKGBUILD vs installed (manual_update_packages):");
     let mut pkgbuild_cache = PkgbuildDirCache::new();
     for pkg in &config.manual_update_packages {
+        if crate::held::is_held(config, pkg) {
+            blog!("{}: held @ {} (skipped version compare)", pkg, crate::held::find_held(config, pkg).map(|h| h.version.as_str()).unwrap_or("?"));
+            continue;
+        }
         match classify_manual_pkg_version(pkg, cli, config, &mut pkgbuild_cache) {
             Ok(line) => print_manual_version_line(pkg, line),
             Err(e) => {
@@ -804,6 +839,9 @@ pub fn should_run_manual_prebuild(
     cli: &Cli,
     config: &Config,
 ) -> bool {
+    if crate::held::is_held(config, pkg) {
+        return false;
+    }
     if cli.force_build {
         return true;
     }
@@ -977,6 +1015,15 @@ pub fn process_package(
     compilation_threads: Option<usize>,
 ) -> bool {
     let pkg = spec.name.as_str();
+    // Prefer an existing worker label; otherwise set one when parallel console mode is on.
+    // Hold the guard through the whole function body (explicit drop at the end).
+    let output_label_guard = if crate::utils::current_output_label().is_none()
+        && crate::utils::parallel_console_mode()
+    {
+        Some(crate::utils::OutputLabelGuard::new(Some(pkg.to_string())))
+    } else {
+        None
+    };
     let pkg_config = config.packages.get(pkg);
     let ramdisk_targets = match ramdisk::resolve_ramdisk_targets(
         config,
@@ -1172,7 +1219,17 @@ pub fn process_package(
     if let Some(cmd) = custom_cmd {
         ensure_pkgsource_pgp_keys(build_dir);
         blog!("Executing custom build command...");
-        if let Err(e) = run_build_with_key_retry(&cmd, build_dir, ShellRunOpts::default()) {
+        let env_prefix = ramdisk_makepkg_env_prefix(repo_dir, &ramdisk_targets);
+        let cmd = if env_prefix.is_empty() {
+            cmd
+        } else {
+            format!("{env_prefix}{cmd}")
+        };
+        if let Err(e) = run_build_with_key_retry(
+            &cmd,
+            build_dir,
+            shell_run_opts_for_pkg(pkg, false, None),
+        ) {
             if config.build.ignore_compilation_failures {
                 ewarn!("Custom build command failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -1184,7 +1241,7 @@ pub fn process_package(
         ensure_pkgsource_pgp_keys(build_dir);
         blog!("Building locally with makepkg...");
 
-        let mut env_prefix = ramdisk_srcdest_env(repo_dir, &ramdisk_targets);
+        let mut env_prefix = ramdisk_makepkg_env_prefix(repo_dir, &ramdisk_targets);
         // Keeps the wrapper makepkg.conf alive until the build command finished.
         let mut _limiter_guard = None;
         if let Some(n) = threads {
@@ -1219,7 +1276,11 @@ pub fn process_package(
 
         build_cmd = strip_makepkg_cleanbuild_in_shell(&build_cmd);
 
-        if let Err(e) = run_build_with_key_retry(&build_cmd, build_dir, ShellRunOpts::default()) {
+        if let Err(e) = run_build_with_key_retry(
+            &build_cmd,
+            build_dir,
+            shell_run_opts_for_pkg(pkg, false, None),
+        ) {
             if config.build.ignore_compilation_failures {
                 ewarn!("makepkg failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -1286,10 +1347,7 @@ pub fn process_package(
         crate::utils::phase_banner(format!(
             "makechrootpkg: installing dependencies and building {pkg} (large packages can take 30+ minutes)"
         ));
-        let chroot_opts = ShellRunOpts {
-            live_output: true,
-            heartbeat_label: Some("makechrootpkg"),
-        };
+        let chroot_opts = shell_run_opts_for_pkg(pkg, true, Some("makechrootpkg"));
         let chroot_result = run_build_with_key_retry(&build_cmd, repo_dir, chroot_opts);
         if let Err(e) = crate::build_env::apply_chroot_parallel_dropin(&chrootdir, &copy_name, None)
         {
@@ -1323,6 +1381,7 @@ pub fn process_package(
     // instead of only at scope end; `Drop` becomes a no-op once backup is consumed.
     restore_pkgbuild(repo_dir);
 
+    drop(output_label_guard);
     true
 }
 
@@ -1347,14 +1406,14 @@ fn format_pgo_makepkg_cmd(
         .map(|(k, v)| format!("{}={}", k, crate::utils::sh_single_quote(v)))
         .collect::<Vec<_>>()
         .join(" ");
-    let srcdest = ramdisk_srcdest_env(repo_dir, targets);
+    let ramdisk_env = ramdisk_makepkg_env_prefix(repo_dir, targets);
     let pkgdest = format!(
         "PKGDEST={}",
         crate::utils::sh_single_quote(&config.paths.ready_made_packages_path)
     );
     let mut parts = Vec::new();
-    if !srcdest.is_empty() {
-        parts.push(srcdest.trim().to_string());
+    if !ramdisk_env.is_empty() {
+        parts.push(ramdisk_env.trim().to_string());
     }
     if let Some(env) = limiter_env {
         parts.push(env);
@@ -1506,7 +1565,11 @@ pub fn process_package_pgo(
         format!("$ (cd {} && {build_cmd})", build_dir.display()),
     );
 
-    if let Err(e) = run_build_with_key_retry(&build_cmd, build_dir, ShellRunOpts::default()) {
+    if let Err(e) = run_build_with_key_retry(
+        &build_cmd,
+        build_dir,
+        shell_run_opts_for_pkg(pkg, false, None),
+    ) {
         if !pgo.defer_pkgbuild_restore {
             restore_pkgbuild(repo_dir);
         }
@@ -1780,6 +1843,15 @@ mod tests {
             purge: false,
             yes: false,
             no_wait: false,
+            list_add: None,
+            list_remove: None,
+            wizard: None,
+            pkg_list: None,
+            hold: None,
+            hold_version: None,
+            unhold: vec![],
+            hold_check: false,
+            trigger: vec![],
         }
     }
 

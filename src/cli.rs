@@ -192,4 +192,42 @@ pub struct Cli {
     /// Skip confirmation prompts (used with --purge)
     #[arg(long, short = 'y', action = ArgAction::SetTrue)]
     pub yes: bool,
+
+    /// Add packages to a config list (`manual_update_packages`, `skip_install_packages`,
+    /// `skip_install_packages_after_compilation`, `ignore_packages`). Aliases: manual, skip, skip_after, ignore.
+    #[arg(long, value_name = "LIST")]
+    pub list_add: Option<String>,
+
+    /// Remove packages from a config list (see `--list-add`)
+    #[arg(long, value_name = "LIST")]
+    pub list_remove: Option<String>,
+
+    /// Interactive config wizard. Optional ACTION: `add`, `remove`, `edit`, `hold`.
+    /// Prefill with `--pkg-list`, `--hold-version`, `--trigger`, and package args.
+    #[arg(long, value_name = "ACTION", num_args = 0..=1, default_missing_value = "")]
+    pub wizard: Option<String>,
+
+    /// Package list name for `--wizard` / list ops prefill (same names as `--list-add`)
+    #[arg(long, value_name = "LIST")]
+    pub pkg_list: Option<String>,
+
+    /// Hold PACKAGE at `--hold-version` (optional `--trigger` for on_packages_updated)
+    #[arg(long, value_name = "PACKAGE")]
+    pub hold: Option<String>,
+
+    /// Version to hold (`pkgver-pkgrel`, epoch allowed in pkgver)
+    #[arg(long, value_name = "PKGVER-PKGREL")]
+    pub hold_version: Option<String>,
+
+    /// Remove packages from `held_packages`
+    #[arg(long, value_name = "PACKAGE", num_args = 1.., action = ArgAction::Append)]
+    pub unhold: Vec<String>,
+
+    /// Show held package versions vs installed and trigger drift
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub hold_check: bool,
+
+    /// Trigger package(s) for hold `on_packages_updated` (comma-separated or repeatable)
+    #[arg(long, value_name = "PKG", action = ArgAction::Append)]
+    pub trigger: Vec<String>,
 }

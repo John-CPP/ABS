@@ -4,7 +4,6 @@ use crate::git::prepare_repo;
 use crate::pkgbuild::apply_pkgbuild_overrides;
 use crate::utils::{run_command_with_output, vercmp};
 use crate::{blog, ewarn, vlog};
-use colored::Colorize;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
