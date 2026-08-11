@@ -1,5 +1,4 @@
 use crate::die;
-use colored::Colorize;
 use std::collections::HashMap;
 
 /// Per-package request parsed from CLI positional args such as `xray[repo=aur,pkgver=26.5.9]`.

@@ -144,4 +144,39 @@ mod tests {
         let parsed: ConfigDocument = toml::from_str(&text).expect("parse");
         assert_eq!(parsed.manual_update_packages, doc.manual_update_packages);
     }
+
+    #[test]
+    fn held_packages_roundtrip_through_toml() {
+        use crate::config::{AutoRecompileTrigger, HeldPackage};
+        use std::collections::HashMap;
+
+        let mut doc = ConfigDocument::default();
+        doc.held_packages.push(HeldPackage {
+            name: "libfoo".into(),
+            version: "1.2.3-1".into(),
+            auto_recompile_trigger: AutoRecompileTrigger {
+                on_packages_updated: HashMap::from([
+                    ("glibc".into(), "2.41-1".into()),
+                    ("icu".into(), "76.1-1".into()),
+                ]),
+            },
+        });
+        let text = toml::to_string_pretty(&doc).expect("serialize");
+        assert!(text.contains("libfoo"));
+        assert!(text.contains("1.2.3-1"));
+        assert!(text.contains("glibc"));
+        let parsed: ConfigDocument = toml::from_str(&text).expect("parse");
+        assert_eq!(parsed.held_packages.len(), 1);
+        assert_eq!(parsed.held_packages[0].name, "libfoo");
+        assert_eq!(
+            parsed.held_packages[0]
+                .auto_recompile_trigger
+                .on_packages_updated
+                .get("glibc")
+                .map(String::as_str),
+            Some("2.41-1")
+        );
+        let text_form = parsed.held_packages[0].triggers_text();
+        assert!(text_form.contains("glibc=2.41-1"));
+    }
 }

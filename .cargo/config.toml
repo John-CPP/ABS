@@ -1,0 +1,8 @@
+# Cargo aliases for this workspace (optional convenience).
+# Prefer `make fast` / `make release` — see Makefile.
+
+[alias]
+# Optimized build without LTO (quick operability checks). Output: target/fast/
+fast = "build --profile fast"
+# Full release profile (thin LTO). Output: target/release/
+rel = "build --release"

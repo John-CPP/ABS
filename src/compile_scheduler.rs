@@ -8,7 +8,6 @@ use crate::package_spec::PackageSpec;
 use crate::pkgbuild;
 use crate::ramdisk;
 use crate::vlog;
-use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex};
 
@@ -71,8 +70,10 @@ pub fn run_compilations(
     let sorted_specs = match dep_graph::sort_packages_topologically(&specs, cli, config) {
         Ok(sorted) => sorted,
         Err(e) => {
-            crate::ewarn!("Dependency sort failed: {}. Falling back to default order.", e);
-            specs.clone()
+            crate::die!(
+                "Dependency sort failed: {}. Refusing to build in an unsafe order.",
+                e
+            );
         }
     };
 
@@ -112,6 +113,15 @@ pub fn run_compilations(
         slot_limit,
     };
 
+    // Keep the guard alive for the entire worker scope. A leading-underscore binding can be
+    // dropped early by NLL (last "use" is construction), which would clear parallel console
+    // mode and fall back to `script` PTYs — shared TTY progress bars then collide.
+    let parallel_console = crate::utils::ParallelConsoleModeGuard::enter();
+    crate::blog!(
+        "Parallel console isolation on ({} workers); build lines prefixed with [package]",
+        slot_limit
+    );
+
     std::thread::scope(|scope| {
         for worker_id in 0..slot_limit {
             let state = &state;
@@ -122,6 +132,7 @@ pub fn run_compilations(
             });
         }
     });
+    drop(parallel_console);
 
     let guard = state.lock().unwrap();
     for base in &guard.failed {
@@ -174,12 +185,22 @@ fn build_job_graph(sorted_specs: &[PackageSpec], cli: &Cli, config: &Config) -> 
     }
 
     let mut deps_map = HashMap::new();
+    // Map pkgname/provides → job base so split-package deps resolve to the producing job.
+    let mut provider_to_base: HashMap<String, String> = HashMap::new();
+    for (base, pkg_dir) in &pkg_dirs {
+        provider_to_base.insert(base.clone(), base.clone());
+        for provided in pkgbuild::parse_pkg_provided_names(pkg_dir.as_path()) {
+            provider_to_base.insert(provided, base.clone());
+        }
+    }
     for (base, pkg_dir) in pkg_dirs {
         let all_deps = pkgbuild::parse_pkg_dependencies(pkg_dir.as_path());
         let mut filtered = HashSet::new();
         for dep in all_deps {
-            if jobs.contains_key(&dep) && dep != base {
-                filtered.insert(dep);
+            if let Some(dep_base) = provider_to_base.get(&dep)
+                && dep_base != &base
+            {
+                filtered.insert(dep_base.clone());
             }
         }
         deps_map.insert(base, filtered);
@@ -205,8 +226,14 @@ fn worker_loop(
                 if guard.pending.is_empty() && guard.active.is_empty() {
                     return;
                 }
-                let picked = pick_next_job(&guard, shared)
-                    .or_else(|| force_pick_if_stalled(&guard, shared));
+                let picked = pick_next_job(&guard, shared).or_else(|| {
+                    let stalled = detect_stalled_job(&guard, shared)?;
+                    crate::die!(
+                        "Parallel compile: {} has unsatisfiable dependencies (cycle or missing \
+                         provider mapping). Refusing to start it out of order.",
+                        stalled
+                    );
+                });
                 if let Some(base) = picked {
                     let job = shared.jobs.get(&base).unwrap().clone();
                     guard.pending.remove(&base);
@@ -223,6 +250,8 @@ fn worker_loop(
             }
         };
 
+        // Keep label guard alive across the whole package build (avoid early NLL drop).
+        let label_guard = crate::utils::OutputLabelGuard::new(Some(job.spec.name.clone()));
         crate::blog!(
             "Processing package [Worker {}]: {}",
             worker_id,
@@ -237,6 +266,7 @@ fn worker_loop(
             Some(&chroot_copy),
             job.threads,
         );
+        drop(label_guard);
 
         {
             let mut guard = state.lock().unwrap();
@@ -277,29 +307,26 @@ fn drain_blocked_pending(
     }
 }
 
-/// Deadlock breaker: nothing is building, yet no pending job has satisfiable dependencies
-/// (a dependency cycle survived the topological-sort fallback). Waiting would hang every
-/// worker forever, so force-start the best pending job while ignoring its dependencies —
-/// once it finishes, the rest of the cycle unblocks normally.
-fn force_pick_if_stalled(state: &SchedulerState, shared: &SchedulerShared<'_>) -> Option<String> {
+/// Detect a scheduler stall: nothing active, yet no pending job has satisfiable dependencies
+/// (cycle or incomplete provider mapping). Callers must fail closed rather than ignore deps.
+fn detect_stalled_job(state: &SchedulerState, shared: &SchedulerShared<'_>) -> Option<String> {
     if !state.active.is_empty() || state.pending.is_empty() {
         return None;
     }
-    let mut candidates: Vec<CompilationJob> = state
+    let mut candidates: Vec<&CompilationJob> = state
         .pending
         .iter()
-        .filter_map(|base| shared.jobs.get(base).cloned())
+        .filter_map(|base| shared.jobs.get(base))
         .collect();
     if candidates.is_empty() {
         return None;
     }
-    sort_ready(&mut candidates);
-    let picked = &candidates[0];
-    crate::ewarn!(
-        "Parallel compile: {} has unsatisfiable dependencies (cycle?); starting it anyway.",
-        picked.base_name
-    );
-    Some(picked.base_name.clone())
+    candidates.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.base_name.cmp(&b.base_name))
+    });
+    Some(candidates[0].base_name.clone())
 }
 
 fn pick_next_job(state: &SchedulerState, shared: &SchedulerShared<'_>) -> Option<String> {
@@ -656,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_cycle_is_force_started_instead_of_deadlocking() {
+    fn dependency_cycle_is_detected_as_stall() {
         let jobs = HashMap::from([
             ("a".to_string(), job("a", Some(2), false, 1)),
             ("b".to_string(), job("b", Some(2), false, 5)),
@@ -674,12 +701,12 @@ mod tests {
         };
         let sh = shared(&jobs, &deps_map, CAPS_STRICT_10, 2);
         assert!(pick_next_job(&state, &sh).is_none());
-        // Higher-priority cycle member is force-started.
-        assert_eq!(force_pick_if_stalled(&state, &sh), Some("b".to_string()));
+        // Higher-priority cycle member is reported; callers die instead of force-starting.
+        assert_eq!(detect_stalled_job(&state, &sh), Some("b".to_string()));
     }
 
     #[test]
-    fn no_force_pick_while_builds_are_active() {
+    fn no_stall_detect_while_builds_are_active() {
         let jobs = HashMap::from([("a".to_string(), job("a", Some(2), false, 1))]);
         let deps_map = HashMap::from([(
             "a".to_string(),
@@ -696,7 +723,7 @@ mod tests {
             exclusive_alone: false,
         };
         let sh = shared(&jobs, &deps_map, CAPS_STRICT_10, 2);
-        assert!(force_pick_if_stalled(&state, &sh).is_none());
+        assert!(detect_stalled_job(&state, &sh).is_none());
     }
 
     #[test]

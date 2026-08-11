@@ -8,7 +8,6 @@ use crate::utils::{
     run_command, run_command_with_output, sh_single_quote,
 };
 use crate::{blog, die, ewarn, vlog};
-use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};

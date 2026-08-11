@@ -21,6 +21,9 @@ pub struct Config {
     /// `skip_install_packages` for backward compatibility with older configs.
     #[serde(default)]
     pub skip_install_packages_after_compilation: Option<Vec<String>>,
+    /// Packages pinned to a fixed pkgver-pkgrel; ignored on system update and not version-compared.
+    #[serde(default)]
+    pub held_packages: Vec<HeldPackage>,
     pub packages: HashMap<String, PackageConfig>,
     #[serde(default = "default_check_for_update_on_startup")]
     pub check_for_update_on_startup: bool,
@@ -256,6 +259,23 @@ pub struct BuildConfig {
     pub self_update_raw_url: Option<String>,
     pub self_update_install_path: Option<String>,
     pub install_testing_phase_archlinux_packages: Option<bool>,
+}
+
+/// A package held at a fixed version with optional auto-recompile triggers.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HeldPackage {
+    pub name: String,
+    /// `pkgver-pkgrel` (epoch may be embedded in pkgver, e.g. `1:0.56.1-1`).
+    pub version: String,
+    #[serde(default)]
+    pub auto_recompile_trigger: AutoRecompileTrigger,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AutoRecompileTrigger {
+    /// Trigger package name -> last recorded installed version (`pkgver-pkgrel`).
+    #[serde(default)]
+    pub on_packages_updated: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,10 +563,15 @@ pub fn expand_user_path(raw: &str) -> PathBuf {
 
 const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
 
-fn user_config_path() -> PathBuf {
+pub fn user_config_path() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("abs").join("abs.toml"))
         .unwrap_or_else(|| die!("Could not determine config directory ($XDG_CONFIG_HOME)"))
+}
+
+/// Ensure the user config file exists (seed from example if missing) and return its path.
+pub fn ensure_config_file() -> PathBuf {
+    ensure_user_config_exists()
 }
 
 fn ensure_user_config_exists() -> PathBuf {
@@ -782,6 +807,14 @@ impl Config {
                 "Invalid [build] global_cpu_threads_mode: {:?} (expected \"strict\" or \"flexible\")",
                 cpu_mode
             ),
+        }
+        for held in &self.held_packages {
+            if held.name.trim().is_empty() {
+                die!("held_packages entry has empty name");
+            }
+            if let Err(e) = crate::held::split_pkgver_pkgrel(&held.version) {
+                die!("held_packages[{}]: {}", held.name, e);
+            }
         }
         for (pkg_name, pkg) in &self.packages {
             if let Some(be) = &pkg.build_env {
@@ -1025,6 +1058,30 @@ impl Config {
             }
         }
 
+        println!("\n{}", "Held Packages".green().bold());
+        if self.held_packages.is_empty() {
+            println!("  (none)");
+        } else {
+            for held in &self.held_packages {
+                println!("  - {} @ {}", held.name, held.version);
+                if !held.auto_recompile_trigger.on_packages_updated.is_empty() {
+                    let mut triggers: Vec<_> = held
+                        .auto_recompile_trigger
+                        .on_packages_updated
+                        .iter()
+                        .collect();
+                    triggers.sort_by(|a, b| a.0.cmp(b.0));
+                    print!("      on_packages_updated:");
+                    for (i, (name, ver)) in triggers.iter().enumerate() {
+                        if i == 0 {
+                            println!();
+                        }
+                        println!("        {} = {}", name, ver);
+                    }
+                }
+            }
+        }
+
         println!("\n{}", "Compilers".green().bold());
         if self.compilers.is_empty() {
             println!("  (none)");
@@ -1115,6 +1172,53 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn test_parse_held_packages() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[[held_packages]]
+name = "libfoo"
+version = "1.2.3-1"
+
+[held_packages.auto_recompile_trigger.on_packages_updated]
+glibc = "2.41-1"
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Su"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.held_packages.len(), 1);
+        assert_eq!(config.held_packages[0].name, "libfoo");
+        assert_eq!(config.held_packages[0].version, "1.2.3-1");
+        assert_eq!(
+            config.held_packages[0]
+                .auto_recompile_trigger
+                .on_packages_updated
+                .get("glibc")
+                .unwrap(),
+            "2.41-1"
+        );
+    }
 
     #[test]
     fn test_parse_cpu_scheduler_config() {

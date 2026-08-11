@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::utils::{run_command, run_command_with_output, run_command_with_output_env};
 use crate::{blog, ewarn, vlog};
-use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -28,10 +27,9 @@ fn parse_pkgname_and_version(filename: &str) -> Option<(String, String)> {
     // Standard format is: <pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>
     // e.g. libntfs-3g-2026.2.25-1.2-x86_64.pkg.tar.zst
     // Epoch (when non-zero) is embedded in pkgver: libfilezilla-1:0.56.1-1.2-x86_64.pkg.tar.zst
-    let base = if let Some(idx) = filename.find(".pkg.tar.") {
+    let base = {
+        let idx = filename.find(".pkg.tar.")?;
         &filename[..idx]
-    } else {
-        return None;
     };
     let parts: Vec<&str> = base.split('-').collect();
     if parts.len() < 4 {
@@ -114,8 +112,14 @@ fn resolve_packagelist_line(
     best_match.map(|(path, _)| path)
 }
 
-/// True when a built package name belongs to this PGO stage's `pkgbase` (e.g. `linux-cachyos-dbg`
-/// yes, `linux-cachyos-lto` no when pkgbase is `linux-cachyos`).
+/// Common same-PKGBUILD split suffixes (`pkgbase-dbg`, `pkgbase-headers`, …).
+/// Open-ended prefix matching is unsafe: `mesa-utils` must not match pkgbase `mesa`.
+const SPLIT_PKG_SUFFIXES: &[&str] = &[
+    "dbg", "debug", "headers", "docs", "doc", "devel", "dev", "src",
+];
+
+/// True when a built package name belongs to this build's `pkgbase` (e.g. `linux-cachyos-dbg`
+/// yes, `linux-cachyos-lto` / `mesa-utils` no when pkgbase is `linux-cachyos` / `mesa`).
 pub fn artifact_belongs_to_pkgbase(pkg_name: &str, pkgbase: &str) -> bool {
     if pkg_name == pkgbase {
         return true;
@@ -124,7 +128,28 @@ pub fn artifact_belongs_to_pkgbase(pkg_name: &str, pkgbase: &str) -> bool {
         return false;
     };
     // Sibling kernel variants share the `linux-cachyos-*` prefix but are separate pkgbases.
-    !suffix.starts_with("lto") && !suffix.starts_with("gcc")
+    if suffix.starts_with("lto") || suffix.starts_with("gcc") {
+        return false;
+    }
+    SPLIT_PKG_SUFFIXES
+        .iter()
+        .any(|s| suffix == *s || suffix.starts_with(&format!("{s}-")))
+}
+
+/// True when an artifact filename belongs to `base_pkg_name` / `pkg_input` (parsed pkgname, not
+/// raw string prefix — avoids treating `mesa-utils-…` as owned by `mesa`).
+pub fn artifact_filename_belongs_to_package(
+    filename: &str,
+    pkg_input: &str,
+    base_pkg_name: &str,
+) -> bool {
+    let Some((pkg_name, _)) = parse_pkgname_and_version(filename) else {
+        return false;
+    };
+    pkg_name == base_pkg_name
+        || pkg_name == pkg_input
+        || artifact_belongs_to_pkgbase(&pkg_name, base_pkg_name)
+        || (pkg_input != base_pkg_name && artifact_belongs_to_pkgbase(&pkg_name, pkg_input))
 }
 
 fn makepkg_env_pairs(env: &HashMap<String, String>) -> Vec<(String, String)> {
@@ -204,7 +229,8 @@ fn collect_candidate_files_from_pkgdest(
     files
 }
 
-/// Legacy scan used by non-PGO installs (matches abs package name prefix).
+/// Fallback scan used by non-PGO installs when `makepkg --packagelist` is unavailable.
+/// Matches on parsed pkgname (and allowlisted split suffixes), never raw filename prefixes.
 fn collect_candidate_files_from_pkgdest_legacy(
     pkg_input: &str,
     base_pkg_name: &str,
@@ -224,9 +250,7 @@ fn collect_candidate_files_from_pkgdest_legacy(
             if !crate::utils::is_package_artifact(name) {
                 continue;
             }
-            if name.starts_with(&format!("{}-", base_pkg_name))
-                || name.starts_with(&format!("{}-", pkg_input))
-            {
+            if artifact_filename_belongs_to_package(name, pkg_input, base_pkg_name) {
                 files.push(p);
             }
         }
@@ -238,7 +262,7 @@ fn collect_candidate_files_from_pkgdest_legacy(
 
 /// True when PKGDEST already has at least one matching `.pkg.tar.*` for this package.
 ///
-/// Uses name-prefix matching (no `makepkg --packagelist`), so it is safe before PKGBUILD mutation.
+/// Uses parsed-pkgname matching (no `makepkg --packagelist`), so it is safe before PKGBUILD mutation.
 /// When `min_version` is set, the primary package (`base_pkg_name` / `pkg_input`) must have an
 /// artifact at that version or newer — stale ready packages must not skip a rebuild after an
 /// upstream pkgrel/pkgver bump.
@@ -691,6 +715,28 @@ mod tests {
         assert!(artifact_belongs_to_pkgbase(
             "linux-cachyos-lto-dbg",
             "linux-cachyos-lto"
+        ));
+        // Distinct packages that share a filename prefix must not match.
+        assert!(!artifact_belongs_to_pkgbase("mesa-utils", "mesa"));
+        assert!(!artifact_belongs_to_pkgbase("ffmpeg-full", "ffmpeg"));
+    }
+
+    #[test]
+    fn artifact_filename_belongs_rejects_sibling_package_prefix() {
+        assert!(artifact_filename_belongs_to_package(
+            "mesa-1:25.0.0-1-x86_64.pkg.tar.zst",
+            "mesa",
+            "mesa"
+        ));
+        assert!(artifact_filename_belongs_to_package(
+            "mesa-dbg-1:25.0.0-1-x86_64.pkg.tar.zst",
+            "mesa",
+            "mesa"
+        ));
+        assert!(!artifact_filename_belongs_to_package(
+            "mesa-utils-2.0.0-1-x86_64.pkg.tar.zst",
+            "mesa",
+            "mesa"
         ));
     }
 

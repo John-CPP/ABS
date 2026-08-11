@@ -34,12 +34,14 @@ fn transform_system_update_command(mut cmd_str: String, is_root_user: bool) -> S
 }
 
 fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
+    let held = crate::held::held_names(config);
     let raw: Vec<String> = config
         .system_update
         .ignore_packages
         .iter()
         .chain(config.manual_update_packages.iter())
         .chain(config.skip_install_packages.iter())
+        .chain(held.iter())
         .chain(crate::pgo::active_pipeline_hold_packages(config).iter())
         .cloned()
         .collect();
@@ -169,6 +171,7 @@ mod tests {
             manual_update_packages: manual.into_iter().map(String::from).collect(),
             skip_install_packages: skip_install.into_iter().map(String::from).collect(),
             skip_install_packages_after_compilation: None,
+            held_packages: Default::default(),
             packages: Default::default(),
             check_for_update_on_startup: false,
             auto_update_on_startup: false,
@@ -180,6 +183,17 @@ mod tests {
             compilers: Default::default(),
             ramdisk: Default::default(),
         }
+    }
+
+    #[test]
+    fn packages_ignored_includes_held() {
+        let mut config = minimal_config(vec![], vec![], vec![]);
+        config.held_packages = vec![crate::config::HeldPackage {
+            name: "heldpkg".into(),
+            version: "1.0.0-1".into(),
+            auto_recompile_trigger: Default::default(),
+        }];
+        assert!(packages_ignored_during_system_update(&config).contains(&"heldpkg".into()));
     }
 
     #[test]

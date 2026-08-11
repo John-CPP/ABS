@@ -44,6 +44,26 @@ User config under `~/.config/abs` is not removed by pacman; use `abs --purge --y
 Manual install (development):
 
 ```bash
+# Fast smoke-test build (optimized, no LTO) — use this while iterating
+make fast                 # → target/fast/{abs,absgui}
+make install-fast         # install those binaries to /usr/bin
+# or: cargo fast
+
+# Production / release build (thin LTO)
+make release              # → target/release/{abs,absgui}
+make install              # binaries + PGO script + desktop icon
+# or: cargo rel
+
+# AUR package from checkout
+make aur                  # cd aur && makepkg -si
+```
+
+`PREFIX` / `DESTDIR` work as usual (`make install-fast PREFIX=$$HOME/.local`).
+
+Equivalent without Make:
+
+```bash
+cargo build --profile fast
 cargo build --release
 sudo install -Dm755 ./target/release/abs /usr/bin/abs
 sudo install -Dm755 ./target/release/absgui /usr/bin/absgui
@@ -113,6 +133,15 @@ abs [FLAGS] [PACKAGE...]
 | `--list`             | Dump resolved config                                                     |
 | `--configure`        | Open user config in `$EDITOR`                                            |
 | `--configure=EDITOR` | Open user config in the given editor (e.g. `--configure=kate`)           |
+| `--list-add=LIST`    | Add packages to a config list (see below)                                |
+| `--list-remove=LIST` | Remove packages from a config list                                       |
+| `--wizard[=ACTION]`  | Interactive config wizard (`add` / `remove` / `edit` / `hold`)           |
+| `--pkg-list=LIST`    | Prefill list name for `--wizard`                                         |
+| `--hold PKG`         | Pin a package version in `held_packages`                                 |
+| `--hold-version=`    | Version for `--hold` (`pkgver-pkgrel`)                                   |
+| `--trigger=PKG`      | Trigger package(s) for hold `on_packages_updated` (comma or repeatable)  |
+| `--unhold PKG`       | Remove package(s) from `held_packages`                                   |
+| `--hold-check`       | Show held vs installed versions and trigger drift                        |
 | `--check-update`     | Query latest remote version of ABS and check against local version       |
 | `--self-update`      | Fetch, compile, and install the latest remote version of ABS             |
 | `--pgo PKG`          | Start CachyOS kernel 3-stage PGO pipeline (debug → AutoFDO → Propeller)  |
@@ -123,6 +152,38 @@ abs [FLAGS] [PACKAGE...]
 | `--purge`            | Remove ABS from the system (binaries, config, cache, build data)         |
 | `--yes` / `-y`       | Skip confirmation when used with `--purge`                               |
 
+
+### Config lists and held packages
+
+Manage package lists without editing `abs.toml` by hand. List names (aliases in parentheses):
+
+- `manual_update_packages` (`manual`, `watched`)
+- `skip_install_packages` (`skip`, `skip_install`)
+- `skip_install_packages_after_compilation` (`skip_after`)
+- `ignore_packages` (`ignore`)
+
+```bash
+abs --list-add=manual_update_packages mesa linux-cachyos
+abs --list-remove=skip_install_packages qemu*
+abs --wizard=add --pkg-list=manual_update_packages go   # prefills; still prints Reproduce/Undo
+abs --wizard                                          # full interactive menu
+```
+
+After list/wizard/hold mutations ABS prints:
+
+```
+Reproduce: abs --list-add=manual_update_packages go
+Undo: abs --list-remove=manual_update_packages go
+```
+
+**Held packages** pin a `pkgver-pkgrel`, are ignored during system update, and are skipped in `-R`/`-RU` version compares. Rebuild with `abs <pkg>` (applies the held version). Optional `on_packages_updated` triggers recompile the held package on `abs -U` when those packages change outside ABS:
+
+```bash
+abs --hold libfoo --hold-version=1.2.3-1 --trigger=glibc,icu
+abs --hold-check
+abs --unhold libfoo
+abs --wizard=hold libfoo
+```
 
 ### Uninstall
 

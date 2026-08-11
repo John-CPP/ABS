@@ -22,6 +22,26 @@ skip_install_packages = [
 skip_install_packages_after_compilation = [
 ]
 
+# Packages pinned to a fixed pkgver-pkgrel. Held names are ignored during system update and are
+# not version-compared on -R/-RU. Rebuild manually with `abs <pkg>` (applies the held version),
+# or via on_packages_updated triggers when those packages change outside ABS (checked on -U).
+# Example:
+# [[held_packages]]
+# name = "libfoo"
+# version = "1.2.3-1"
+#
+# [held_packages.auto_recompile_trigger.on_packages_updated]
+# glibc = "2.41-1"
+# icu = "76.1-1"
+#
+# Manage without editing this file:
+#   abs --list-add=manual_update_packages pkg
+#   abs --list-remove=skip_install_packages pkg
+#   abs --hold pkg --hold-version=1.2.3-1 --trigger=glibc,icu
+#   abs --unhold pkg
+#   abs --hold-check
+#   abs --wizard[=add|remove|edit|hold]
+
 [paths]
 packages_path = "$XDG_CONFIG_HOME/.cache/abs/packages"
 chroot_base_path = "$XDG_CONFIG_HOME/.cache/abs/chroot"

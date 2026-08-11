@@ -149,6 +149,8 @@ pub struct App {
     log_content: text_editor::Content,
     last_event_log_path: Option<std::path::PathBuf>,
     list_editors: ListEditors,
+    /// Last `abs --hold-check` output shown on ABS settings.
+    hold_check_report: Option<String>,
     busy: bool,
     /// True while a one-shot (non-PGO) kernel build is running; suppresses PGO status polling.
     building_oneshot: bool,
@@ -212,6 +214,7 @@ impl App {
                 log_content: text_editor::Content::new(),
                 last_event_log_path: None,
                 list_editors: ListEditors::from_config(&ConfigDocument::default()),
+                hold_check_report: None,
                 busy: false,
                 building_oneshot: false,
                 pgo_run: PgoRunHandle::new(),
@@ -569,6 +572,14 @@ impl App {
             Message::OpenDefaultConfig => self.page = Page::DefaultKernelConfig,
             Message::OpenPackages => self.page = Page::Packages,
             Message::OpenPackage(name) => {
+                if !self.config.packages.contains_key(&name) && !name.is_empty() {
+                    self.config
+                        .packages
+                        .insert(name.clone(), PackageSection::default());
+                    self.status_message = Some(format!(
+                        "Created [packages.{name}] — configure and Save."
+                    ));
+                }
                 self.selected_package = Some(name);
                 self.page = Page::PackageConfig;
             }
@@ -626,6 +637,13 @@ impl App {
             }
             Message::SaveConfig => {
                 self.list_editors.apply_all(&mut self.config);
+                self.config
+                    .held_packages
+                    .retain(|h| !h.name.trim().is_empty());
+                for h in &mut self.config.held_packages {
+                    h.name = h.name.trim().to_string();
+                    h.version = h.version.trim().to_string();
+                }
                 let path = self.config_path.clone();
                 let doc = self.config.clone();
                 return Task::perform(async move { save_config(&path, &doc) }, Message::ConfigSaved);
@@ -816,6 +834,92 @@ impl App {
             Message::CompilerRemove(name) => {
                 self.config.compilers.remove(&name);
             }
+            Message::HeldNameChanged(idx, name) => {
+                if let Some(h) = self.config.held_packages.get_mut(idx) {
+                    h.name = name;
+                }
+            }
+            Message::HeldVersionChanged(idx, version) => {
+                if let Some(h) = self.config.held_packages.get_mut(idx) {
+                    h.version = version;
+                }
+            }
+            Message::HeldTriggersChanged(idx, text) => {
+                if let Some(h) = self.config.held_packages.get_mut(idx) {
+                    h.set_triggers_from_text(&text);
+                }
+            }
+            Message::HeldAdd => {
+                let version = String::new();
+                self.config.held_packages.push(crate::config::HeldPackage {
+                    name: String::new(),
+                    version,
+                    auto_recompile_trigger: crate::config::AutoRecompileTrigger::default(),
+                });
+                self.status_message = Some(
+                    "Added held package row — set name and version, then Save.".into(),
+                );
+            }
+            Message::HeldRemove(idx) => {
+                if idx < self.config.held_packages.len() {
+                    let removed = self.config.held_packages.remove(idx);
+                    self.status_message = Some(format!(
+                        "Removed hold for {} (Save to write abs.toml).",
+                        if removed.name.is_empty() {
+                            "(unnamed)"
+                        } else {
+                            removed.name.as_str()
+                        }
+                    ));
+                }
+            }
+            Message::HeldSnapshotTriggers(idx) => {
+                if let Some(h) = self.config.held_packages.get_mut(idx) {
+                    let mut filled = 0usize;
+                    for (pkg, ver) in h.auto_recompile_trigger.on_packages_updated.iter_mut() {
+                        if ver.is_empty() {
+                            if let Some(installed) = abs_runner::pacman_query_version(pkg) {
+                                *ver = installed;
+                                filled += 1;
+                            }
+                        }
+                    }
+                    // Also prefill held version from pacman when empty.
+                    if h.version.trim().is_empty() && !h.name.trim().is_empty() {
+                        if let Some(installed) = abs_runner::pacman_query_version(&h.name) {
+                            h.version = installed;
+                            filled += 1;
+                        }
+                    }
+                    self.status_message = Some(format!(
+                        "Snapshot: filled {filled} version(s) from pacman -Q."
+                    ));
+                }
+            }
+            Message::HeldCheck => {
+                let pkgs: Vec<String> = self
+                    .config
+                    .held_packages
+                    .iter()
+                    .map(|h| h.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                self.status_message = Some("Running abs --hold-check…".into());
+                return Task::perform(
+                    async move { abs_runner::run_hold_check(&pkgs) },
+                    Message::HeldCheckDone,
+                );
+            }
+            Message::HeldCheckDone(result) => match result {
+                Ok(text) => {
+                    self.hold_check_report = Some(text);
+                    self.status_message = Some("Hold check finished.".into());
+                }
+                Err(e) => {
+                    self.hold_check_report = Some(format!("Error: {e}"));
+                    self.status_message = Some(format!("Hold check failed: {e}"));
+                }
+            },
             Message::BrowsePath(field, kind) => {
                 let current = self.path_value(field);
                 return Task::perform(
@@ -890,27 +994,33 @@ impl App {
             }
             Message::PgoStatusLoaded(Ok(status)) => {
                 // For builds running in their own terminal window there is no in-app stream to tell
-                // us the abs process exited. Detect it via the pipeline reaching a stage where abs
-                // parks and returns control (a reboot gate, completion, or abort). A short grace
-                // period avoids reacting to stale state from a just-finished previous run.
+                // us the abs process exited. Prefer PID-file liveness; only fall back to "parked"
+                // stages (reboot gates / done / aborted) when the PID file is already gone.
+                // Never treat live compile stages (`stage2_build` / `stage3_build`) as parked —
+                // those are written for the entire build and previously cleared busy mid-compile.
                 if self.busy
                     && self
                         .external_run_since
                         .map(|t| t.elapsed() >= std::time::Duration::from_secs(6))
                         .unwrap_or(false)
-                    && matches!(
-                        status.stage.as_str(),
-                        "wait_reboot1" | "wait_reboot2" | "stage2_build" | "stage3_build"
-                            | "done" | "aborted"
-                    )
                 {
-                    self.busy = false;
-                    self.external_run_since = None;
-                    self.external_pid_path = None;
-                    self.append_log(format!(
-                        "abs (terminal) reached: {}. {}",
-                        status.stage_label, status.next_action
-                    ));
+                    let pid_alive =
+                        abs_runner::pid_file_process_alive(self.external_pid_path.as_deref());
+                    // Reboot gates / done / aborted mean abs returned control (the terminal shell
+                    // may still be alive waiting for Enter — that must not keep us "busy").
+                    let parked = matches!(
+                        status.stage.as_str(),
+                        "wait_reboot1" | "wait_reboot2" | "done" | "aborted"
+                    );
+                    if parked || !pid_alive {
+                        self.busy = false;
+                        self.external_run_since = None;
+                        self.external_pid_path = None;
+                        self.append_log(format!(
+                            "abs (terminal) reached: {}. {}",
+                            status.stage_label, status.next_action
+                        ));
+                    }
                 }
                 self.sync_pgo_selected_stage_from_status(&status);
                 self.pgo_status = Some(status);
@@ -1174,19 +1284,23 @@ impl App {
                     // alone so closing the GUI doesn't kill an in-progress kernel compile.
                     return Task::done(Message::ExitAfterCleanup);
                 }
+                // Idle close: do not unmount the ramdisk. Leaving it mounted is intentional
+                // (reclaim on next build); forcing `abs --ramdisk-shutdown` always prompted sudo.
+                if !self.busy {
+                    return Task::done(Message::ExitAfterCleanup);
+                }
                 let pkg = self.selected_kernel.clone();
                 let handle = self.pgo_run.clone();
-                let busy = self.busy;
                 let run_pgo_abort = !self.building_oneshot;
                 let pid_path = self.external_pid_path.clone();
                 return Task::perform(
                     async move {
-                        if busy {
-                            if let Some(p) = pkg {
-                                let _ = handle.abort(&p, run_pgo_abort, pid_path.as_deref());
-                            }
+                        if let Some(p) = pkg {
+                            // abort() already runs --ramdisk-shutdown after stopping the build.
+                            let _ = handle.abort(&p, run_pgo_abort, pid_path.as_deref());
+                        } else {
+                            let _ = run_ramdisk_shutdown();
                         }
-                        let _ = run_ramdisk_shutdown();
                     },
                     |_| Message::ExitAfterCleanup,
                 );
@@ -1206,7 +1320,12 @@ impl App {
             Page::KernelConfig => self.view_kernel_config(theme),
             Page::Packages => self.view_packages(theme),
             Page::PackageConfig => self.view_package_config(theme),
-            Page::AbsSettings => abs_settings::view(&self.config, &self.list_editors, theme),
+            Page::AbsSettings => abs_settings::view(
+                &self.config,
+                &self.list_editors,
+                self.hold_check_report.as_deref(),
+                theme,
+            ),
             Page::AppSettings => self.view_app_settings(theme),
         };
 
