@@ -184,6 +184,15 @@ pub enum Message {
     CompilerCxxChanged(String, String),
     CompilerAdd,
     CompilerRemove(String),
+    HeldNameChanged(usize, String),
+    HeldVersionChanged(usize, String),
+    HeldTriggersChanged(usize, String),
+    HeldAdd,
+    HeldRemove(usize),
+    /// Fill empty trigger versions from `pacman -Q` for this held entry.
+    HeldSnapshotTriggers(usize),
+    HeldCheck,
+    HeldCheckDone(Result<String, String>),
     BrowsePath(PathField, PathKind),
     PathPicked(PathField, Option<String>),
     // Kernel editing

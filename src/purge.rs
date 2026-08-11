@@ -2,7 +2,6 @@ use crate::config::{self, Config};
 use crate::blog;
 use crate::ramdisk;
 use crate::utils::{check_sudo_removal, init_deletable_roots, run_command};
-use colored::Colorize;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};

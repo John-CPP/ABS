@@ -1,14 +1,273 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::thread::ThreadId;
 
 static TRACKED_CHILDREN: OnceLock<Mutex<HashMap<u32, ()>>> = OnceLock::new();
 static EXIT_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SKIP_EXIT_PAUSE: AtomicBool = AtomicBool::new(false);
+static PARALLEL_CONSOLE_MODE: AtomicBool = AtomicBool::new(false);
+static CONSOLE_GATE: OnceLock<ConsoleGate> = OnceLock::new();
+static CONSOLE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static OUTPUT_LABEL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+struct ConsoleGateState {
+    exclusive_owner: Option<ThreadId>,
+    /// Lines buffered while another thread holds exclusive console access.
+    buffer: Vec<(bool, String)>,
+}
+
+struct ConsoleGate {
+    state: Mutex<ConsoleGateState>,
+    cvar: Condvar,
+}
+
+fn console_gate() -> &'static ConsoleGate {
+    CONSOLE_GATE.get_or_init(|| ConsoleGate {
+        state: Mutex::new(ConsoleGateState {
+            exclusive_owner: None,
+            buffer: Vec::new(),
+        }),
+        cvar: Condvar::new(),
+    })
+}
+
+/// Enable/disable parallel-compile console isolation (line prefixes + sudo gate).
+pub fn set_parallel_console_mode(enabled: bool) {
+    PARALLEL_CONSOLE_MODE.store(enabled, Ordering::SeqCst);
+}
+
+/// RAII flag for parallel console mode (cleared on drop).
+pub struct ParallelConsoleModeGuard;
+
+impl ParallelConsoleModeGuard {
+    pub fn enter() -> Self {
+        set_parallel_console_mode(true);
+        // Env backup so child logic / future helpers can detect concurrent console isolation
+        // even if TLS/atomics are missed on a call path.
+        // SAFETY: abs is single-process; this is process-global console mode for workers.
+        unsafe {
+            std::env::set_var("ABS_PARALLEL_CONSOLE", "1");
+        }
+        Self
+    }
+}
+
+impl Drop for ParallelConsoleModeGuard {
+    fn drop(&mut self) {
+        set_parallel_console_mode(false);
+        unsafe {
+            std::env::remove_var("ABS_PARALLEL_CONSOLE");
+        }
+    }
+}
+
+/// True when concurrent compilation console isolation should be active.
+pub fn parallel_console_mode() -> bool {
+    PARALLEL_CONSOLE_MODE.load(Ordering::SeqCst)
+        || std::env::var_os("ABS_PARALLEL_CONSOLE").is_some()
+}
+
+/// Thread-local package label for prefixed console lines.
+pub struct OutputLabelGuard {
+    previous: Option<String>,
+}
+
+impl OutputLabelGuard {
+    pub fn new(label: Option<String>) -> Self {
+        let previous = OUTPUT_LABEL.with(|cell| cell.replace(label));
+        Self { previous }
+    }
+}
+
+impl Drop for OutputLabelGuard {
+    fn drop(&mut self) {
+        OUTPUT_LABEL.with(|cell| {
+            cell.replace(self.previous.take());
+        });
+    }
+}
+
+/// Current thread's package label, if any.
+pub fn current_output_label() -> Option<String> {
+    OUTPUT_LABEL.with(|cell| cell.borrow().clone())
+}
+
+/// Format a build log line with a package label prefix.
+pub fn format_prefixed_line(label: &str, line: &str) -> String {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    format!("[{label}] {trimmed}")
+}
+
+/// Strip ANSI cursor/erase sequences and other controls so `\r` progress bars cannot
+/// rewind the terminal and erase the `[pkg]` prefix (or pad the line with spaces).
+pub fn sanitize_console_fragment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\u{07}' {
+                            break;
+                        }
+                        if c2 == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if c == '\t' {
+            out.push(' ');
+            continue;
+        }
+        // Drop C0/C1 controls (including leftover CR) — progress padding lives here too.
+        if c.is_control() {
+            continue;
+        }
+        out.push(c);
+    }
+    // Progress bars often pad with trailing spaces after `\r` to clear the previous longer line.
+    out.trim_end().to_string()
+}
+
+/// Pull complete fragments delimited by CR or LF out of `buffer`, leaving a partial tail.
+fn drain_console_fragments(buffer: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(pos) = buffer.find(['\r', '\n']) {
+        let fragment = buffer[..pos].to_string();
+        buffer.drain(..=pos);
+        let cleaned = sanitize_console_fragment(&fragment);
+        if !cleaned.is_empty() {
+            out.push(cleaned);
+        }
+    }
+    out
+}
+
+fn write_raw_line(to_stderr: bool, line: &str) {
+    let _lock = CONSOLE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let text = line.trim_end_matches(['\r', '\n']);
+    if to_stderr {
+        let _ = writeln!(io::stderr(), "{text}");
+        let _ = io::stderr().flush();
+    } else {
+        let _ = writeln!(io::stdout(), "{text}");
+        let _ = io::stdout().flush();
+    }
+}
+
+/// Atomically write one console line. Buffers while another thread holds exclusive sudo access.
+pub fn console_write_line(line: &str) {
+    console_write(line, false);
+}
+
+/// Atomically write one stderr line (phase banners / heartbeats).
+pub fn console_write_line_stderr(line: &str) {
+    console_write(line, true);
+}
+
+fn console_write(line: &str, to_stderr: bool) {
+    let gate = console_gate();
+    let mut state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+    let me = std::thread::current().id();
+    if let Some(owner) = state.exclusive_owner
+        && owner != me
+    {
+        state.buffer.push((to_stderr, line.trim_end_matches(['\r', '\n']).to_string()));
+        return;
+    }
+    drop(state);
+    write_raw_line(to_stderr, line);
+}
+
+/// Pause other builds' console output, run `f`, then flush buffered lines.
+///
+/// Used so a second/third sudo password prompt waits instead of colliding with live build output.
+pub fn with_exclusive_console<R>(label: &str, f: impl FnOnce() -> R) -> R {
+    let gate = console_gate();
+    let mut state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut announced_wait = false;
+    while state.exclusive_owner.is_some() {
+        if !announced_wait {
+            announced_wait = true;
+            drop(state);
+            write_raw_line(
+                true,
+                &format!(
+                    "==> [{label}] waiting for console (another package is prompting for sudo)..."
+                ),
+            );
+            state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        state = gate
+            .cvar
+            .wait(state)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    state.exclusive_owner = Some(std::thread::current().id());
+    drop(state);
+
+    let result = f();
+
+    let mut state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+    let buffered = std::mem::take(&mut state.buffer);
+    state.exclusive_owner = None;
+    drop(state);
+    gate.cvar.notify_all();
+
+    for (to_stderr, line) in buffered {
+        write_raw_line(to_stderr, &line);
+    }
+
+    result
+}
+
+/// ABS status line (`blog!`), with optional `[pkg]` prefix in parallel mode.
+pub fn emit_blog(msg: &str) {
+    use colored::Colorize;
+    let line = match current_output_label() {
+        Some(label) => format!("{} [{}] {}", "==>".blue(), label, msg),
+        None => format!("{} {}", "==>".blue(), msg),
+    };
+    console_write_line(&line);
+}
+
+/// ABS warning line (`ewarn!`), with optional `[pkg]` prefix in parallel mode.
+pub fn emit_ewarn(msg: &str) {
+    use colored::Colorize;
+    let line = match current_output_label() {
+        Some(label) => format!("{} [{}] {}", "==> WARNING:".yellow(), label, msg),
+        None => format!("{} {}", "==> WARNING:".yellow(), msg),
+    };
+    console_write_line_stderr(&line);
+}
 
 fn tracked_children() -> &'static Mutex<HashMap<u32, ()>> {
     TRACKED_CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
@@ -61,6 +320,96 @@ fn track_child(pid: u32) {
 
 fn untrack_child(id: u32) {
     tracked_children().lock().unwrap().remove(&id);
+}
+
+/// Write a private executable helper script (`O_CREAT|O_EXCL`, mode `0700`).
+fn write_private_script(path: &Path, contents: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("failed to create build helper script {}: {e}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("failed to write build helper script {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Ensures a spawned build child is always reaped/untracked and temp helpers are removed,
+/// even when early `?` paths bail out after `spawn`.
+struct ShellChildGuard {
+    child: Option<Child>,
+    pid: u32,
+    inner_path: PathBuf,
+    log_path: PathBuf,
+    done: std::sync::Arc<AtomicBool>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ShellChildGuard {
+    fn new(
+        child: Child,
+        inner_path: PathBuf,
+        log_path: PathBuf,
+        done: std::sync::Arc<AtomicBool>,
+        heartbeat: Option<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        let pid = child.id();
+        track_child(pid);
+        Self {
+            child: Some(child),
+            pid,
+            inner_path,
+            log_path,
+            done,
+            heartbeat,
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut().and_then(|c| c.stdout.take())
+    }
+
+    fn wait(mut self) -> Result<(ExitStatus, String), String> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| "build pipeline child already reaped".to_string())?;
+        let status = child
+            .wait()
+            .map_err(|e| format!("failed to wait on build pipeline: {e}"))?;
+        let log_text = fs::read_to_string(&self.log_path).unwrap_or_default();
+        self.finish_tracked();
+        Ok((status, log_text))
+    }
+
+    fn finish_tracked(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.heartbeat.take() {
+            let _ = handle.join();
+        }
+        untrack_child(self.pid);
+        let _ = fs::remove_file(&self.inner_path);
+        let _ = fs::remove_file(&self.log_path);
+        restore_terminal();
+    }
+}
+
+impl Drop for ShellChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.finish_tracked();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -598,26 +947,22 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
         return Ok(());
     }
 
-    let owned_sudo_args;
-    let exec_args: Vec<&str> = if cmd == "sudo" {
-        owned_sudo_args = sudo_prefixed_args(args);
-        owned_sudo_args.iter().map(String::as_str).collect()
-    } else {
-        args.to_vec()
-    };
+    if cmd == "sudo" {
+        return run_sudo_command(args, cwd.as_ref().map(|p| p.as_ref()));
+    }
 
-    echo_command(cmd, &exec_args, cwd.as_ref().map(|p| p.as_ref()));
+    echo_command(cmd, args, cwd.as_ref().map(|p| p.as_ref()));
 
     let mut command = Command::new(cmd);
-
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    command.args(args);
 
-    if cmd == "sudo" {
-        configure_sudo_command(&mut command, args);
-    } else {
-        command.args(&exec_args);
+    // Parallel builds: never inherit the shared TTY — capture and prefix so git/curl
+    // progress cannot collide with other workers (same problem as un-labeled `script`).
+    if parallel_console_mode() {
+        return run_command_labeled(command, cmd, args);
     }
 
     let mut child = command
@@ -641,6 +986,182 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
                 .map_or_else(|| "signal".to_string(), |c| c.to_string())
         ))
     }
+}
+
+fn run_command_labeled(
+    mut command: Command,
+    cmd: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let label = current_output_label().unwrap_or_else(|| cmd.to_string());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("TERM", "dumb")
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE");
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to execute '{cmd}': {e}"))?;
+    track_child(child.id());
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let label_out = label.clone();
+    let label_err = label.clone();
+    let out_handle = stdout.map(|pipe| {
+        std::thread::spawn(move || stream_labeled_pipe(pipe, &label_out))
+    });
+    let err_handle = stderr.map(|pipe| {
+        std::thread::spawn(move || stream_labeled_pipe(pipe, &label_err))
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait on '{cmd}': {e}"))?;
+    if let Some(h) = out_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = err_handle {
+        let _ = h.join();
+    }
+    untrack_child(child.id());
+
+    if status.success() {
+        Ok(())
+    } else {
+        let rendered_cmd = render_command_line(cmd, args);
+        Err(format!(
+            "Command failed: `{rendered_cmd}` (exit: {})\n(Output was printed above.)",
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string())
+        ))
+    }
+}
+
+fn stream_labeled_pipe<R: Read>(reader: R, label: &str) {
+    let mut reader = BufReader::new(reader);
+    let mut raw_buf = [0u8; 8192];
+    let mut pending = String::new();
+    let mut last_emitted = String::new();
+    loop {
+        let n = match reader.read(&mut raw_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        pending.push_str(&String::from_utf8_lossy(&raw_buf[..n]));
+        for fragment in drain_console_fragments(&mut pending) {
+            if fragment == last_emitted {
+                continue;
+            }
+            last_emitted = fragment.clone();
+            console_write_line(&format_prefixed_line(label, &fragment));
+        }
+    }
+    let tail = sanitize_console_fragment(&pending);
+    if !tail.is_empty() && tail != last_emitted {
+        console_write_line(&format_prefixed_line(label, &tail));
+    }
+}
+
+fn sudo_args_with_noninteractive(args: &[&str]) -> Vec<String> {
+    let mut v = Vec::with_capacity(args.len() + 2);
+    if !args.contains(&"-n") {
+        v.push("-n".to_string());
+    }
+    if use_sudo_askpass() && !args.contains(&"-A") {
+        v.push("-A".to_string());
+    }
+    v.extend(args.iter().map(|s| (*s).to_string()));
+    v
+}
+
+fn spawn_sudo_and_wait(args: &[String], cwd: Option<&Path>) -> Result<std::process::ExitStatus, String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    echo_command("sudo", &refs, cwd);
+
+    let mut command = Command::new("sudo");
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.args(args);
+    if use_sudo_askpass() {
+        command.stdin(Stdio::null());
+    } else {
+        command.stdin(Stdio::inherit());
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to execute 'sudo': {e}"))?;
+    track_child(child.id());
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait on 'sudo': {e}"))?;
+    untrack_child(child.id());
+    Ok(status)
+}
+
+fn sudo_status_to_result(args: &[&str], status: std::process::ExitStatus) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        let rendered_cmd = render_command_line("sudo", args);
+        Err(format!(
+            "Command failed: `{}` (exit: {})\n(Output was printed above.)",
+            rendered_cmd,
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string())
+        ))
+    }
+}
+
+/// Run sudo, serializing interactive prompts when parallel console mode is active.
+fn run_sudo_command(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
+    // Graphical askpass never steals the shared build TTY.
+    if use_sudo_askpass() {
+        let owned = sudo_prefixed_args(args);
+        let status = spawn_sudo_and_wait(&owned, cwd)?;
+        return sudo_status_to_result(args, status);
+    }
+
+    if parallel_console_mode() {
+        let n_args = sudo_args_with_noninteractive(args);
+        if let Ok(status) = spawn_sudo_and_wait(&n_args, cwd)
+            && status.success()
+        {
+            return Ok(());
+        }
+
+        let label = current_output_label().unwrap_or_else(|| "sudo".to_string());
+        return with_exclusive_console(&label, || {
+            // Another build may have just authenticated on the shared TTY.
+            let n_args = sudo_args_with_noninteractive(args);
+            if let Ok(status) = spawn_sudo_and_wait(&n_args, cwd)
+                && status.success()
+            {
+                return Ok(());
+            }
+            write_raw_line(
+                true,
+                &format!("==> [{label}] sudo password required (other build output paused)..."),
+            );
+            let owned = sudo_prefixed_args(args);
+            let status = spawn_sudo_and_wait(&owned, cwd)?;
+            sudo_status_to_result(args, status)
+        });
+    }
+
+    let owned = sudo_prefixed_args(args);
+    let status = spawn_sudo_and_wait(&owned, cwd)?;
+    sudo_status_to_result(args, status)
 }
 
 /// Like [`run_command`], but captures stdout/stderr instead of inheriting them when silent.
@@ -693,18 +1214,24 @@ pub fn run_command_quiet<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P
 }
 
 /// How [`run_shell_in_dir_with_tee`] runs the build pipeline.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellRunOpts {
     /// Stream output directly to the terminal instead of `script(1)` (needed for makechrootpkg).
     pub live_output: bool,
     /// When set, print a heartbeat every 45s while the command runs.
     pub heartbeat_label: Option<&'static str>,
+    /// When set (parallel builds), prefix each output line with `[label]` and avoid `script` PTYs.
+    pub output_label: Option<String>,
 }
 
 /// Always-visible phase line on stderr (flushed), even when abs runs with `-s`.
 pub fn phase_banner(msg: impl AsRef<str>) {
-    eprintln!("==> {}", msg.as_ref());
-    let _ = io::stderr().flush();
+    let msg = msg.as_ref();
+    let line = match current_output_label() {
+        Some(label) => format!("==> [{label}] {msg}"),
+        None => format!("==> {msg}"),
+    };
+    console_write_line_stderr(&line);
 }
 
 /// Reset terminal attributes after `script(1)`, devtools ANSI, or Ctrl+C mid-line.
@@ -743,10 +1270,14 @@ impl Drop for TerminalRestoreGuard {
 ///
 /// Uses `script` when available so subprocesses (makepkg → `pacman -U` → `sudo`) get a real TTY.
 /// A plain `cmd | tee` pipeline breaks sudo password prompts.
+///
+/// When a package output label is active (parallel compiles), output is captured via pipes,
+/// each line is prefixed with `[label]`, and `script` is not used so sudo shares the parent TTY ticket
+/// and progress bars cannot fight over the shared console.
 pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(
     cwd: P,
     shell_body: &str,
-    opts: ShellRunOpts,
+    opts: &ShellRunOpts,
 ) -> Result<(), String> {
     if crate::is_dry_run_mode() {
         echo_shell_command(shell_body, Some(cwd.as_ref()));
@@ -769,13 +1300,24 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(
     let cwd_q = sh_single_quote(&cwd.as_ref().to_string_lossy());
     let inner_contents = format!("#!/bin/bash\nset -e\ncd {}\n{}\n", cwd_q, shell_body);
 
-    std::fs::write(&inner_path, inner_contents)
-        .map_err(|e| format!("failed to write build helper script: {}", e))?;
+    write_private_script(&inner_path, &inner_contents)?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&inner_path, std::fs::Permissions::from_mode(0o700));
+    // Prefer explicit opts label, then thread-local package label, then parallel-mode fallback.
+    // Never use `script` while concurrent builds share the console — it allocates PTYs that
+    // make curl/git/ninja think they own the TTY and their `\r` progress bars collide.
+    let forced_label = opts
+        .output_label
+        .clone()
+        .or_else(current_output_label)
+        .or_else(|| {
+            if parallel_console_mode() {
+                Some("build".to_string())
+            } else {
+                None
+            }
+        });
+    if let Some(label) = forced_label.as_deref() {
+        return run_shell_labeled(&inner_path, &log_path, label, opts);
     }
 
     let inner_arg = sh_single_quote(inner_path.to_string_lossy().as_ref());
@@ -819,45 +1361,146 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(
         .arg("-c")
         .arg(&pipeline);
 
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|e| format!("failed to run build pipeline: {}", e))?;
-    track_child(child.id());
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let heartbeat = spawn_heartbeat(opts.heartbeat_label, &done, opts.output_label.as_deref());
+    let guard = ShellChildGuard::new(child, inner_path.clone(), log_path.clone(), done, heartbeat);
 
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let heartbeat = opts.heartbeat_label.map(|label| {
-        let done_flag = std::sync::Arc::clone(&done);
+    let (status, log_text) = guard.wait()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Command failed (exit: {})\n{}",
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            log_text
+        ))
+    }
+}
+
+fn spawn_heartbeat(
+    heartbeat_label: Option<&'static str>,
+    done: &std::sync::Arc<AtomicBool>,
+    output_label: Option<&str>,
+) -> Option<std::thread::JoinHandle<()>> {
+    heartbeat_label.map(|label| {
+        let done_flag = std::sync::Arc::clone(done);
         let label = label.to_string();
+        let pkg = output_label.map(str::to_string);
         std::thread::spawn(move || {
             let mut elapsed_secs = 0u64;
-            while !done_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            while !done_flag.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(45));
-                if done_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if done_flag.load(Ordering::Relaxed) {
                     break;
                 }
                 elapsed_secs += 45;
                 let mins = elapsed_secs / 60;
                 let secs = elapsed_secs % 60;
-                eprintln!(
-                    "==> Still running: {label} ({mins}m {secs:02}s) — chroot sync and dependency install can take a long time for large packages"
+                let msg = format!(
+                    "Still running: {label} ({mins}m {secs:02}s) — chroot sync and dependency install can take a long time for large packages"
                 );
+                let line = match pkg.as_deref() {
+                    Some(p) => format!("==> [{p}] {msg}"),
+                    None => format!("==> {msg}"),
+                };
+                console_write_line_stderr(&line);
             }
         })
-    });
+    })
+}
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("failed to wait on build pipeline: {}", e))?;
-    done.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some(handle) = heartbeat {
-        let _ = handle.join();
+/// Piped build runner with per-line `[label]` prefixes (parallel compiles).
+fn run_shell_labeled(
+    inner_path: &Path,
+    log_path: &Path,
+    label: &str,
+    opts: &ShellRunOpts,
+) -> Result<(), String> {
+    let stdbuf = if command_exists("stdbuf") {
+        "stdbuf -oL -eL "
+    } else {
+        ""
+    };
+    let inner_arg = sh_single_quote(inner_path.to_string_lossy().as_ref());
+    // Merge stderr into the pipe so lines stay ordered; do not use `script` (per-PTY sudo tickets).
+    let pipeline = format!("{stdbuf}bash {inner_arg} 2>&1");
+
+    let mut command = Command::new("bash");
+    command
+        .arg("-o")
+        .arg("pipefail")
+        .arg("-c")
+        .arg(&pipeline)
+        // Discourage fancy TTY progress in tools that check TERM even when piped
+        // (inner chroot PTYs from makechrootpkg/nspawn still emit `\r` bars — we sanitize those).
+        .env("TERM", "dumb")
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let child = command
+        .spawn()
+        .map_err(|e| format!("failed to run build pipeline: {e}"))?;
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let heartbeat = spawn_heartbeat(opts.heartbeat_label, &done, Some(label));
+    let mut guard = ShellChildGuard::new(
+        child,
+        inner_path.to_path_buf(),
+        log_path.to_path_buf(),
+        done,
+        heartbeat,
+    );
+
+    let stdout = guard
+        .take_stdout()
+        .ok_or_else(|| "failed to capture build stdout".to_string())?;
+    let mut reader = BufReader::new(stdout);
+    let mut log_file = fs::File::create(log_path)
+        .map_err(|e| format!("failed to create build log {}: {e}", log_path.display()))?;
+    let mut log_text = String::new();
+    let mut raw_buf = [0u8; 8192];
+    let mut pending = String::new();
+    let mut last_emitted = String::new();
+
+    loop {
+        let n = reader
+            .read(&mut raw_buf)
+            .map_err(|e| format!("failed to read build output: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &raw_buf[..n];
+        let _ = log_file.write_all(chunk);
+        let lossy = String::from_utf8_lossy(chunk);
+        log_text.push_str(&lossy);
+        pending.push_str(&lossy);
+
+        for fragment in drain_console_fragments(&mut pending) {
+            if fragment == last_emitted {
+                continue;
+            }
+            last_emitted = fragment.clone();
+            console_write_line(&format_prefixed_line(label, &fragment));
+        }
     }
-    untrack_child(child.id());
 
-    let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&inner_path);
-    let _ = std::fs::remove_file(&log_path);
-    restore_terminal();
+    let tail = sanitize_console_fragment(&pending);
+    if !tail.is_empty() && tail != last_emitted {
+        console_write_line(&format_prefixed_line(label, &tail));
+    }
+
+    // Prefer in-memory capture (already complete); discard file-backed copy from wait.
+    let (status, _) = guard.wait()?;
 
     if status.success() {
         Ok(())
@@ -909,6 +1552,9 @@ pub fn is_package_artifact(name: &str) -> bool {
 
 /// Remove prior package artifacts for this package base name from PKGDEST so old builds (e.g.
 /// `-1.2`) are not offered alongside the new one (`-1.3`) after a recompile.
+///
+/// Matches on parsed pkgname + allowlisted split suffixes (not raw `{base}-*` prefixes), so
+/// cleaning `mesa` cannot delete `mesa-utils`.
 pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
     if crate::is_dry_run_mode() {
         println!(
@@ -919,7 +1565,6 @@ pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
     }
 
     let dir = Path::new(pkgdest);
-    let prefix = format!("{}-", base_name);
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -929,10 +1574,23 @@ pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !is_package_artifact(name) || !name.starts_with(&prefix) {
+        if !is_package_artifact(name)
+            || !crate::install::artifact_filename_belongs_to_package(name, base_name, base_name)
+        {
             continue;
         }
-        if let Err(e) = validate_deletable_path(&path) {
+        let canonical = match resolve_path_for_deletion(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "==> WARNING: Skipping stale package removal for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        if let Err(e) = validate_deletable_path(&canonical) {
             eprintln!(
                 "==> WARNING: Skipping stale package removal for {}: {}",
                 path.display(),
@@ -943,12 +1601,12 @@ pub fn remove_stale_pkgs_in_pkgdest(pkgdest: &str, base_name: &str) {
         let removed = if crate::force_sudo_clean() {
             false
         } else {
-            fs::remove_file(&path).is_ok()
+            fs::remove_file(&canonical).is_ok()
         };
         if !removed {
             let _ = run_command(
                 "sudo",
-                &["rm", "-f", path.to_string_lossy().as_ref()],
+                &["rm", "-f", canonical.to_string_lossy().as_ref()],
                 None::<&str>,
             );
         } else {
@@ -1156,15 +1814,24 @@ pub fn check_sudo_removal<P: AsRef<Path>>(path: P) -> Result<(), String> {
         return Ok(());
     }
 
-    validate_deletable_path(p)?;
+    // Validate + delete the canonical path so a symlink swap between check and rm cannot escape.
+    let canonical = resolve_path_for_deletion(p)?;
+    validate_deletable_path(&canonical)?;
 
-    if !crate::force_sudo_clean() && std::fs::remove_dir_all(p).is_ok() {
-        return Ok(());
+    if !crate::force_sudo_clean() {
+        let removed = if canonical.is_file() {
+            std::fs::remove_file(&canonical).is_ok()
+        } else {
+            std::fs::remove_dir_all(&canonical).is_ok()
+        };
+        if removed {
+            return Ok(());
+        }
     }
 
     run_command(
         "sudo",
-        &["rm", "-rf", p.to_string_lossy().as_ref()],
+        &["rm", "-rf", canonical.to_string_lossy().as_ref()],
         None::<&str>,
     )?;
 
@@ -1721,5 +2388,163 @@ mod path_safety_tests {
         wait_before_exit_if_needed();
         SKIP_EXIT_PAUSE.store(false, Ordering::Relaxed);
         EXIT_PAUSE_REQUESTED.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod console_gate_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Console gate + parallel flag are process-global; serialize these tests.
+    static CONSOLE_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn format_prefixed_line_strips_trailing_newlines() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            format_prefixed_line("firefox", "building...\n"),
+            "[firefox] building..."
+        );
+        assert_eq!(format_prefixed_line("mesa", "ok\r\n"), "[mesa] ok");
+    }
+
+    #[test]
+    fn sanitize_strips_ansi_erase_and_trailing_progress_padding() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = "Receiving objects:  50%\x1b[K                    ";
+        assert_eq!(
+            sanitize_console_fragment(raw),
+            "Receiving objects:  50%"
+        );
+    }
+
+    #[test]
+    fn drain_splits_carriage_return_progress_into_separate_fragments() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = String::from(
+            "[ 28%] Built target tdmime_auto\r[ 30%] Building CXX object tdutils.cpp.o\r\n",
+        );
+        let parts = drain_console_fragments(&mut buf);
+        assert_eq!(
+            parts,
+            vec![
+                "[ 28%] Built target tdmime_auto".to_string(),
+                "[ 30%] Building CXX object tdutils.cpp.o".to_string(),
+            ]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_keeps_partial_fragment_without_delimiter() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = String::from("Generating targets:  47%");
+        assert!(drain_console_fragments(&mut buf).is_empty());
+        assert_eq!(buf, "Generating targets:  47%");
+        buf.push_str("\rGenerating targets: 100%\n");
+        assert_eq!(
+            drain_console_fragments(&mut buf),
+            vec![
+                "Generating targets:  47%".to_string(),
+                "Generating targets: 100%".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn output_label_guard_restores_previous() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _outer = OutputLabelGuard::new(Some("outer".into()));
+        assert_eq!(current_output_label().as_deref(), Some("outer"));
+        {
+            let _inner = OutputLabelGuard::new(Some("inner".into()));
+            assert_eq!(current_output_label().as_deref(), Some("inner"));
+        }
+        assert_eq!(current_output_label().as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn exclusive_console_serializes_contending_closures() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let order_a = Arc::clone(&order);
+        let started_a = Arc::clone(&started);
+        let t1 = std::thread::spawn(move || {
+            with_exclusive_console("a", || {
+                started_a.fetch_add(1, Ordering::SeqCst);
+                order_a.lock().unwrap().push("a-enter");
+                std::thread::sleep(Duration::from_millis(80));
+                order_a.lock().unwrap().push("a-leave");
+            });
+        });
+
+        // Ensure first thread likely acquires exclusive first.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let order_b = Arc::clone(&order);
+        let started_b = Arc::clone(&started);
+        let t2 = std::thread::spawn(move || {
+            // Spin until A has entered, then contend.
+            while started_b.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            with_exclusive_console("b", || {
+                order_b.lock().unwrap().push("b-enter");
+                order_b.lock().unwrap().push("b-leave");
+            });
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let seen = order.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                "a-enter".to_string(),
+                "a-leave".to_string(),
+                "b-enter".to_string(),
+                "b-leave".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn console_write_buffers_while_exclusive_held() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let released = Arc::new(AtomicBool::new(false));
+        let released_flag = Arc::clone(&released);
+
+        let holder = std::thread::spawn(move || {
+            with_exclusive_console("holder", || {
+                // Another thread will try to write while we hold exclusive.
+                std::thread::sleep(Duration::from_millis(100));
+                released_flag.store(true, Ordering::SeqCst);
+            });
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        console_write_line("buffered-from-other");
+        assert!(!released.load(Ordering::SeqCst));
+
+        holder.join().unwrap();
+        // After release, buffered line is flushed (smoke: no deadlock).
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn parallel_console_mode_guard_toggles_flag() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!parallel_console_mode());
+        {
+            let _g = ParallelConsoleModeGuard::enter();
+            assert!(parallel_console_mode());
+        }
+        assert!(!parallel_console_mode());
     }
 }

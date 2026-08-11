@@ -325,6 +325,68 @@ fn extract_base_package_name(dep: &str) -> String {
     cleaned.to_string()
 }
 
+/// Names this package directory provides for dependency matching: `pkgbase`, every `pkgname`,
+/// and `provides` entries from `.SRCINFO` / `makepkg --printsrcinfo`.
+pub fn parse_pkg_provided_names(pkg_dir: &Path) -> Vec<String> {
+    use crate::utils::run_command_with_output;
+    let mut names = Vec::new();
+    let srcinfo_path = pkg_dir.join(".SRCINFO");
+    let srcinfo_text = if srcinfo_path.is_file() {
+        fs::read_to_string(&srcinfo_path).ok()
+    } else {
+        run_command_with_output("makepkg", &["--printsrcinfo"], Some(pkg_dir)).ok()
+    };
+
+    if let Some(text) = srcinfo_text {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some((key, value)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if matches!(key, "pkgbase" | "pkgname" | "provides") {
+                    let name = extract_base_package_name(value);
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    } else {
+        let pkgbuild_path = pkg_dir.join("PKGBUILD");
+        if let Ok(content) = fs::read_to_string(&pkgbuild_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                let (key, rest) = if let Some(r) = trimmed.strip_prefix("pkgbase=") {
+                    ("pkgbase", r)
+                } else if let Some(r) = trimmed.strip_prefix("pkgname=") {
+                    ("pkgname", r)
+                } else {
+                    continue;
+                };
+                let _ = key;
+                let raw = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+                if raw.starts_with('(') {
+                    for word in raw.trim_matches(|c| c == '(' || c == ')').split_whitespace() {
+                        let clean = word.trim_matches(|c| c == '\'' || c == '"');
+                        let name = extract_base_package_name(clean);
+                        if !name.is_empty() {
+                            names.push(name);
+                        }
+                    }
+                } else {
+                    let name = extract_base_package_name(raw);
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
 pub fn parse_pkg_dependencies(pkg_dir: &Path) -> Vec<String> {
     use crate::utils::run_command_with_output;
     let mut deps = Vec::new();
@@ -405,6 +467,28 @@ mod tests {
         assert_eq!(restored, "pkgver=1.0\npkgrel=1\n");
         assert!(!temp.join(".PKGBUILD.emerge_backup").exists());
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn parse_pkg_provided_names_reads_srcinfo() {
+        let temp = std::env::temp_dir().join(format!(
+            "abs_provided_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            temp.join(".SRCINFO"),
+            "pkgbase = foo\npkgname = foo\npkgname = foo-libs\nprovides = libfoo\n",
+        )
+        .unwrap();
+        let names = parse_pkg_provided_names(&temp);
+        assert!(names.contains(&"foo".to_string()));
+        assert!(names.contains(&"foo-libs".to_string()));
+        assert!(names.contains(&"libfoo".to_string()));
         let _ = fs::remove_dir_all(&temp);
     }
 

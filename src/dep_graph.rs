@@ -42,10 +42,14 @@ pub fn sort_packages_topologically(
         indegree.insert(base.clone(), 0);
     }
 
-    // Build the dependency graph
+    // Build the dependency graph. Edges resolve through pkgname/provides so a job keyed by
+    // pkgbase still waits on dependents that list a split package (e.g. `foo-libs`).
+    let mut provider_to_base: HashMap<String, String> = HashMap::new();
+    let mut pkg_dirs: HashMap<String, std::path::PathBuf> = HashMap::new();
+
     for (base, spec) in &base_to_spec {
         let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo_for_manual(&spec.name, cli, config);
-        
+
         // Fast, read-only prepare repo (does not clone/pull if it exists; smart dry-run bypasses commands)
         let pkg_config = config.packages.get(&spec.name);
         let targets = ramdisk::resolve_ramdisk_targets(
@@ -67,23 +71,33 @@ pub fn sort_packages_topologically(
         )
         .pkg_dir;
 
+        // Always map the job's base key itself.
+        provider_to_base.insert(base.clone(), base.clone());
+        for provided in crate::pkgbuild::parse_pkg_provided_names(pkg_dir.as_path()) {
+            provider_to_base.insert(provided, base.clone());
+        }
+        pkg_dirs.insert(base.clone(), pkg_dir);
+    }
+
+    for (base, pkg_dir) in &pkg_dirs {
         let deps = parse_pkg_dependencies(pkg_dir.as_path());
         vlog!("Topological Sort: {} has dependencies {:?}", base, deps);
 
         for dep in deps {
-            // If the dependency is one of the targets we are scheduled to build
-            if base_to_spec.contains_key(&dep) && dep != *base {
-                // A depends on dep (dep must be built first)
-                // Graph stores reverse edges for Kahn's (dep -> packages depending on dep)
-                // Wait! Let's build standard: dep -> base (dep has base as successor)
-                let dep_edges = graph
-                    .get_mut(&dep)
-                    .expect("Internal error: target package missing from graph");
-                if dep_edges.insert(base.clone()) {
-                    *indegree
-                        .get_mut(base)
-                        .expect("Internal error: target package missing from indegree map") += 1;
-                }
+            let Some(dep_base) = provider_to_base.get(&dep) else {
+                continue;
+            };
+            if dep_base == base {
+                continue;
+            }
+            // A depends on dep (dep must be built first)
+            let dep_edges = graph
+                .get_mut(dep_base)
+                .expect("Internal error: target package missing from graph");
+            if dep_edges.insert(base.clone()) {
+                *indegree
+                    .get_mut(base)
+                    .expect("Internal error: target package missing from indegree map") += 1;
             }
         }
     }
@@ -146,6 +160,20 @@ pub fn sort_packages_topologically(
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
+
+    fn init_bare_pkg_dir(dir: &std::path::Path, srcinfo: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(".SRCINFO"), srcinfo).unwrap();
+        // prepare_repo treats dirs without a usable .git as incomplete clones and tries to
+        // delete them; seed a minimal git repo so unit tests stay read-only.
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+    }
 
     #[test]
     fn test_topological_sort_success() {
@@ -154,13 +182,9 @@ mod tests {
         let pkg_b_dir = temp.join("aur").join("package-b");
         let pkg_c_dir = temp.join("aur").join("package-c");
 
-        fs::create_dir_all(&pkg_a_dir).unwrap();
-        fs::create_dir_all(&pkg_b_dir).unwrap();
-        fs::create_dir_all(&pkg_c_dir).unwrap();
-
-        fs::write(pkg_a_dir.join(".SRCINFO"), "pkgname = package-a\ndepends = package-b\n").unwrap();
-        fs::write(pkg_b_dir.join(".SRCINFO"), "pkgname = package-b\ndepends = package-c\n").unwrap();
-        fs::write(pkg_c_dir.join(".SRCINFO"), "pkgname = package-c\n").unwrap();
+        init_bare_pkg_dir(&pkg_a_dir, "pkgname = package-a\ndepends = package-b\n");
+        init_bare_pkg_dir(&pkg_b_dir, "pkgname = package-b\ndepends = package-c\n");
+        init_bare_pkg_dir(&pkg_c_dir, "pkgname = package-c\n");
 
         let config_content = format!(
             "config_version = 1\nmanual_update_packages = []\nskip_install_packages = []\n\n[paths]\npackages_path = \"{}\"\nchroot_base_path = \"\"\nready_made_packages_path = \"\"\n\n[build]\ndefault_environment = \"local\"\n\n[system_update]\ncommand_to_update_repositories = \"\"\ncommand_to_perform_system_update = \"\"\nignore_flag = \"\"\nignore_packages = []\n\n[repositories]\naur = \"https://aur.archlinux.org\"\ndefault = \"aur\"\n\n[packages]\n",
@@ -214,6 +238,15 @@ mod tests {
             purge: false,
             yes: false,
             no_wait: false,
+            list_add: None,
+            list_remove: None,
+            wizard: None,
+            pkg_list: None,
+            hold: None,
+            hold_version: None,
+            unhold: vec![],
+            hold_check: false,
+            trigger: vec![],
         };
 
         let specs = vec![
@@ -236,11 +269,8 @@ mod tests {
         let pkg_a_dir = temp.join("aur").join("package-a");
         let pkg_b_dir = temp.join("aur").join("package-b");
 
-        fs::create_dir_all(&pkg_a_dir).unwrap();
-        fs::create_dir_all(&pkg_b_dir).unwrap();
-
-        fs::write(pkg_a_dir.join(".SRCINFO"), "pkgname = package-a\ndepends = package-b\n").unwrap();
-        fs::write(pkg_b_dir.join(".SRCINFO"), "pkgname = package-b\ndepends = package-a\n").unwrap();
+        init_bare_pkg_dir(&pkg_a_dir, "pkgname = package-a\ndepends = package-b\n");
+        init_bare_pkg_dir(&pkg_b_dir, "pkgname = package-b\ndepends = package-a\n");
 
         let config_content = format!(
             "config_version = 1\nmanual_update_packages = []\nskip_install_packages = []\n\n[paths]\npackages_path = \"{}\"\nchroot_base_path = \"\"\nready_made_packages_path = \"\"\n\n[build]\ndefault_environment = \"local\"\n\n[system_update]\ncommand_to_update_repositories = \"\"\ncommand_to_perform_system_update = \"\"\nignore_flag = \"\"\nignore_packages = []\n\n[repositories]\naur = \"https://aur.archlinux.org\"\ndefault = \"aur\"\n\n[packages]\n",
@@ -294,6 +324,15 @@ mod tests {
             purge: false,
             yes: false,
             no_wait: false,
+            list_add: None,
+            list_remove: None,
+            wizard: None,
+            pkg_list: None,
+            hold: None,
+            hold_version: None,
+            unhold: vec![],
+            hold_check: false,
+            trigger: vec![],
         };
 
         let specs = vec![
@@ -304,6 +343,95 @@ mod tests {
         let result = sort_packages_topologically(&specs, &cli, &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Cyclic dependency detected"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn topological_sort_resolves_deps_via_pkgname_provides() {
+        let temp = std::env::temp_dir().join(format!(
+            "abs_test_topo_provides_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lib_dir = temp.join("aur").join("foo");
+        let app_dir = temp.join("aur").join("bar");
+
+        // Job keyed by pkgbase `foo` provides split package `foo-libs`.
+        init_bare_pkg_dir(
+            &lib_dir,
+            "pkgbase = foo\npkgname = foo\npkgname = foo-libs\n",
+        );
+        init_bare_pkg_dir(&app_dir, "pkgname = bar\ndepends = foo-libs\n");
+
+        let config_content = format!(
+            "config_version = 1\nmanual_update_packages = []\nskip_install_packages = []\n\n[paths]\npackages_path = \"{}\"\nchroot_base_path = \"\"\nready_made_packages_path = \"\"\n\n[build]\ndefault_environment = \"local\"\n\n[system_update]\ncommand_to_update_repositories = \"\"\ncommand_to_perform_system_update = \"\"\nignore_flag = \"\"\nignore_packages = []\n\n[repositories]\naur = \"https://aur.archlinux.org\"\ndefault = \"aur\"\n\n[packages]\n",
+            temp.to_str().unwrap().escape_default()
+        );
+        let config: Config = toml::from_str(&config_content).unwrap();
+        let cli = Cli {
+            download_only: false,
+            local_build: false,
+            chroot_build: false,
+            compile_only: false,
+            no_check: false,
+            force_build: false,
+            clean: false,
+            clean_all: false,
+            use_sudo_clean: false,
+            remove_chroot: false,
+            install_keys: false,
+            update_sums: false,
+            verbose: false,
+            silent: false,
+            force_repo_update: false,
+            system_update: false,
+            repo: Some("aur".to_string()),
+            jobs: None,
+            install_only: false,
+            clean_install: false,
+            dry_run: true,
+            list: false,
+            configure: None,
+            check_update: false,
+            self_update: false,
+            help: None,
+            ramdisk: None,
+            packages: vec![],
+            pgo: None,
+            pgo_resume: None,
+            pgo_status: None,
+            pgo_abort: None,
+            pgo_keep_stage: false,
+            pgo_restart: None,
+            pgo_stage: None,
+            pgo_once: false,
+            pgo_goto: false,
+            pgo_auto: false,
+            kernel_build: None,
+            ramdisk_shutdown: false,
+            json: false,
+            event_log: None,
+            purge: false,
+            yes: false,
+            no_wait: false,
+            list_add: None,
+            list_remove: None,
+            wizard: None,
+            pkg_list: None,
+            hold: None,
+            hold_version: None,
+            unhold: vec![],
+            hold_check: false,
+            trigger: vec![],
+        };
+
+        let specs = vec![PackageSpec::plain("bar"), PackageSpec::plain("foo")];
+        let sorted = sort_packages_topologically(&specs, &cli, &config).unwrap();
+        let sorted_names: Vec<String> = sorted.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(sorted_names, vec!["foo", "bar"]);
 
         let _ = fs::remove_dir_all(&temp);
     }

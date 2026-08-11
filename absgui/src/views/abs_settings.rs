@@ -17,6 +17,7 @@ const RAMDISK_MODE_OPTS: &[&str] = &["0755", "0775", "0700"];
 pub fn view<'a>(
     config: &'a ConfigDocument,
     editors: &'a ListEditors,
+    hold_check_report: Option<&'a str>,
     app_theme: AppTheme,
 ) -> Element<'a, Message> {
     let paths = card_section(
@@ -533,6 +534,107 @@ pub fn view<'a>(
         .spacing(8),
     );
 
+    let mut held_rows = column![].spacing(12);
+    if config.held_packages.is_empty() {
+        held_rows = held_rows.push(
+            text("No held packages.")
+                .size(13)
+                .color(crate::style::muted(app_theme)),
+        );
+    }
+    for (idx, held) in config.held_packages.iter().enumerate() {
+        let triggers = held.triggers_text();
+        let name = held.name.clone();
+        let has_pkg_config = config.packages.contains_key(&held.name) && !held.name.is_empty();
+        let mut actions = row![
+            button(text("Snapshot triggers").size(12))
+                .style(button::secondary)
+                .on_press(Message::HeldSnapshotTriggers(idx)),
+            button(text("Remove").size(12))
+                .style(button::danger)
+                .on_press(Message::HeldRemove(idx)),
+        ]
+        .spacing(8);
+        if has_pkg_config {
+            actions = actions.push(
+                button(text("Edit package").size(12))
+                    .on_press(Message::OpenPackage(name.clone())),
+            );
+        } else if !held.name.is_empty() {
+            actions = actions.push(
+                button(text("Add package config").size(12))
+                    .on_press(Message::OpenPackage(name.clone())),
+            );
+        }
+
+        held_rows = held_rows.push(
+            column![
+                row![
+                    field_text(
+                        "name",
+                        Some(field_help::HELD_NAME),
+                        &held.name,
+                        "libfoo",
+                        app_theme,
+                        move |v| Message::HeldNameChanged(idx, v),
+                    ),
+                    field_text(
+                        "version",
+                        Some(field_help::HELD_VERSION),
+                        &held.version,
+                        "1.2.3-1",
+                        app_theme,
+                        move |v| Message::HeldVersionChanged(idx, v),
+                    ),
+                ]
+                .spacing(8),
+                field_text(
+                    "on_packages_updated (name[=ver], …)",
+                    Some(field_help::HELD_TRIGGERS),
+                    &triggers,
+                    "glibc=2.41-1, icu=76.1-1",
+                    app_theme,
+                    move |v| Message::HeldTriggersChanged(idx, v),
+                ),
+                actions,
+            ]
+            .spacing(8),
+        );
+    }
+
+    let held_section_body = column![
+        text(field_help::HELD_PACKAGES)
+            .size(12)
+            .color(crate::style::muted(app_theme)),
+        held_rows,
+        row![
+            button(text("+ Hold package").size(13)).on_press(Message::HeldAdd),
+            button(text("Check holds").size(13))
+                .style(button::secondary)
+                .on_press(Message::HeldCheck),
+        ]
+        .spacing(8),
+        text(field_help::HELD_CHECK)
+            .size(11)
+            .color(crate::style::muted(app_theme)),
+        {
+            if let Some(report) = hold_check_report {
+                column![
+                    text("Hold check result").size(13),
+                    text(report)
+                        .size(12)
+                        .font(iced::Font::MONOSPACE),
+                ]
+                .spacing(4)
+            } else {
+                column![]
+            }
+        },
+    ]
+    .spacing(10);
+
+    let held_packages = card_section("Held packages", app_theme, held_section_body);
+
     let actions = row![
         button(text("Reload").size(14))
             .style(button::secondary)
@@ -553,6 +655,7 @@ pub fn view<'a>(
         self_update,
         package_lists,
         system_update,
+        held_packages,
         ramdisk,
         repositories,
         compilers,

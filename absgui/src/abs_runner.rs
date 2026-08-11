@@ -161,6 +161,56 @@ pub fn fetch_pgo_status(package: &str) -> Result<PgoStatus, String> {
     serde_json::from_str(&stdout[json_start..]).map_err(|e| format!("parse status JSON: {e}"))
 }
 
+/// Run `abs --hold-check` (optional package filter) and return combined stdout/stderr text.
+pub fn run_hold_check(packages: &[String]) -> Result<String, String> {
+    let mut cmd = Command::new(abs_binary());
+    cmd.arg("--hold-check").arg("--no-wait");
+    for pkg in packages {
+        if !pkg.trim().is_empty() {
+            cmd.arg(pkg);
+        }
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("spawn abs --hold-check: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut text = String::new();
+    if !stdout.trim().is_empty() {
+        text.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr.trim());
+    }
+    if !output.status.success() && text.is_empty() {
+        return Err(format!(
+            "abs --hold-check failed with status {}",
+            output.status
+        ));
+    }
+    if text.is_empty() {
+        Ok("(no held packages)".into())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Installed version from `pacman -Q`, or `None` if not installed.
+pub fn pacman_query_version(pkg: &str) -> Option<String> {
+    let output = Command::new("pacman").args(["-Q", pkg]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let line = line.lines().next()?.trim();
+    line.split_once(char::is_whitespace)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
@@ -716,6 +766,31 @@ pub fn external_run_pid_path(package: &str) -> PathBuf {
         .parent()
         .map(|dir| dir.join(format!("{package}.term.pid")))
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/{package}.term.pid")))
+}
+
+/// True when `path` holds a PID that still exists in `/proc` (or cannot be ruled out on non-Unix).
+pub fn pid_file_process_alive(path: Option<&Path>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<u32>() else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 fn kill_pid_from_file(path: Option<&Path>) {
