@@ -33,10 +33,10 @@ pub struct Config {
     pub self_update_raw_url: String,
     #[serde(default = "default_self_update_install_path")]
     pub self_update_install_path: String,
-    /// When `true`, `--self-update` builds `aur/PKGBUILD` and installs with pacman.
-    /// When `false`, copies the compiled `abs` binary to `self_update_install_path`.
-    /// Default (`null`/unset): auto-detect from installed pacman packages.
-    #[serde(default)]
+    /// When `true` (default), `--self-update` builds `aur/PKGBUILD` and installs with pacman.
+    /// When `false`, copies compiled `abs`/`absgui` next to `self_update_install_path`.
+    /// Unset / `null` is treated as `true`.
+    #[serde(default = "default_self_update_use_pacman")]
     pub self_update_use_pacman: Option<bool>,
     #[serde(default = "default_self_update_at_updates")]
     pub self_update_at_updates: bool,
@@ -76,6 +76,10 @@ fn default_install_testing_phase_archlinux_packages() -> bool {
 
 fn default_self_update_install_path() -> String {
     "/usr/bin/abs".to_string()
+}
+
+fn default_self_update_use_pacman() -> Option<bool> {
+    Some(true)
 }
 
 fn default_self_update_raw_url() -> String {
@@ -1102,9 +1106,8 @@ impl Config {
         println!(
             "  self_update_use_pacman: {}",
             match self.self_update_use_pacman {
-                None => "auto".to_string(),
-                Some(true) => "true".to_string(),
-                Some(false) => "false".to_string(),
+                None | Some(true) => "true",
+                Some(false) => "false",
             }
         );
         println!(
