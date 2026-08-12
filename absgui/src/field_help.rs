@@ -170,7 +170,7 @@ pub const SELF_UPDATE_RAW: &str =
     "Raw URL of Cargo.toml checked for the latest version string.";
 pub const SELF_UPDATE_INSTALL: &str = "Fallback path for the abs binary when not using pacman packages (legacy manual install).";
 pub const SELF_UPDATE_USE_PACMAN: &str =
-    "When true, --self-update builds aur/PKGBUILD and upgrades pacman packages. When false, copies the abs binary only. Default (auto) detects installed abs/absgui packages.";
+    "When true (default), --self-update builds aur/PKGBUILD and upgrades pacman packages. When false, copies abs and absgui binaries (and desktop/icon under /usr).";
 
 // --- Package lists ---
 

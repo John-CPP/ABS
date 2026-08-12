@@ -253,7 +253,7 @@ pub fn view<'a>(
                 "self_update_use_pacman",
                 Some(field_help::SELF_UPDATE_USE_PACMAN),
                 config.self_update_use_pacman,
-                "auto",
+                "true",
                 app_theme,
                 Message::SelfUpdateUsePacman,
             ),

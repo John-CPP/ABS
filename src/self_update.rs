@@ -79,11 +79,8 @@ fn pacman_installed(pkg: &str) -> bool {
 }
 
 fn should_use_pacman_update(config: &Config) -> bool {
-    match config.self_update_use_pacman {
-        Some(true) => true,
-        Some(false) => false,
-        None => pacman_installed("abs") || pacman_installed("absgui") || pacman_installed("abs-full"),
-    }
+    // Default (unset / None) and explicit true both use pacman; only false forces binary install.
+    !matches!(config.self_update_use_pacman, Some(false))
 }
 
 fn pacman_packages_to_upgrade() -> Vec<&'static str> {
@@ -294,6 +291,37 @@ fn sync_source_repo(config: &Config, expected_version: &str) -> Result<PathBuf, 
     Ok(abs_dir)
 }
 
+/// Install `src` to `dest` with `install -DmMODE`, retrying via sudo on failure.
+fn install_file(src: &Path, dest: &Path, mode: &str) -> Result<(), String> {
+    let src_str = src.to_string_lossy();
+    let dest_str = dest.to_string_lossy();
+    let mode_flag = format!("-Dm{mode}");
+    let install_res = run_command_quiet(
+        "install",
+        &[mode_flag.as_str(), src_str.as_ref(), dest_str.as_ref()],
+        None::<&str>,
+    );
+    if install_res.is_err() {
+        vlog!("Standard install failed for {}. Retrying with sudo...", dest.display());
+        run_command(
+            "sudo",
+            &[
+                "install",
+                mode_flag.as_str(),
+                src_str.as_ref(),
+                dest_str.as_ref(),
+            ],
+            None::<&str>,
+        )?;
+    }
+    Ok(())
+}
+
+/// Derive `…/absgui` from `self_update_install_path` (e.g. `/usr/bin/abs` → `/usr/bin/absgui`).
+fn absgui_install_path(abs_install_path: &str) -> PathBuf {
+    Path::new(abs_install_path).with_file_name("absgui")
+}
+
 fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String> {
     blog!("Compiling latest release...");
     run_command(
@@ -302,28 +330,46 @@ fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String
         Some(repo_dir),
     )?;
 
-    let new_binary = repo_dir.join("target").join("release").join("abs");
-    if !new_binary.exists() {
+    let release_dir = repo_dir.join("target").join("release");
+    let abs_binary = release_dir.join("abs");
+    if !abs_binary.exists() {
         return Err("Compiled binary not found in target/release/abs".into());
     }
 
-    let install_path = &config.self_update_install_path;
-    blog!("Installing executable to {}...", install_path);
+    let abs_install = PathBuf::from(&config.self_update_install_path);
+    blog!("Installing executable to {}...", abs_install.display());
+    install_file(&abs_binary, &abs_install, "755")?;
 
-    let new_str = new_binary.to_string_lossy();
-    let install_res = run_command_quiet(
-        "install",
-        &["-Dm755", new_str.as_ref(), install_path.as_ref()],
-        None::<&str>,
-    );
+    let gui_binary = release_dir.join("absgui");
+    if gui_binary.exists() {
+        let gui_install = absgui_install_path(&config.self_update_install_path);
+        blog!("Installing executable to {}...", gui_install.display());
+        install_file(&gui_binary, &gui_install, "755")?;
 
-    if install_res.is_err() {
-        vlog!("Standard install failed. Retrying with sudo...");
-        run_command(
-            "sudo",
-            &["install", "-Dm755", new_str.as_ref(), install_path.as_ref()],
-            None::<&str>,
-        )?;
+        // Match README / pacman package layout when installing under /usr/bin.
+        if abs_install.parent().is_some_and(|p| p == Path::new("/usr/bin")) {
+            let desktop = repo_dir.join("absgui").join("absgui.desktop");
+            let icon = repo_dir.join("absgui").join("assets").join("icon.png");
+            if desktop.exists() {
+                install_file(
+                    &desktop,
+                    Path::new("/usr/share/applications/absgui.desktop"),
+                    "644",
+                )?;
+            }
+            if icon.exists() {
+                install_file(
+                    &icon,
+                    Path::new("/usr/share/icons/hicolor/256x256/apps/absgui.png"),
+                    "644",
+                )?;
+            }
+        }
+    } else {
+        eprintln!(
+            "{} Compiled absgui not found in target/release; left existing GUI install unchanged.",
+            "==> WARNING:".yellow()
+        );
     }
 
     Ok(())
@@ -384,24 +430,13 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
     let repo_dir = sync_source_repo(config, &latest)?;
 
     if should_use_pacman_update(config) {
-        match run_pacman_self_update(&repo_dir, &latest) {
-            Ok(()) => {
-                blog!(
-                    "ABS successfully updated to version {} via pacman!",
-                    latest.green()
-                );
-                return Ok(true);
-            }
-            Err(e) => {
-                if config.self_update_use_pacman == Some(true) {
-                    return Err(format!("Pacman self-update failed: {e}"));
-                }
-                eprintln!(
-                    "{} Pacman self-update failed ({e}); falling back to binary install.",
-                    "==> WARNING:".yellow()
-                );
-            }
-        }
+        run_pacman_self_update(&repo_dir, &latest)
+            .map_err(|e| format!("Pacman self-update failed: {e}"))?;
+        blog!(
+            "ABS successfully updated to version {} via pacman!",
+            latest.green()
+        );
+        return Ok(true);
     }
 
     run_binary_self_update(config, &repo_dir)?;
@@ -473,5 +508,17 @@ name = "abs"
 version = "1.3.4"
 "#;
         assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("1.3.4"));
+    }
+
+    #[test]
+    fn absgui_path_siblings_abs_install_path() {
+        assert_eq!(
+            absgui_install_path("/usr/bin/abs"),
+            PathBuf::from("/usr/bin/absgui")
+        );
+        assert_eq!(
+            absgui_install_path("/home/user/.local/bin/abs"),
+            PathBuf::from("/home/user/.local/bin/absgui")
+        );
     }
 }
