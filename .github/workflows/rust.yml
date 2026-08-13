@@ -33,7 +33,18 @@ jobs:
           mapfile -t pkgs < <(find aur -maxdepth 1 -name '*.pkg.tar.zst' ! -name '*-debug-*')
           [[ ${#pkgs[@]} -gt 0 ]] || { echo "no packages built"; exit 1; }
           ver=$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-          notes="Built from ${{ github.sha }} (pkgver ${ver}). Install with: sudo pacman -U abs-*.pkg.tar.zst absgui-*.pkg.tar.zst abs-full-*.pkg.tar.zst"
+          names=()
+          for pkg in abs absgui abs-full; do
+            for p in "${pkgs[@]}"; do
+              b=$(basename "$p")
+              if [[ "$b" == "${pkg}-${ver}-"* ]]; then
+                names+=("$b")
+                break
+              fi
+            done
+          done
+          [[ ${#names[@]} -eq 3 ]] || { echo "expected abs, absgui, and abs-full packages, got: ${names[*]}"; exit 1; }
+          notes="$(printf 'Built from %s (pkgver %s).\n\n```\nsudo pacman -U %s %s %s\n```\n' '${{ github.sha }}' "$ver" "${names[0]}" "${names[1]}" "${names[2]}")"
           if gh release view latest >/dev/null 2>&1; then
             gh release upload latest --clobber "${pkgs[@]}"
             gh release edit latest --title "ABS ${ver}" --notes "$notes"
