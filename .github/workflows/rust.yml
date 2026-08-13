@@ -19,9 +19,9 @@ jobs:
           echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
       - uses: actions/checkout@v7
       - name: Build packages
-        working-directory: ${{ github.workspace }}/aur
+        working-directory: aur
         run: |
-          chown -R builder:builder "${{ github.workspace }}"
+          chown -R builder:builder "$GITHUB_WORKSPACE"
           sudo -u builder makepkg -s --noconfirm --noprogressbar
       - name: Publish rolling latest release
         env:
