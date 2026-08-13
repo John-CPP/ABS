@@ -26,7 +26,9 @@ jobs:
       - name: Publish rolling latest release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           shopt -s nullglob
           mapfile -t pkgs < <(find aur -maxdepth 1 -name '*.pkg.tar.zst' ! -name '*-debug-*')
           [[ ${#pkgs[@]} -gt 0 ]] || { echo "no packages built"; exit 1; }
