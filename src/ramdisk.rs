@@ -1,8 +1,8 @@
 use crate::config::{Config, PackageConfig, RamdiskConfig};
 use crate::package_spec::PackageSpec;
 use crate::utils::{
-    append_deletable_roots, check_sudo_removal, path_has_prefix,
-    resolve_path_for_deletion, run_command, validate_config_path,
+    append_deletable_roots, check_sudo_removal, path_has_prefix, resolve_path_for_deletion,
+    run_command, validate_config_path,
 };
 use crate::{blog, die, ewarn, is_dry_run_mode, vlog};
 use std::fs;
@@ -40,7 +40,11 @@ fn defer_workdir_removal(path: PathBuf) {
 }
 
 pub fn cleanup_pending_workdirs() {
-    let paths: Vec<PathBuf> = pending_workdir_removals().lock().unwrap().drain(..).collect();
+    let paths: Vec<PathBuf> = pending_workdir_removals()
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect();
     for path in paths {
         if path.exists() {
             let _ = check_sudo_removal(&path);
@@ -300,13 +304,11 @@ pub fn mem_available_mb() -> Result<u64, String> {
 
 pub fn workdir_key(repo_dir: &Path, packages_path: &str) -> String {
     let repo_abs = resolve_path_for_deletion(repo_dir).unwrap_or_else(|_| repo_dir.to_path_buf());
-    let base_abs =
-        resolve_path_for_deletion(Path::new(packages_path)).unwrap_or_else(|_| PathBuf::from(packages_path));
+    let base_abs = resolve_path_for_deletion(Path::new(packages_path))
+        .unwrap_or_else(|_| PathBuf::from(packages_path));
 
     if path_has_prefix(&base_abs, &repo_abs) {
-        let rel = repo_abs
-            .strip_prefix(&base_abs)
-            .unwrap_or(&repo_abs);
+        let rel = repo_abs.strip_prefix(&base_abs).unwrap_or(&repo_abs);
         let key = rel
             .components()
             .filter_map(|c| match c {
@@ -344,12 +346,70 @@ fn invoking_uid_gid() -> (u32, u32) {
     unsafe { (libc::getuid(), libc::getgid()) }
 }
 
-fn tmpfs_mount_options(config: &RamdiskConfig) -> String {
+fn tmpfs_mount_options(config: &RamdiskConfig) -> Result<String, String> {
+    validate_ramdisk_size(&config.size)?;
+    validate_ramdisk_mode(&config.mode)?;
     let (uid, gid) = invoking_uid_gid();
-    format!(
+    Ok(format!(
         "size={},mode={},uid={},gid={}",
-        config.size, config.mode, uid, gid
-    )
+        config.size.trim(),
+        config.mode.trim(),
+        uid,
+        gid
+    ))
+}
+
+/// tmpfs `size=` value: digits plus an optional k/m/g/t/% suffix. No commas (mount-option injection).
+pub fn validate_ramdisk_size(size: &str) -> Result<(), String> {
+    let s = size.trim();
+    if s.is_empty() || s.contains(',') || s.contains('=') || s.contains(' ') {
+        return Err(format!(
+            "invalid ramdisk.size {s:?} (expected e.g. 16G or 50%)"
+        ));
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return Err(format!(
+            "invalid ramdisk.size {s:?} (must start with a number)"
+        ));
+    }
+    match &s[i..] {
+        "" | "%" | "k" | "K" | "m" | "M" | "g" | "G" | "t" | "T" | "ki" | "Ki" | "mi" | "Mi"
+        | "gi" | "Gi" | "ti" | "Ti" => Ok(()),
+        other => Err(format!(
+            "invalid ramdisk.size suffix {other:?} (use k/m/g/t or %)"
+        )),
+    }
+}
+
+/// Directory mode for tmpfs: 3–4 octal digits, optional leading `0`.
+pub fn validate_ramdisk_mode(mode: &str) -> Result<(), String> {
+    let s = mode.trim().trim_start_matches("0o");
+    if (3..=4).contains(&s.len()) && s.chars().all(|c| matches!(c, '0'..='7')) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid ramdisk.mode {mode:?} (expected octal like 0755)"
+        ))
+    }
+}
+
+/// Mount point must be an ABS-named directory (default `/run/abs-ram`), not a home or system root.
+pub fn validate_ramdisk_mount_point(path: &str) -> Result<(), String> {
+    crate::utils::validate_config_path("ramdisk.mount_point", path)?;
+    let resolved = resolve_path_for_deletion(Path::new(path.trim()))?;
+    let name = resolved.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.starts_with("abs") {
+        return Ok(());
+    }
+    Err(format!(
+        "ramdisk.mount_point must be a directory named abs* (e.g. /run/abs-ram), got {}",
+        resolved.display()
+    ))
 }
 
 fn ensure_mount_point_dir(mount_point: &Path) -> Result<(), String> {
@@ -357,10 +417,7 @@ fn ensure_mount_point_dir(mount_point: &Path) -> Result<(), String> {
         return Ok(());
     }
     if is_dry_run_mode() {
-        println!(
-            "[DRY RUN] sudo mkdir -p {}",
-            mount_point.display()
-        );
+        println!("[DRY RUN] sudo mkdir -p {}", mount_point.display());
         return Ok(());
     }
     run_command(
@@ -373,9 +430,7 @@ fn ensure_mount_point_dir(mount_point: &Path) -> Result<(), String> {
 fn ensure_ramdisk_subdir(path: &Path) -> Result<(), String> {
     match fs::create_dir_all(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            ensure_ramdisk_path(path)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => ensure_ramdisk_path(path),
         Err(e) => Err(format!("failed to create {}: {}", path.display(), e)),
     }
 }
@@ -489,7 +544,10 @@ fn unmount_mount_point(mount_point: &Path) -> bool {
     if run_command("sudo", &["umount", path.as_ref()], None::<&str>).is_ok() {
         return true;
     }
-    vlog!("Mount {} is busy; trying lazy unmount (umount -l)...", mount_point.display());
+    vlog!(
+        "Mount {} is busy; trying lazy unmount (umount -l)...",
+        mount_point.display()
+    );
     run_command("sudo", &["umount", "-l", path.as_ref()], None::<&str>).is_ok()
 }
 
@@ -532,7 +590,7 @@ fn mount_tmpfs(mount_point: &Path, config: &RamdiskConfig) -> Result<bool, Strin
     }
 
     if is_dry_run_mode() {
-        let opts = tmpfs_mount_options(config);
+        let opts = tmpfs_mount_options(config)?;
         println!(
             "[DRY RUN] sudo mount -t tmpfs -o {} tmpfs {}",
             opts,
@@ -545,6 +603,7 @@ fn mount_tmpfs(mount_point: &Path, config: &RamdiskConfig) -> Result<bool, Strin
 
     ensure_mount_point_dir(mount_point)?;
 
+    let opts = tmpfs_mount_options(config)?;
     run_command(
         "sudo",
         &[
@@ -552,7 +611,7 @@ fn mount_tmpfs(mount_point: &Path, config: &RamdiskConfig) -> Result<bool, Strin
             "-t",
             "tmpfs",
             "-o",
-            &tmpfs_mount_options(config),
+            &opts,
             "tmpfs",
             &mount_point.to_string_lossy(),
         ],
@@ -750,7 +809,8 @@ fn mount_session(config: &Config) -> Result<RamdiskSession, String> {
     if available < config.ramdisk.min_free_ram_mb {
         die!(
             "Refusing to mount ramdisk: MemAvailable is {} MiB (min_free_ram_mb = {})",
-            available, config.ramdisk.min_free_ram_mb
+            available,
+            config.ramdisk.min_free_ram_mb
         );
     }
 
@@ -890,11 +950,7 @@ fn sync_chroot_to_seed(session: &RamdiskSession) {
     blog!("Syncing ramdisk chroot back to {}...", seed);
 
     if is_dry_run_mode() {
-        println!(
-            "[DRY RUN] rsync -a {}/ {}/",
-            ram_chroot.display(),
-            seed
-        );
+        println!("[DRY RUN] rsync -a {}/ {}/", ram_chroot.display(), seed);
         return;
     }
 
@@ -998,9 +1054,7 @@ pub struct WorkdirGuard {
 impl WorkdirGuard {
     /// Directory where makepkg should run (ramdisk copy when `w` is active).
     pub fn build_dir(&self) -> &Path {
-        self.ram_repo
-            .as_deref()
-            .unwrap_or(self.disk_repo.as_path())
+        self.ram_repo.as_deref().unwrap_or(self.disk_repo.as_path())
     }
 
     pub fn uses_ramdisk(&self) -> bool {
@@ -1102,10 +1156,7 @@ mod tests {
 
     #[test]
     fn pending_workdir_paths_tracks_deferred_removals() {
-        let dir = std::env::temp_dir().join(format!(
-            "abs-pending-workdir-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("abs-pending-workdir-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         defer_workdir_removal(dir.clone());
         assert_eq!(pending_workdir_paths(), vec![dir.clone()]);
@@ -1323,5 +1374,11 @@ packages = false
     fn mount_point_validation_allows_run_subpath() {
         assert!(validate_config_path("ramdisk.mount_point", "/run/abs-ram").is_ok());
         assert!(validate_config_path("ramdisk.mount_point", "/run").is_err());
+        assert!(validate_ramdisk_mount_point("/run/abs-ram").is_ok());
+        assert!(validate_ramdisk_mount_point("/home/someone").is_err());
+        assert!(validate_ramdisk_size("16G").is_ok());
+        assert!(validate_ramdisk_size("16G,uid=0").is_err());
+        assert!(validate_ramdisk_mode("0755").is_ok());
+        assert!(validate_ramdisk_mode("0777,noexec").is_err());
     }
 }

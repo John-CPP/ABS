@@ -2,28 +2,26 @@ use crate::abs_runner::{
     self, fetch_pgo_status, run_ramdisk_shutdown, stream_abs_pgo, AbsPgoStreamItem, PgoAction,
     PgoRunHandle, PgoStatus,
 };
-use iced::futures::StreamExt;
 use crate::app_settings::{load_window_icon, AppTheme, GuiSettings};
-use crate::list_editors::{self, ListEditors, PackageListField};
 use crate::config::{config_path, load_config, save_config, ConfigDocument, PackageSection};
 use crate::dialog;
 use crate::field_help;
+use crate::list_editors::{self, ListEditors, PackageListField};
 use crate::messages::{EditTarget, KBool, KOptBool, KStr, Message, Page, PathField, RamdiskLetter};
 use crate::style;
 use crate::views::abs_settings;
 use crate::widgets::{
     card_section, encode_ramdisk_flags, field_checkbox, field_number, field_path, field_pick,
-    field_text, optional_bool_field, parse_ramdisk_flags, kernel_ramdisk_targets_field,
-    page_title, ramdisk_targets_field, PathField as WPathField, PathKind as WPathKind,
+    field_text, kernel_ramdisk_targets_field, optional_bool_field, page_title, parse_ramdisk_flags,
+    ramdisk_targets_field, PathField as WPathField, PathKind as WPathKind,
 };
 use iced::event;
+use iced::futures::StreamExt;
 use iced::widget::{
     button, column, container, image, row, rule, scrollable, text, text_editor, text_input, Space,
 };
-use iced::{clipboard, window, time};
-use iced::{
-    Alignment, Element, Font, Length, Padding, Subscription, Task, Theme,
-};
+use iced::{clipboard, time, window};
+use iced::{Alignment, Element, Font, Length, Padding, Subscription, Task, Theme};
 use std::sync::Arc;
 
 const PGO_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -55,10 +53,7 @@ fn pgo_stage_label(key: &str) -> &str {
 }
 
 fn pgo_auto_restart_enabled(pkg: &PackageSection) -> bool {
-    pkg.pgo
-        .as_ref()
-        .map(|p| p.auto_restart)
-        .unwrap_or(false)
+    pkg.pgo.as_ref().map(|p| p.auto_restart).unwrap_or(false)
 }
 
 fn pgo_stage_index(stage: &str) -> Option<usize> {
@@ -104,7 +99,14 @@ fn pgo_saved_at_wait_reboot(saved: &str) -> bool {
 }
 
 const SCHED_OPTS: &[&str] = &[
-    "cachyos", "bore", "eevdf", "rt", "rt-bore", "hardened", "bmq", "sched-ext",
+    "cachyos",
+    "bore",
+    "eevdf",
+    "rt",
+    "rt-bore",
+    "hardened",
+    "bmq",
+    "sched-ext",
 ];
 const LTO_OPTS: &[&str] = &["none", "thin", "full"];
 const HZ_OPTS: &[&str] = &["100", "250", "300", "500", "600", "750", "1000"];
@@ -121,13 +123,17 @@ pub fn run() -> iced::Result {
     let icon = load_window_icon();
     let window = gui_settings.window_settings(icon);
     let boot_settings = gui_settings.clone();
-    iced::application(move || App::new(boot_settings.clone()), App::update, App::view)
-        .title(App::title)
-        .theme(App::theme)
-        .subscription(App::subscription)
-        .window(window)
-        .exit_on_close_request(false)
-        .run()
+    iced::application(
+        move || App::new(boot_settings.clone()),
+        App::update,
+        App::view,
+    )
+    .title(App::title)
+    .theme(App::theme)
+    .subscription(App::subscription)
+    .window(window)
+    .exit_on_close_request(false)
+    .run()
 }
 
 pub struct App {
@@ -186,9 +192,7 @@ impl App {
             window::close_requests().map(|_| Message::WindowCloseRequested),
         ];
         if state.pgo_status_poll_active() {
-            subs.push(
-                time::every(PGO_STATUS_POLL_INTERVAL).map(|_| Message::RefreshPgoStatus),
-            );
+            subs.push(time::every(PGO_STATUS_POLL_INTERVAL).map(|_| Message::RefreshPgoStatus));
         }
         Subscription::batch(subs)
     }
@@ -242,13 +246,15 @@ impl App {
                 .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
         }
         if !first_line {
-            self.log_content.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                Arc::new("\n".to_string()),
-            )));
+            self.log_content
+                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    Arc::new("\n".to_string()),
+                )));
         }
-        self.log_content.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-            Arc::new(line.to_string()),
-        )));
+        self.log_content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(line.to_string()),
+            )));
     }
 
     fn append_log(&mut self, line: impl Into<String>) {
@@ -275,11 +281,7 @@ impl App {
 
     fn sync_pgo_selected_stage_from_status(&mut self, status: &PgoStatus) {
         let saved = status.stage.as_str();
-        let stage_changed = self
-            .pgo_status
-            .as_ref()
-            .map(|s| s.stage.as_str())
-            != Some(saved);
+        let stage_changed = self.pgo_status.as_ref().map(|s| s.stage.as_str()) != Some(saved);
 
         if stage_changed || !is_valid_pgo_phase_key(&self.pgo_selected_stage) {
             self.pgo_selected_stage = pgo_default_selected_stage(saved);
@@ -482,7 +484,11 @@ impl App {
 
     fn apply_path(&mut self, field: PathField, value: String) {
         let trimmed = value.trim().to_string();
-        let opt = if trimmed.is_empty() { None } else { Some(trimmed) };
+        let opt = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
         match field {
             PathField::PackagesPath => {
                 if let Some(v) = opt {
@@ -576,9 +582,8 @@ impl App {
                     self.config
                         .packages
                         .insert(name.clone(), PackageSection::default());
-                    self.status_message = Some(format!(
-                        "Created [packages.{name}] — configure and Save."
-                    ));
+                    self.status_message =
+                        Some(format!("Created [packages.{name}] — configure and Save."));
                 }
                 self.selected_package = Some(name);
                 self.page = Page::PackageConfig;
@@ -646,7 +651,10 @@ impl App {
                 }
                 let path = self.config_path.clone();
                 let doc = self.config.clone();
-                return Task::perform(async move { save_config(&path, &doc) }, Message::ConfigSaved);
+                return Task::perform(
+                    async move { save_config(&path, &doc) },
+                    Message::ConfigSaved,
+                );
             }
             Message::SaveAppSettings => {
                 let settings = self.gui_settings.clone();
@@ -745,14 +753,19 @@ impl App {
                     self.config.skip_install_packages_after_compilation = Some(
                         list_editors::parse_lines(&self.list_editors.skip_install_after.text()),
                     );
-                    if self.list_editors.skip_install_after.text().trim().is_empty() {
-                        self.list_editors.skip_install_after = iced::widget::text_editor::Content::with_text(
-                            &list_editors::lines_to_text(&self.config.skip_install_packages),
-                        );
-                        self.list_editors.apply_field(
-                            PackageListField::SkipInstallAfter,
-                            &mut self.config,
-                        );
+                    if self
+                        .list_editors
+                        .skip_install_after
+                        .text()
+                        .trim()
+                        .is_empty()
+                    {
+                        self.list_editors.skip_install_after =
+                            iced::widget::text_editor::Content::with_text(
+                                &list_editors::lines_to_text(&self.config.skip_install_packages),
+                            );
+                        self.list_editors
+                            .apply_field(PackageListField::SkipInstallAfter, &mut self.config);
                     }
                 } else {
                     self.config.skip_install_packages_after_compilation = None;
@@ -765,7 +778,9 @@ impl App {
                 self.config.system_update.command_to_perform_system_update = v;
             }
             Message::SysUpdateNoRefreshCmd(v) => {
-                self.config.system_update.command_to_perform_system_update_no_refresh = opt_str(v);
+                self.config
+                    .system_update
+                    .command_to_perform_system_update_no_refresh = opt_str(v);
             }
             Message::SysUpdateIgnoreFlag(v) => self.config.system_update.ignore_flag = v,
             Message::RamdiskEnabled(v) => self.config.ramdisk.enabled = v,
@@ -856,9 +871,8 @@ impl App {
                     version,
                     auto_recompile_trigger: crate::config::AutoRecompileTrigger::default(),
                 });
-                self.status_message = Some(
-                    "Added held package row — set name and version, then Save.".into(),
-                );
+                self.status_message =
+                    Some("Added held package row — set name and version, then Save.".into());
             }
             Message::HeldRemove(idx) => {
                 if idx < self.config.held_packages.len() {
@@ -1032,9 +1046,8 @@ impl App {
             }
             Message::PgoSelectStage(stage) => {
                 if self.busy {
-                    return self.push_log(
-                        "PGO is running — wait for it to finish before changing phase.",
-                    );
+                    return self
+                        .push_log("PGO is running — wait for it to finish before changing phase.");
                 }
                 if is_valid_pgo_phase_key(&stage) {
                     self.pgo_selected_stage = stage;
@@ -1086,8 +1099,9 @@ impl App {
                     return Task::none();
                 };
                 if self.busy {
-                    return self
-                        .push_log("A build is already running — wait for it to finish or click Abort.");
+                    return self.push_log(
+                        "A build is already running — wait for it to finish or click Abort.",
+                    );
                 }
                 self.list_editors.apply_all(&mut self.config);
                 if !self.config.packages.contains_key(&pkg) {
@@ -1117,8 +1131,14 @@ impl App {
                     return self.push_log(format!("Cannot build: failed to save config: {e}"));
                 }
                 self.append_log(format!("Saved {}", path.display()));
-                let abs_cmd =
-                    abs_runner::format_abs_pgo_command(PgoAction::KernelBuild, &pkg, None, None, false, false);
+                let abs_cmd = abs_runner::format_abs_pgo_command(
+                    PgoAction::KernelBuild,
+                    &pkg,
+                    None,
+                    None,
+                    false,
+                    false,
+                );
                 self.append_log(format!("$ {abs_cmd}"));
                 match abs_runner::launch_in_terminal(&abs_cmd, None) {
                     Ok(term) => {
@@ -1139,14 +1159,21 @@ impl App {
                         return Task::batch([
                             self.scroll_log_if_following(),
                             Task::stream(
-                                stream_abs_pgo(PgoAction::KernelBuild, pkg, None, None, false, false, handle).map(
-                                    |item| match item {
-                                        AbsPgoStreamItem::Line(line) => Message::PgoLogLine(line),
-                                        AbsPgoStreamItem::Finished(result) => {
-                                            Message::PgoRunFinished(result)
-                                        }
-                                    },
-                                ),
+                                stream_abs_pgo(
+                                    PgoAction::KernelBuild,
+                                    pkg,
+                                    None,
+                                    None,
+                                    false,
+                                    false,
+                                    handle,
+                                )
+                                .map(|item| match item {
+                                    AbsPgoStreamItem::Line(line) => Message::PgoLogLine(line),
+                                    AbsPgoStreamItem::Finished(result) => {
+                                        Message::PgoRunFinished(result)
+                                    }
+                                }),
                             ),
                         ]);
                     }
@@ -1346,17 +1373,21 @@ impl App {
     }
 
     fn view_sidebar(&self, theme: AppTheme) -> Element<'_, Message> {
-        let kernels_active =
-            matches!(self.page, Page::Kernels | Page::KernelConfig | Page::DefaultKernelConfig);
+        let kernels_active = matches!(
+            self.page,
+            Page::Kernels | Page::KernelConfig | Page::DefaultKernelConfig
+        );
         let nav = column![
             row![
-                image(image::Handle::from_bytes(
-                    bytes::Bytes::from_static(include_bytes!("../assets/icon.png")),
-                ))
+                image(image::Handle::from_bytes(bytes::Bytes::from_static(
+                    include_bytes!("../assets/icon.png")
+                ),))
                 .width(Length::Fixed(36.0))
                 .height(Length::Fixed(36.0)),
                 column![
-                    text("ABS").size(24).color(style::iced_theme(theme).palette().primary),
+                    text("ABS")
+                        .size(24)
+                        .color(style::iced_theme(theme).palette().primary),
                     text("kernel manager").size(11).color(style::muted(theme)),
                 ],
             ]
@@ -1470,10 +1501,7 @@ impl App {
                 name,
                 theme,
                 row![
-                    column![
-                        text(*desc).size(12).color(style::muted(theme)),
-                    ]
-                    .width(Length::Fill),
+                    column![text(*desc).size(12).color(style::muted(theme)),].width(Length::Fill),
                     container(text(*sched).size(11))
                         .padding(pill_padding())
                         .style(style::tag(theme)),
@@ -1814,13 +1842,13 @@ impl App {
         let saved = self.effective_pgo_stage();
         let saved_idx = pgo_stage_index(saved);
         let at_wait_reboot = pgo_saved_at_wait_reboot(saved);
-        let show_start_from_phase = !at_wait_reboot && self.pgo_selected_stage != pgo_first_phase_key();
+        let show_start_from_phase =
+            !at_wait_reboot && self.pgo_selected_stage != pgo_first_phase_key();
 
         let mut timeline = row![].spacing(6);
         for (i, (label, key)) in PGO_STEPS.iter().copied().enumerate() {
             let is_selected = selected == key;
-            let is_saved = saved == key
-                || (saved == "done" && key == "stage3_build");
+            let is_saved = saved == key || (saved == "done" && key == "stage3_build");
             let is_done = saved == "done" || saved_idx.is_some_and(|idx| i < idx);
             let pill_label = if is_done {
                 format!("✓ {label}")
@@ -1862,10 +1890,7 @@ impl App {
         }
 
         let status_row: Element<'_, Message> = if let Some(ref s) = self.pgo_status {
-            let mut detail = vec![format!(
-                "selected: {}",
-                pgo_stage_label(selected)
-            )];
+            let mut detail = vec![format!("selected: {}", pgo_stage_label(selected))];
             if !s.stage.is_empty() && s.stage_label != "No pipeline" {
                 detail.push(format!("saved: {}", s.stage_label));
             }
@@ -1898,11 +1923,9 @@ impl App {
                 .into()
         };
 
-        let mut action_row = row![
-            button(text("Start from scratch").size(14))
-                .style(button::primary)
-                .on_press_maybe((!self.busy).then_some(Message::PgoRestartFromScratch)),
-        ]
+        let mut action_row = row![button(text("Start from scratch").size(14))
+            .style(button::primary)
+            .on_press_maybe((!self.busy).then_some(Message::PgoRestartFromScratch)),]
         .spacing(8);
         if at_wait_reboot {
             action_row = action_row.push(
@@ -2138,8 +2161,7 @@ fn kernel_form<'a>(
                 field_number(
                     "compilation_threads (optional)",
                     Some(field_help::PACKAGE_COMPILATION_THREADS),
-                    &pkg
-                        .compilation_threads
+                    &pkg.compilation_threads
                         .map(|n| n.to_string())
                         .unwrap_or_default(),
                     theme,
@@ -2447,8 +2469,7 @@ fn package_form<'a>(
                 field_number(
                     "compilation_threads (optional)",
                     Some(field_help::PACKAGE_COMPILATION_THREADS),
-                    &pkg
-                        .compilation_threads
+                    &pkg.compilation_threads
                         .map(|n| n.to_string())
                         .unwrap_or_default(),
                     theme,
@@ -2755,17 +2776,31 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
         KStr::CustomLocalBuildCommand => pkg.custom_local_build_command = opt,
         KStr::CustomChrootBuildCommand => pkg.custom_chroot_build_command = opt,
         KStr::Cpusched => pkg.kernel.get_or_insert_with(Default::default).cpusched = opt,
-        KStr::ProcessorOpt => pkg.kernel.get_or_insert_with(Default::default).processor_opt = opt,
+        KStr::ProcessorOpt => {
+            pkg.kernel
+                .get_or_insert_with(Default::default)
+                .processor_opt = opt
+        }
         KStr::LlvmLto => pkg.kernel.get_or_insert_with(Default::default).use_llvm_lto = opt,
         KStr::HzTicks => pkg.kernel.get_or_insert_with(Default::default).hz_ticks = opt,
         KStr::Tickrate => pkg.kernel.get_or_insert_with(Default::default).tickrate = opt,
         KStr::Preempt => pkg.kernel.get_or_insert_with(Default::default).preempt = opt,
         KStr::Hugepage => pkg.kernel.get_or_insert_with(Default::default).hugepage = opt,
         KStr::ArchiveDir => {
-            pkg.pgo.get_or_insert_with(Default::default).profiles_archive_dir = opt
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .profiles_archive_dir = opt
         }
-        KStr::Benchmark => pkg.pgo.get_or_insert_with(Default::default).benchmark_command = opt,
-        KStr::BenchmarkWorkdir => pkg.pgo.get_or_insert_with(Default::default).benchmark_workdir = opt,
+        KStr::Benchmark => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .benchmark_command = opt
+        }
+        KStr::BenchmarkWorkdir => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .benchmark_workdir = opt
+        }
         KStr::BenchmarkPreset | KStr::ProfilingQuality => unreachable!("handled above"),
         KStr::BuildUser => pkg.pgo.get_or_insert_with(Default::default).build_user = opt,
         KStr::SysctlCommand => pkg.pgo.get_or_insert_with(Default::default).sysctl_command = opt,
@@ -2813,26 +2848,26 @@ fn kbool_value(pkg: &PackageSection, field: KBool) -> bool {
 fn set_kbool(pkg: &mut PackageSection, field: KBool, value: bool) {
     match field {
         KBool::PgoEnabled => pkg.pgo.get_or_insert_with(Default::default).enabled = value,
-        KBool::PgoAutoRestart => {
-            pkg.pgo.get_or_insert_with(Default::default).auto_restart = value
-        }
+        KBool::PgoAutoRestart => pkg.pgo.get_or_insert_with(Default::default).auto_restart = value,
         KBool::PgoPerfDataOnRam => {
-            pkg.pgo.get_or_insert_with(Default::default).perf_data_on_ram = value
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .perf_data_on_ram = value
         }
-        KBool::PgoVerifyBoot => {
-            pkg.pgo.get_or_insert_with(Default::default).verify_boot = value
-        }
+        KBool::PgoVerifyBoot => pkg.pgo.get_or_insert_with(Default::default).verify_boot = value,
         KBool::CcHarder => {
             pkg.kernel.get_or_insert_with(Default::default).cc_harder =
                 if value { Some("y".into()) } else { None }
         }
         KBool::LtoSuffix => {
-            pkg.kernel.get_or_insert_with(Default::default).use_lto_suffix =
-                if value { Some("y".into()) } else { None }
+            pkg.kernel
+                .get_or_insert_with(Default::default)
+                .use_lto_suffix = if value { Some("y".into()) } else { None }
         }
         KBool::GccSuffix => {
-            pkg.kernel.get_or_insert_with(Default::default).use_gcc_suffix =
-                if value { Some("y".into()) } else { None }
+            pkg.kernel
+                .get_or_insert_with(Default::default)
+                .use_gcc_suffix = if value { Some("y".into()) } else { None }
         }
         KBool::Kcfi => {
             pkg.kernel.get_or_insert_with(Default::default).use_kcfi =

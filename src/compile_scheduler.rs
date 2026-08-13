@@ -39,6 +39,7 @@ struct SchedulerState {
     finished: HashSet<String>,
     failed: HashSet<String>,
     exclusive_alone: bool,
+    fatal: Option<String>,
 }
 
 /// Read-only data shared by all worker threads.
@@ -104,6 +105,7 @@ pub fn run_compilations(
         finished: HashSet::new(),
         failed: HashSet::new(),
         exclusive_alone: false,
+        fatal: None,
     });
     let cvar = Condvar::new();
     let shared = SchedulerShared {
@@ -134,7 +136,11 @@ pub fn run_compilations(
     });
     drop(parallel_console);
 
-    let guard = state.lock().unwrap();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(msg) = guard.fatal.clone() {
+        drop(guard);
+        crate::die!("{}", msg);
+    }
     for base in &guard.failed {
         if let Some(name) = base_to_name.get(base) {
             skipped_install.insert(name.clone());
@@ -153,13 +159,9 @@ fn build_job_graph(sorted_specs: &[PackageSpec], cli: &Cli, config: &Config) -> 
             build::resolve_pkg_repo_for_manual(&spec.name, cli, config);
         base_to_name.insert(base.clone(), spec.name.clone());
         let pkg_cfg = config.packages.get(&spec.name);
-        let targets = ramdisk::resolve_ramdisk_targets(
-            config,
-            pkg_cfg,
-            Some(spec),
-            cli.ramdisk.as_deref(),
-        )
-        .unwrap_or_default();
+        let targets =
+            ramdisk::resolve_ramdisk_targets(config, pkg_cfg, Some(spec), cli.ramdisk.as_deref())
+                .unwrap_or_default();
         let pkg_dir = git::prepare_repo(
             &spec.name,
             &base,
@@ -220,20 +222,28 @@ fn worker_loop(
 ) {
     loop {
         let job = {
-            let mut guard = state.lock().unwrap();
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                if guard.fatal.is_some() {
+                    return;
+                }
                 drain_blocked_pending(&mut guard, shared.deps_map);
                 if guard.pending.is_empty() && guard.active.is_empty() {
                     return;
                 }
-                let picked = pick_next_job(&guard, shared).or_else(|| {
-                    let stalled = detect_stalled_job(&guard, shared)?;
-                    crate::die!(
-                        "Parallel compile: {} has unsatisfiable dependencies (cycle or missing \
-                         provider mapping). Refusing to start it out of order.",
-                        stalled
-                    );
-                });
+                let picked = pick_next_job(&guard, shared);
+                if picked.is_none()
+                    && let Some(stalled) = detect_stalled_job(&guard, shared)
+                {
+                    guard.fatal = Some(format!(
+                        "Parallel compile: {stalled} has unsatisfiable dependencies (cycle or missing \
+                         provider mapping). Refusing to start it out of order."
+                    ));
+                    cvar.notify_all();
+                }
+                if guard.fatal.is_some() {
+                    return;
+                }
                 if let Some(base) = picked {
                     let job = shared.jobs.get(&base).unwrap().clone();
                     guard.pending.remove(&base);
@@ -246,7 +256,7 @@ fn worker_loop(
                     }
                     break job;
                 }
-                guard = cvar.wait(guard).unwrap();
+                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
             }
         };
 
@@ -269,10 +279,8 @@ fn worker_loop(
         drop(label_guard);
 
         {
-            let mut guard = state.lock().unwrap();
-            guard
-                .active
-                .retain(|a| a.base_name != job.base_name);
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.active.retain(|a| a.base_name != job.base_name);
             if guard.exclusive_alone && job.compile_alone {
                 guard.exclusive_alone = false;
             }
@@ -286,10 +294,7 @@ fn worker_loop(
     }
 }
 
-fn drain_blocked_pending(
-    state: &mut SchedulerState,
-    deps_map: &HashMap<String, HashSet<String>>,
-) {
+fn drain_blocked_pending(state: &mut SchedulerState, deps_map: &HashMap<String, HashSet<String>>) {
     let blocked: Vec<String> = state
         .pending
         .iter()
@@ -301,7 +306,10 @@ fn drain_blocked_pending(
         .cloned()
         .collect();
     for base in blocked {
-        vlog!("Parallel compile: Skipping {} because a dependency failed.", base);
+        vlog!(
+            "Parallel compile: Skipping {} because a dependency failed.",
+            base
+        );
         state.pending.remove(&base);
         state.failed.insert(base);
     }
@@ -359,7 +367,13 @@ fn pick_next_job(state: &SchedulerState, shared: &SchedulerShared<'_>) -> Option
     }
 
     if let Some(partner) = find_partner(&ready, &state.active, shared.caps)
-        && can_start(partner, &state.active, shared.caps, shared.slot_limit, false)
+        && can_start(
+            partner,
+            &state.active,
+            shared.caps,
+            shared.slot_limit,
+            false,
+        )
     {
         return Some(partner.base_name.clone());
     }
@@ -520,13 +534,7 @@ mod tests {
             threads: Some(8),
         }];
         let candidate = job("b", Some(2), false, 1);
-        assert!(can_start(
-            &candidate,
-            &active,
-            CAPS_STRICT_10,
-            2,
-            false
-        ));
+        assert!(can_start(&candidate, &active, CAPS_STRICT_10, 2, false));
     }
 
     #[test]
@@ -536,13 +544,7 @@ mod tests {
             threads: Some(8),
         }];
         let candidate = job("b", Some(5), false, 1);
-        assert!(!can_start(
-            &candidate,
-            &active,
-            CAPS_STRICT_10,
-            2,
-            false
-        ));
+        assert!(!can_start(&candidate, &active, CAPS_STRICT_10, 2, false));
     }
 
     #[test]
@@ -618,13 +620,7 @@ mod tests {
             threads: Some(8),
         }];
         let candidate = job("b", Some(2), false, 1);
-        assert!(!can_start(
-            &candidate,
-            &active,
-            CAPS_STRICT_10,
-            2,
-            true
-        ));
+        assert!(!can_start(&candidate, &active, CAPS_STRICT_10, 2, true));
     }
 
     #[test]
@@ -634,13 +630,7 @@ mod tests {
             threads: Some(4),
         }];
         let alone = job("k", Some(8), true, 10);
-        assert!(!can_start(
-            &alone,
-            &active,
-            CAPS_STRICT_10,
-            2,
-            false
-        ));
+        assert!(!can_start(&alone, &active, CAPS_STRICT_10, 2, false));
     }
 
     fn shared<'a>(
@@ -663,10 +653,8 @@ mod tests {
             ("k".to_string(), job("k", Some(8), true, 10)),
             ("b".to_string(), job("b", Some(2), false, 1)),
         ]);
-        let deps_map: HashMap<String, HashSet<String>> = jobs
-            .keys()
-            .map(|k| (k.clone(), HashSet::new()))
-            .collect();
+        let deps_map: HashMap<String, HashSet<String>> =
+            jobs.keys().map(|k| (k.clone(), HashSet::new())).collect();
         let state = SchedulerState {
             pending: jobs.keys().cloned().collect(),
             active: vec![ActiveBuild {
@@ -676,6 +664,7 @@ mod tests {
             finished: HashSet::new(),
             failed: HashSet::new(),
             exclusive_alone: false,
+            fatal: None,
         };
         // "b" would fit, but admitting it would starve the exclusive job "k".
         let sh = shared(&jobs, &deps_map, CAPS_STRICT_10, 3);
@@ -698,6 +687,7 @@ mod tests {
             finished: HashSet::new(),
             failed: HashSet::new(),
             exclusive_alone: false,
+            fatal: None,
         };
         let sh = shared(&jobs, &deps_map, CAPS_STRICT_10, 2);
         assert!(pick_next_job(&state, &sh).is_none());
@@ -708,10 +698,7 @@ mod tests {
     #[test]
     fn no_stall_detect_while_builds_are_active() {
         let jobs = HashMap::from([("a".to_string(), job("a", Some(2), false, 1))]);
-        let deps_map = HashMap::from([(
-            "a".to_string(),
-            HashSet::from(["x".to_string()]),
-        )]);
+        let deps_map = HashMap::from([("a".to_string(), HashSet::from(["x".to_string()]))]);
         let state = SchedulerState {
             pending: jobs.keys().cloned().collect(),
             active: vec![ActiveBuild {
@@ -721,6 +708,7 @@ mod tests {
             finished: HashSet::new(),
             failed: HashSet::new(),
             exclusive_alone: false,
+            fatal: None,
         };
         let sh = shared(&jobs, &deps_map, CAPS_STRICT_10, 2);
         assert!(detect_stalled_job(&state, &sh).is_none());
@@ -734,6 +722,7 @@ mod tests {
             finished: ["a".to_string()].into_iter().collect(),
             failed: HashSet::new(),
             exclusive_alone: false,
+            fatal: None,
         };
         let mut deps = HashMap::new();
         deps.insert("b".to_string(), ["a".to_string()].into_iter().collect());

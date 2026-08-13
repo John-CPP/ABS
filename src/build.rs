@@ -1,24 +1,25 @@
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::git::{is_per_package_repo, prepare_repo, PkgbuildDirCache};
+use crate::git::{PkgbuildDirCache, is_per_package_repo, prepare_repo};
 use crate::package_spec::PackageSpec;
 use crate::pkgbuild::{
-    apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, parse_validpgpkeys, restore_pkgbuild,
-    update_pkgsums, inject_compiler_env,
-};
-use crate::utils::{
-    check_sudo_removal, gpg_has_public_key, gpg_key_short_id, import_gpg_key_for_build,
-    pacman_query_version, pacman_sync_version, read_pkg_full_version_from_dir,
-    remove_src_pkg_workdirs, remove_stale_pkgs_in_pkgdest, run_command, run_shell_in_dir_with_tee,
-    vercmp, ShellRunOpts,
+    apply_pkgbuild_overrides, backup_pkgbuild, bump_pkgrel, inject_compiler_env,
+    parse_validpgpkeys, restore_pkgbuild, update_pkgsums,
 };
 use crate::ramdisk::{self, WorkdirGuard};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::utils::{
+    ShellRunOpts, check_sudo_removal, gpg_has_public_key, gpg_key_short_id,
+    import_gpg_key_for_build, pacman_query_version, pacman_sync_version, parse_command_argv,
+    read_pkg_full_version_from_dir, remove_src_pkg_workdirs, remove_stale_pkgs_in_pkgdest,
+    run_argv_command, run_command, run_shell_in_dir_with_tee, sh_single_quote, shell_quote_argv,
+    vercmp,
+};
 use crate::{blog, die, ewarn, vlog};
 use colored::Colorize;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// When compilation uses tmpfs (`w`) but the git repo stays on disk, keep makepkg source
 /// tarballs on disk so PGO stages do not re-download the kernel archive.
@@ -106,11 +107,24 @@ pub fn pgo_pkgbase_from_env(package: &str, env: &HashMap<String, String>) -> Str
         .or_else(|| package.strip_suffix("-gcc"))
         .unwrap_or(package)
         .trim();
-    let base = if base.is_empty() { "linux-cachyos" } else { base };
-    let llvm_lto = env.get("_use_llvm_lto").map(String::as_str).unwrap_or("thin");
+    let base = if base.is_empty() {
+        "linux-cachyos"
+    } else {
+        base
+    };
+    let llvm_lto = env
+        .get("_use_llvm_lto")
+        .map(String::as_str)
+        .unwrap_or("thin");
     let is_lto = matches!(llvm_lto, "thin" | "full" | "thin-dist");
-    let lto_suffix = env.get("_use_lto_suffix").map(String::as_str).unwrap_or("no");
-    let gcc_suffix = env.get("_use_gcc_suffix").map(String::as_str).unwrap_or("yes");
+    let lto_suffix = env
+        .get("_use_lto_suffix")
+        .map(String::as_str)
+        .unwrap_or("no");
+    let gcc_suffix = env
+        .get("_use_gcc_suffix")
+        .map(String::as_str)
+        .unwrap_or("yes");
     if is_lto && lto_suffix == "yes" {
         format!("{base}-lto")
     } else if !is_lto && gcc_suffix == "yes" {
@@ -213,11 +227,7 @@ fn chroot_copy_lock_path(chrootdir: &Path, copy: &str) -> PathBuf {
 }
 
 /// Mirror `makechrootpkg` `sync_chroot` with visible rsync progress (devtools uses `rsync -q`).
-fn sync_chroot_working_copy(
-    chrootdir: &Path,
-    copy: &str,
-    refresh: bool,
-) -> Result<(), String> {
+fn sync_chroot_working_copy(chrootdir: &Path, copy: &str, refresh: bool) -> Result<(), String> {
     let root = chrootdir.join("root");
     let copydir = chrootdir.join(copy);
     let lock_path = chroot_copy_lock_path(chrootdir, copy);
@@ -229,13 +239,13 @@ fn sync_chroot_working_copy(
 
     if copydir.is_dir() {
         if refresh || !chroot_rootfs_is_complete(&copydir) {
-            blog!(
-                "Refreshing chroot working copy at {}...",
-                copydir.display()
-            );
+            blog!("Refreshing chroot working copy at {}...", copydir.display());
             check_sudo_removal(&copydir)?;
         } else {
-            vlog!("Using existing chroot working copy at {}", copydir.display());
+            vlog!(
+                "Using existing chroot working copy at {}",
+                copydir.display()
+            );
             return Ok(());
         }
     }
@@ -266,7 +276,14 @@ fn sync_chroot_working_copy(
     run_command(
         "sudo",
         &[
-            "rsync", "-a", "--delete", "--info=progress2", "-W", "-x", &src, &dst,
+            "rsync",
+            "-a",
+            "--delete",
+            "--info=progress2",
+            "-W",
+            "-x",
+            &src,
+            &dst,
         ],
         None::<&str>,
     )?;
@@ -377,8 +394,9 @@ fn run_build_with_key_retry(
         .map_err(|e| format!("Failed to compile missing-key regex: {}", e))?;
     // Large logs (e.g. Firefox) can mention "unknown public key" long before the real failure in
     // `prepare()` / `build()` / `check()`. Retrying the whole makepkg then re-runs those phases for no benefit.
-    let pkgbuild_phase_failed_re = Regex::new(r"(?i)A failure occurred in (prepare|build|check)\(\)")
-        .map_err(|e| format!("Failed to compile phase-failure regex: {}", e))?;
+    let pkgbuild_phase_failed_re =
+        Regex::new(r"(?i)A failure occurred in (prepare|build|check)\(\)")
+            .map_err(|e| format!("Failed to compile phase-failure regex: {}", e))?;
     let mut seen_keys: HashSet<String> = HashSet::new();
 
     loop {
@@ -434,9 +452,7 @@ fn shell_run_opts_for_pkg(
 ) -> ShellRunOpts {
     let output_label = if crate::utils::parallel_console_mode() {
         // Prefer TLS label from the worker; fall back to the package name.
-        Some(
-            crate::utils::current_output_label().unwrap_or_else(|| pkg.to_string()),
-        )
+        Some(crate::utils::current_output_label().unwrap_or_else(|| pkg.to_string()))
     } else {
         crate::utils::current_output_label()
     };
@@ -507,8 +523,8 @@ pub fn resolve_pkg_repo_for_manual(
     resolve_pkg_repo(pkg, cli, config, None)
 }
 
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 static AUR_UP_TO_DATE_PACKAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -564,13 +580,14 @@ fn manual_src_newer_than_installed(pkg: &str, cli: &Cli, config: &Config) -> Res
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
     if !config.install_testing_phase_archlinux_packages
         && (repo_name == "arch" || repo_name == "cachyos")
-        && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
-            let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
-                vlog!("{}: not installed; skipping manual update build", pkg);
-                return Ok(false);
-            };
-            return Ok(vercmp(&sync_ver, &inst_ver)? > 0);
-        }
+        && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg)
+    {
+        let Some(inst_ver) = pacman_query_version(&base_pkg)? else {
+            vlog!("{}: not installed; skipping manual update build", pkg);
+            return Ok(false);
+        };
+        return Ok(vercmp(&sync_ver, &inst_ver)? > 0);
+    }
     let repo_url = repo_url_string.as_str();
     // Callers that pass `-R` with `-U` run `sync_manual_repo_remotes` first; only read the tree here.
     let pkg_dir = prepare_repo(
@@ -620,18 +637,32 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                         let (_, _, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
                         if let Some(remote_ver) = versions.get(pkg)
                             && let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg)
-                                && let Ok(c) = vercmp(remote_ver, &inst_ver) {
-                                    if c <= 0 {
-                                        vlog!("AUR RPC: {} is up-to-date (remote: {}, installed: {}). Skipping git pull.", pkg, remote_ver, inst_ver);
-                                        mark_aur_package_up_to_date(pkg);
-                                    } else {
-                                        vlog!("AUR RPC: {} requires update (remote: {}, installed: {}).", pkg, remote_ver, inst_ver);
-                                    }
-                                }
+                            && let Ok(c) = vercmp(remote_ver, &inst_ver)
+                        {
+                            if c <= 0 {
+                                vlog!(
+                                    "AUR RPC: {} is up-to-date (remote: {}, installed: {}). Skipping git pull.",
+                                    pkg,
+                                    remote_ver,
+                                    inst_ver
+                                );
+                                mark_aur_package_up_to_date(pkg);
+                            } else {
+                                vlog!(
+                                    "AUR RPC: {} requires update (remote: {}, installed: {}).",
+                                    pkg,
+                                    remote_ver,
+                                    inst_ver
+                                );
+                            }
+                        }
                     }
                 }
                 Err(e) => {
-                    ewarn!("AUR RPC check failed: {}; falling back to standard Git update checks", e);
+                    ewarn!(
+                        "AUR RPC check failed: {}; falling back to standard Git update checks",
+                        e
+                    );
                 }
             }
         }
@@ -642,25 +673,26 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
             let (repo_name, _, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
             if (repo_name == "arch" || repo_name == "cachyos")
                 && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg)
-                    && let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg)
-                        && let Ok(c) = vercmp(&sync_ver, &inst_ver) {
-                            if c <= 0 {
-                                vlog!(
-                                    "Stable Repo Check: {} is up-to-date in stable (sync: {}, installed: {}). Skipping git pull.",
-                                    pkg,
-                                    sync_ver,
-                                    inst_ver
-                                );
-                                mark_stable_package_up_to_date(pkg);
-                            } else {
-                                vlog!(
-                                    "Stable Repo Check: {} requires update in stable (sync: {}, installed: {}).",
-                                    pkg,
-                                    sync_ver,
-                                    inst_ver
-                                );
-                            }
-                        }
+                && let Ok(Some(inst_ver)) = pacman_query_version(&base_pkg)
+                && let Ok(c) = vercmp(&sync_ver, &inst_ver)
+            {
+                if c <= 0 {
+                    vlog!(
+                        "Stable Repo Check: {} is up-to-date in stable (sync: {}, installed: {}). Skipping git pull.",
+                        pkg,
+                        sync_ver,
+                        inst_ver
+                    );
+                    mark_stable_package_up_to_date(pkg);
+                } else {
+                    vlog!(
+                        "Stable Repo Check: {} requires update in stable (sync: {}, installed: {}).",
+                        pkg,
+                        sync_ver,
+                        inst_ver
+                    );
+                }
+            }
         }
     }
 
@@ -728,7 +760,12 @@ pub fn sync_manual_repo_remotes(config: &Config, cli: &Cli) {
                         true,
                         None,
                     );
-                    vlog!("Synced {} (repo {}) in {:?}", task.pkg, task.repo_name, start.elapsed());
+                    vlog!(
+                        "Synced {} (repo {}) in {:?}",
+                        task.pkg,
+                        task.repo_name,
+                        start.elapsed()
+                    );
                 }
             });
         }
@@ -749,25 +786,27 @@ fn classify_manual_pkg_version(
 ) -> Result<ManualPkgVersionLine, String> {
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, None);
     if (is_aur_package_up_to_date(pkg) || is_stable_package_up_to_date(pkg))
-        && let Ok(Some(inst)) = pacman_query_version(&base_pkg) {
-            return Ok(ManualPkgVersionLine::UpToDate { current: inst });
-        }
+        && let Ok(Some(inst)) = pacman_query_version(&base_pkg)
+    {
+        return Ok(ManualPkgVersionLine::UpToDate { current: inst });
+    }
     if !config.install_testing_phase_archlinux_packages
         && (repo_name == "arch" || repo_name == "cachyos")
-        && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg) {
-            let inst = pacman_query_version(&base_pkg)?;
-            let Some(inst_ver) = inst else {
-                return Ok(ManualPkgVersionLine::NotInstalled);
-            };
-            if vercmp(&sync_ver, &inst_ver)? > 0 {
-                return Ok(ManualPkgVersionLine::Upgrade {
-                    current: inst_ver,
-                    new: sync_ver,
-                });
-            } else {
-                return Ok(ManualPkgVersionLine::UpToDate { current: inst_ver });
-            }
+        && let Ok(Some(sync_ver)) = pacman_sync_version(&base_pkg)
+    {
+        let inst = pacman_query_version(&base_pkg)?;
+        let Some(inst_ver) = inst else {
+            return Ok(ManualPkgVersionLine::NotInstalled);
+        };
+        if vercmp(&sync_ver, &inst_ver)? > 0 {
+            return Ok(ManualPkgVersionLine::Upgrade {
+                current: inst_ver,
+                new: sync_ver,
+            });
+        } else {
+            return Ok(ManualPkgVersionLine::UpToDate { current: inst_ver });
         }
+    }
     let pkg_dir = prepare_repo(
         pkg,
         &base_pkg,
@@ -822,7 +861,13 @@ pub fn report_manual_update_versions(config: &Config, cli: &Cli) {
     let mut pkgbuild_cache = PkgbuildDirCache::new();
     for pkg in &config.manual_update_packages {
         if crate::held::is_held(config, pkg) {
-            blog!("{}: held @ {} (skipped version compare)", pkg, crate::held::find_held(config, pkg).map(|h| h.version.as_str()).unwrap_or("?"));
+            blog!(
+                "{}: held @ {} (skipped version compare)",
+                pkg,
+                crate::held::find_held(config, pkg)
+                    .map(|h| h.version.as_str())
+                    .unwrap_or("?")
+            );
             continue;
         }
         match classify_manual_pkg_version(pkg, cli, config, &mut pkgbuild_cache) {
@@ -834,11 +879,7 @@ pub fn report_manual_update_versions(config: &Config, cli: &Cli) {
     }
 }
 
-pub fn should_run_manual_prebuild(
-    pkg: &str,
-    cli: &Cli,
-    config: &Config,
-) -> bool {
+pub fn should_run_manual_prebuild(pkg: &str, cli: &Cli, config: &Config) -> bool {
     if crate::held::is_held(config, pkg) {
         return false;
     }
@@ -905,7 +946,9 @@ fn resolve_effective_config(
         || cli.no_check
         || pkg_config.is_some_and(|pc| pc.tests.is_some_and(|t| !t));
 
-    let compiler = spec.compiler.clone()
+    let compiler = spec
+        .compiler
+        .clone()
         .or_else(|| pkg_config.and_then(|pc| pc.compiler.clone()))
         .or_else(|| config.build.default_compiler.clone());
 
@@ -952,19 +995,17 @@ pub fn install_package_phase(spec: &PackageSpec, cli: &Cli, config: &Config) {
     .pkg_dir;
     let repo_dir = repo_dir_path.as_path();
 
-    crate::install::install_artifacts(
-        pkg,
-        base_pkg.as_str(),
-        Some(repo_dir),
-        config,
-    );
+    crate::install::install_artifacts(pkg, base_pkg.as_str(), Some(repo_dir), config);
 
     if let Some(pc) = pkg_config
         && let Some(cmd) = &pc.post_update_command
     {
         blog!("Running post-update command...");
-        if let Err(e) = run_command("sh", &["-c", cmd], Some(repo_dir)) {
-            ewarn!("Post-update command failed: {}", e);
+        match parse_command_argv(cmd).and_then(|argv| run_argv_command(&argv, Some(repo_dir))) {
+            Ok(()) => {}
+            Err(e) => {
+                ewarn!("Post-update command failed: {}", e);
+            }
         }
     }
 }
@@ -1106,8 +1147,9 @@ pub fn process_package(
         )
     {
         blog!(
-            "Already-made packages found for {}; skipping compilation (use -n to rebuild)",
-            pkg
+            "Already-made packages found for {} in {}; skipping compilation (use -n to rebuild)",
+            pkg,
+            config.paths.ready_made_packages_path
         );
         if !cli.compile_only && !install_deferred_this_run {
             crate::install::install_artifacts(pkg, base_pkg_name, Some(repo_dir), config);
@@ -1132,12 +1174,20 @@ pub fn process_package(
     // Resolve and inject custom compiler if specified
     if let Some(comp_key) = &effective_cfg.compiler {
         if let Some(comp_cfg) = config.compilers.get(comp_key) {
-            blog!("Compiling with custom compiler '{}': cc={} cxx={}", comp_key, comp_cfg.cc, comp_cfg.cxx);
+            blog!(
+                "Compiling with custom compiler '{}': cc={} cxx={}",
+                comp_key,
+                comp_cfg.cc,
+                comp_cfg.cxx
+            );
             if let Err(e) = inject_compiler_env(repo_dir, &comp_cfg.cc, &comp_cfg.cxx) {
                 die!("Failed to configure custom compiler: {}", e);
             }
         } else {
-            die!("Custom compiler '{}' is not defined in the [compilers] configuration section", comp_key);
+            die!(
+                "Custom compiler '{}' is not defined in the [compilers] configuration section",
+                comp_key
+            );
         }
     }
 
@@ -1152,7 +1202,9 @@ pub fn process_package(
         && let Some(cmd) = &pc.pre_update_command
     {
         blog!("Running pre-update command...");
-        if let Err(e) = run_command("sh", &["-c", cmd], Some(repo_dir)) {
+        if let Err(e) =
+            parse_command_argv(cmd).and_then(|argv| run_argv_command(&argv, Some(repo_dir)))
+        {
             die!("Pre-update command failed: {}", e);
         }
     }
@@ -1180,7 +1232,9 @@ pub fn process_package(
     };
 
     // Run updpkgsums when `-u` is set, when CLI overrides changed PKGBUILD fields (e.g. pkgver), or when it's an upgrade.
-    if (cli.update_sums || !spec.pkgbuild_overrides.is_empty() || is_upgrade) && !update_pkgsums(repo_dir) {
+    if (cli.update_sums || !spec.pkgbuild_overrides.is_empty() || is_upgrade)
+        && !update_pkgsums(repo_dir)
+    {
         ewarn!("updpkgsums failed, continuing...");
     }
     if !spec.pkgbuild_overrides.contains_key("pkgrel") {
@@ -1188,15 +1242,12 @@ pub fn process_package(
     }
 
     // Drop older PKGDEST artifacts for this base name so install prompts do not list stale builds.
-    remove_stale_pkgs_in_pkgdest(
-        &config.paths.ready_made_packages_path,
-        base_pkg_name,
-    );
+    remove_stale_pkgs_in_pkgdest(&config.paths.ready_made_packages_path, base_pkg_name);
 
     let build_env = effective_cfg.build_env.clone();
     let skip_tests = effective_cfg.skip_tests;
-    let threads = compilation_threads
-        .or_else(|| crate::build_env::resolve_package_threads(pkg, config, cli));
+    let threads =
+        compilation_threads.or_else(|| crate::build_env::resolve_package_threads(pkg, config, cli));
 
     let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, false) {
         Ok(guard) => guard,
@@ -1219,17 +1270,15 @@ pub fn process_package(
     if let Some(cmd) = custom_cmd {
         ensure_pkgsource_pgp_keys(build_dir);
         blog!("Executing custom build command...");
-        let env_prefix = ramdisk_makepkg_env_prefix(repo_dir, &ramdisk_targets);
-        let cmd = if env_prefix.is_empty() {
-            cmd
-        } else {
-            format!("{env_prefix}{cmd}")
+        let argv = match parse_command_argv(&cmd) {
+            Ok(v) => v,
+            Err(e) => die!("Invalid custom build command: {e}"),
         };
-        if let Err(e) = run_build_with_key_retry(
-            &cmd,
-            build_dir,
-            shell_run_opts_for_pkg(pkg, false, None),
-        ) {
+        let env_prefix = ramdisk_makepkg_env_prefix(repo_dir, &ramdisk_targets);
+        let cmd = format!("{env_prefix}{}", shell_quote_argv(&argv));
+        if let Err(e) =
+            run_build_with_key_retry(&cmd, build_dir, shell_run_opts_for_pkg(pkg, false, None))
+        {
             if config.build.ignore_compilation_failures {
                 ewarn!("Custom build command failed for {}: {}", pkg, e);
                 restore_pkgbuild(repo_dir);
@@ -1262,9 +1311,9 @@ pub fn process_package(
         }
 
         let mut build_cmd = format!(
-            "{}PKGDEST=\"{}\" makepkg --syncdeps --noconfirm --needed -f",
+            "{}PKGDEST={} makepkg --syncdeps --noconfirm --needed -f",
             env_prefix,
-            config.paths.ready_made_packages_path
+            sh_single_quote(&config.paths.ready_made_packages_path)
         );
         if cli.clean && !ramdisk_targets.build_workdir {
             build_cmd.push_str(" -c");
@@ -1298,9 +1347,10 @@ pub fn process_package(
             "Preparing chroot at {} (seed copy or mkarchroot if needed)...",
             chrootdir.display()
         );
-        if let Err(e) = ramdisk::seed_chroot_if_needed(config, Path::new(&chroot_base), &ramdisk_targets)
-            .and_then(|_| ensure_devtools_chroot(&chrootdir))
-            .and_then(|_| inject_chroot_makepkg_conf(&chrootdir, config))
+        if let Err(e) =
+            ramdisk::seed_chroot_if_needed(config, Path::new(&chroot_base), &ramdisk_targets)
+                .and_then(|_| ensure_devtools_chroot(&chrootdir))
+                .and_then(|_| inject_chroot_makepkg_conf(&chrootdir, config))
         {
             if config.build.ignore_compilation_failures {
                 ewarn!("Chroot setup failed for {}: {}", pkg, e);
@@ -1330,15 +1380,15 @@ pub fn process_package(
         }
         ensure_pkgsource_pgp_keys(build_dir);
         let mut build_cmd = format!(
-            "PKGDEST=\"{}\" makechrootpkg -r \"{}\" -d \"{}\"",
-            config.paths.ready_made_packages_path,
-            chrootdir.to_string_lossy(),
-            repo_dir.to_string_lossy()
+            "PKGDEST={} makechrootpkg -r {} -d {}",
+            sh_single_quote(&config.paths.ready_made_packages_path),
+            sh_single_quote(&chrootdir.to_string_lossy()),
+            sh_single_quote(&repo_dir.to_string_lossy())
         );
         // Give each concurrent build its own chroot working copy so parallel `makechrootpkg`
         // invocations do not clobber the shared default `<chrootdir>/$USER` copy.
         if let Some(copy) = chroot_copy {
-            build_cmd.push_str(&format!(" -l \"{}\"", copy));
+            build_cmd.push_str(&format!(" -l {}", sh_single_quote(copy)));
         }
         if skip_tests {
             build_cmd.push_str(" -- --nocheck");
@@ -1371,7 +1421,9 @@ pub fn process_package(
             && let Some(cmd) = &pc.post_update_command
         {
             blog!("Running post-update command...");
-            if let Err(e) = run_command("sh", &["-c", cmd], Some(repo_dir)) {
+            if let Err(e) =
+                parse_command_argv(cmd).and_then(|argv| run_argv_command(&argv, Some(repo_dir)))
+            {
                 ewarn!("Post-update command failed: {}", e);
             }
         }
@@ -1457,9 +1509,7 @@ pub fn strip_makepkg_cleanbuild_in_shell(cmd: &str) -> String {
         out.push(tok);
     }
     if stripped {
-        crate::blog!(
-            "Omitting makepkg --cleanbuild/-c so src/ and pkg/ stay on ramdisk tmpfs"
-        );
+        crate::blog!("Omitting makepkg --cleanbuild/-c so src/ and pkg/ stay on ramdisk tmpfs");
     }
     out.join(" ")
 }
@@ -1533,7 +1583,8 @@ pub fn process_package_pgo(
         bump_pkgrel(repo_dir);
     }
 
-    let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, pgo.clean_pkg) {
+    let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, pgo.clean_pkg)
+    {
         Ok(guard) => guard,
         Err(e) => die!("Ramdisk build workdir setup failed: {}", e),
     };
@@ -1557,7 +1608,10 @@ pub fn process_package_pgo(
         &ramdisk_targets,
         limiter_guard.as_ref().map(|g| g.env_assignment()),
     );
-    if workdir_guard.as_ref().is_some_and(WorkdirGuard::uses_ramdisk) {
+    if workdir_guard
+        .as_ref()
+        .is_some_and(WorkdirGuard::uses_ramdisk)
+    {
         build_cmd = strip_makepkg_cleanbuild_in_shell(&build_cmd);
     }
     events.log_line(
@@ -1579,13 +1633,7 @@ pub fn process_package_pgo(
     if !pgo.skip_abs_install && !cli.compile_only {
         let pkgbase = pgo_pkgbase_from_env(pkg, &pgo.env_vars);
         blog!("PGO stage installs packages for pkgbase {pkgbase}");
-        crate::install::install_pgo_artifacts(
-            pkg,
-            &pkgbase,
-            Some(repo_dir),
-            config,
-            &pgo.env_vars,
-        );
+        crate::install::install_pgo_artifacts(pkg, &pkgbase, Some(repo_dir), config, &pgo.env_vars);
     }
 
     if !pgo.defer_pkgbuild_restore {
@@ -1683,7 +1731,8 @@ mod tests {
     fn strip_makepkg_cleanbuild_in_shell_command() {
         use super::strip_makepkg_cleanbuild_in_shell;
 
-        let cmd = "SRCDEST='/tmp/x' PKGDEST='/tmp/r' makepkg --syncdeps --noconfirm --cleanbuild -sfi";
+        let cmd =
+            "SRCDEST='/tmp/x' PKGDEST='/tmp/r' makepkg --syncdeps --noconfirm --cleanbuild -sfi";
         assert_eq!(
             strip_makepkg_cleanbuild_in_shell(cmd),
             "SRCDEST='/tmp/x' PKGDEST='/tmp/r' makepkg --syncdeps --noconfirm -sfi"
@@ -1703,10 +1752,7 @@ mod tests {
             sanitize_makepkg_flags_for_ramdisk("--cleanbuild -sfi --noconfirm", &w),
             "-sfi --noconfirm"
         );
-        assert_eq!(
-            sanitize_makepkg_flags_for_ramdisk("-sfi -c", &w),
-            "-sfi"
-        );
+        assert_eq!(sanitize_makepkg_flags_for_ramdisk("-sfi -c", &w), "-sfi");
         let no_w = RamdiskTargets::default();
         assert_eq!(
             sanitize_makepkg_flags_for_ramdisk("--cleanbuild -sfi", &no_w),
@@ -1845,6 +1891,7 @@ mod tests {
             no_wait: false,
             list_add: None,
             list_remove: None,
+            config_wizard: false,
             wizard: None,
             pkg_list: None,
             hold: None,
@@ -1855,10 +1902,7 @@ mod tests {
         }
     }
 
-    fn config_with_ignore(
-        global: bool,
-        per_pkg: Option<bool>,
-    ) -> crate::config::Config {
+    fn config_with_ignore(global: bool, per_pkg: Option<bool>) -> crate::config::Config {
         let per_pkg_toml = match per_pkg {
             Some(true) => "\n[packages.firefox]\nignore_already_made_packages = true\n",
             Some(false) => "\n[packages.firefox]\nignore_already_made_packages = false\n",

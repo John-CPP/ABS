@@ -3,7 +3,7 @@
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::config_edit::{
-    self, print_reproduce_undo, shell_join_packages, ConfigListKind, PackageEditFields,
+    self, ConfigListKind, PackageEditFields, print_reproduce_undo, shell_join_packages,
 };
 use crate::die;
 use crate::held::{self, snapshot_trigger_versions, split_pkgver_pkgrel};
@@ -112,11 +112,7 @@ fn resolve_action(cli: &Cli) -> WizardAction {
             return WizardAction::parse(trimmed).unwrap_or_else(|e| die!("{}", e));
         }
     }
-    let choice = prompt_choice(
-        "Select action:",
-        &["add", "remove", "edit", "hold"],
-        None,
-    );
+    let choice = prompt_choice("Select action:", &["add", "remove", "edit", "hold"], None);
     WizardAction::parse(&choice).unwrap_or_else(|e| die!("{}", e))
 }
 
@@ -167,11 +163,7 @@ fn run_add(cli: &Cli) {
     if added.is_empty() {
         blog!("Nothing to add (already present).");
     } else {
-        blog!(
-            "Added to {}: {}",
-            kind.canonical_name(),
-            added.join(", ")
-        );
+        blog!("Added to {}: {}", kind.canonical_name(), added.join(", "));
     }
     let pkg_args = shell_join_packages(&pkgs);
     print_reproduce_undo(
@@ -234,15 +226,8 @@ fn run_edit(cli: &Cli, config: &Config) {
     blog!("Editing compilation options for {}...", pkg);
 
     let build_env = {
-        let cur = current
-            .build_env
-            .as_deref()
-            .unwrap_or(default_env);
-        let choice = prompt_choice(
-            "build_env:",
-            &["local", "chroot", "(keep)"],
-            Some(cur),
-        );
+        let cur = current.build_env.as_deref().unwrap_or(default_env);
+        let choice = prompt_choice("build_env:", &["local", "chroot", "(keep)"], Some(cur));
         if choice == "(keep)" {
             None
         } else {
@@ -295,11 +280,7 @@ fn run_edit(cli: &Cli, config: &Config) {
             Some(false) => "false",
             None => "(unset)",
         };
-        let choice = prompt_choice(
-            "compile_alone:",
-            &["true", "false", "(keep)"],
-            Some(cur),
-        );
+        let choice = prompt_choice("compile_alone:", &["true", "false", "(keep)"], Some(cur));
         match choice.as_str() {
             "true" => Some(true),
             "false" => Some(false),
@@ -344,10 +325,7 @@ fn run_edit(cli: &Cli, config: &Config) {
 
     // Reproduce/Undo for edit is approximate: undo clears the fields we set.
     let mut repro_parts = vec![format!("abs --wizard=edit {}", pkg)];
-    let mut undo_note = format!(
-        "abs --configure  # manually revert [packages.{}]",
-        pkg
-    );
+    let mut undo_note = format!("abs --configure  # manually revert [packages.{}]", pkg);
     let _ = (&mut repro_parts, &mut undo_note);
     print_reproduce_undo(
         &format!("abs --wizard=edit {}", pkg),
@@ -383,9 +361,7 @@ fn resolve_hold_version(cli: &Cli, pkg: &str, config: &Config) -> String {
     let current_highlight = installed.as_deref();
     // Map display options for prompt — highlight installed entry
     let display: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-    let default_label = installed
-        .as_ref()
-        .map(|v| format!("{} (installed)", v));
+    let default_label = installed.as_ref().map(|v| format!("{} (installed)", v));
     let choice = prompt_choice(
         "Versions:",
         &display,
@@ -548,22 +524,21 @@ pub fn run_hold_cli(cli: &Cli, config: &Config) {
         .filter(|s| !s.is_empty())
         .cloned()
         .or_else(|| {
-            cli.packages
-                .first()
-                .map(|s| s.split_once('[').map(|(n, _)| n.to_string()).unwrap_or_else(|| s.clone()))
+            cli.packages.first().map(|s| {
+                s.split_once('[')
+                    .map(|(n, _)| n.to_string())
+                    .unwrap_or_else(|| s.clone())
+            })
         })
         .unwrap_or_else(|| die!("--hold requires a package name"));
 
-    let version = cli
-        .hold_version
-        .clone()
-        .unwrap_or_else(|| {
-            // Fall back to installed version
-            pacman_query_version(&pkg)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| die!("--hold-version is required when package is not installed"))
-        });
+    let version = cli.hold_version.clone().unwrap_or_else(|| {
+        // Fall back to installed version
+        pacman_query_version(&pkg)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| die!("--hold-version is required when package is not installed"))
+    });
     split_pkgver_pkgrel(&version).unwrap_or_else(|e| die!("{}", e));
 
     let trigger_names = parse_trigger_list(&cli.trigger);
@@ -615,7 +590,11 @@ pub fn run_unhold(cli: &Cli) {
 /// `--hold-check`.
 pub fn run_hold_check(cli: &Cli, config: &Config) {
     let filter: Vec<String> = if cli.packages.is_empty() {
-        config.held_packages.iter().map(|h| h.name.clone()).collect()
+        config
+            .held_packages
+            .iter()
+            .map(|h| h.name.clone())
+            .collect()
     } else {
         cli.packages.clone()
     };
@@ -644,13 +623,23 @@ pub fn run_hold_check(cli: &Cli, config: &Config) {
             println!("  triggers:  (none)");
         } else {
             println!("  triggers (on_packages_updated):");
-            let mut pairs: Vec<_> = held.auto_recompile_trigger.on_packages_updated.iter().collect();
+            let mut pairs: Vec<_> = held
+                .auto_recompile_trigger
+                .on_packages_updated
+                .iter()
+                .collect();
             pairs.sort_by(|a, b| a.0.cmp(b.0));
             for (trig, saved) in pairs {
                 let cur = pacman_query_version(trig).ok().flatten();
                 match cur {
                     Some(ref c) if c == saved => {
-                        println!("    {} saved={} installed={} {}", trig, saved, c, "ok".green());
+                        println!(
+                            "    {} saved={} installed={} {}",
+                            trig,
+                            saved,
+                            c,
+                            "ok".green()
+                        );
                     }
                     Some(ref c) => {
                         println!(

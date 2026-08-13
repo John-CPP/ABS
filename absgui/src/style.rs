@@ -164,10 +164,13 @@ pub fn sidebar(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
 
 pub fn tag(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(primary_tint(app_theme, match app_theme {
-            AppTheme::Dark => 0.16,
-            AppTheme::Light => 0.12,
-        }))),
+        background: Some(Background::Color(primary_tint(
+            app_theme,
+            match app_theme {
+                AppTheme::Dark => 0.16,
+                AppTheme::Light => 0.12,
+            },
+        ))),
         text_color: Some(primary_soft(app_theme)),
         border: Border {
             color: Color::TRANSPARENT,
@@ -197,10 +200,13 @@ pub fn tag_muted(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
 /// Current step in the PGO timeline — strong accent so it stays visible at a glance.
 pub fn pgo_stage_active(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(primary_tint(app_theme, match app_theme {
-            AppTheme::Dark => 0.24,
-            AppTheme::Light => 0.16,
-        }))),
+        background: Some(Background::Color(primary_tint(
+            app_theme,
+            match app_theme {
+                AppTheme::Dark => 0.24,
+                AppTheme::Light => 0.16,
+            },
+        ))),
         text_color: Some(primary_soft(app_theme)),
         border: Border {
             color: primary(app_theme),
@@ -214,10 +220,13 @@ pub fn pgo_stage_active(app_theme: AppTheme) -> impl Fn(&Theme) -> container::St
 /// Completed PGO timeline step.
 pub fn pgo_stage_done(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Background::Color(primary_tint(app_theme, match app_theme {
-            AppTheme::Dark => 0.08,
-            AppTheme::Light => 0.07,
-        }))),
+        background: Some(Background::Color(primary_tint(
+            app_theme,
+            match app_theme {
+                AppTheme::Dark => 0.08,
+                AppTheme::Light => 0.07,
+            },
+        ))),
         text_color: Some(muted(app_theme)),
         border: Border {
             color: primary_tint(app_theme, 0.35),
@@ -300,7 +309,9 @@ pub fn log_hint(app_theme: AppTheme) -> Color {
     }
 }
 
-pub fn log_editor(app_theme: AppTheme) -> impl Fn(&Theme, text_editor::Status) -> text_editor::Style {
+pub fn log_editor(
+    app_theme: AppTheme,
+) -> impl Fn(&Theme, text_editor::Status) -> text_editor::Style {
     let bg = match app_theme {
         AppTheme::Dark => Color::from_rgb8(0x0e, 0x11, 0x16),
         AppTheme::Light => Color::from_rgb8(0xee, 0xf1, 0xf6),
@@ -315,10 +326,13 @@ pub fn log_editor(app_theme: AppTheme) -> impl Fn(&Theme, text_editor::Status) -
         },
         placeholder: log_hint(app_theme),
         value: fg,
-        selection: primary_tint(app_theme, match app_theme {
-            AppTheme::Dark => 0.35,
-            AppTheme::Light => 0.25,
-        }),
+        selection: primary_tint(
+            app_theme,
+            match app_theme {
+                AppTheme::Dark => 0.35,
+                AppTheme::Light => 0.25,
+            },
+        ),
     }
 }
 

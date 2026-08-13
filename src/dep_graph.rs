@@ -1,11 +1,11 @@
+use crate::build::resolve_pkg_repo_for_manual;
 use crate::cli::Cli;
 use crate::config::Config;
+use crate::git::prepare_repo;
 use crate::package_spec::PackageSpec;
 use crate::pkgbuild::parse_pkg_dependencies;
-use crate::git::prepare_repo;
 use crate::ramdisk;
 use crate::vlog;
-use crate::build::resolve_pkg_repo_for_manual;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Sort the package specifications topologically based on their PKGBUILD dependencies
@@ -48,7 +48,8 @@ pub fn sort_packages_topologically(
     let mut pkg_dirs: HashMap<String, std::path::PathBuf> = HashMap::new();
 
     for (base, spec) in &base_to_spec {
-        let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo_for_manual(&spec.name, cli, config);
+        let (repo_name, repo_url_string, base_pkg) =
+            resolve_pkg_repo_for_manual(&spec.name, cli, config);
 
         // Fast, read-only prepare repo (does not clone/pull if it exists; smart dry-run bypasses commands)
         let pkg_config = config.packages.get(&spec.name);
@@ -58,7 +59,7 @@ pub fn sort_packages_topologically(
             Some(spec),
             cli.ramdisk.as_deref(),
         )
-            .unwrap_or_default();
+        .unwrap_or_default();
         let pkg_dir = prepare_repo(
             &spec.name,
             &base_pkg,
@@ -177,7 +178,13 @@ mod tests {
 
     #[test]
     fn test_topological_sort_success() {
-        let temp = std::env::temp_dir().join(format!("abs_test_topo_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let temp = std::env::temp_dir().join(format!(
+            "abs_test_topo_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let pkg_a_dir = temp.join("aur").join("package-a");
         let pkg_b_dir = temp.join("aur").join("package-b");
         let pkg_c_dir = temp.join("aur").join("package-c");
@@ -240,6 +247,7 @@ mod tests {
             no_wait: false,
             list_add: None,
             list_remove: None,
+            config_wizard: false,
             wizard: None,
             pkg_list: None,
             hold: None,
@@ -265,7 +273,13 @@ mod tests {
 
     #[test]
     fn test_topological_sort_cycle() {
-        let temp = std::env::temp_dir().join(format!("abs_test_topo_cycle_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let temp = std::env::temp_dir().join(format!(
+            "abs_test_topo_cycle_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let pkg_a_dir = temp.join("aur").join("package-a");
         let pkg_b_dir = temp.join("aur").join("package-b");
 
@@ -326,6 +340,7 @@ mod tests {
             no_wait: false,
             list_add: None,
             list_remove: None,
+            config_wizard: false,
             wizard: None,
             pkg_list: None,
             hold: None,
@@ -419,6 +434,7 @@ mod tests {
             no_wait: false,
             list_add: None,
             list_remove: None,
+            config_wizard: false,
             wizard: None,
             pkg_list: None,
             hold: None,

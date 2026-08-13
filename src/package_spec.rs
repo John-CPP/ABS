@@ -39,7 +39,9 @@ fn normalize_repo_name(name: &str) -> String {
 }
 
 fn merge_ramdisk_code(existing: &str, addition: &str) -> String {
-    if crate::ramdisk::is_ramdisk_disabled(existing) || crate::ramdisk::is_ramdisk_disabled(addition) {
+    if crate::ramdisk::is_ramdisk_disabled(existing)
+        || crate::ramdisk::is_ramdisk_disabled(addition)
+    {
         return crate::ramdisk::RAMDISK_DISABLED.to_string();
     }
     let mut targets = crate::ramdisk::parse_ramdisk_targets(existing).unwrap_or_default();
@@ -75,7 +77,10 @@ fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
     match key_lower.as_str() {
         "repo" => {
             if value.is_empty() {
-                die!("Package '{}': [repo] requires a value (e.g. repo=aur)", spec.name);
+                die!(
+                    "Package '{}': [repo] requires a value (e.g. repo=aur)",
+                    spec.name
+                );
             }
             spec.repo = Some(normalize_repo_name(value));
         }
@@ -108,13 +113,17 @@ fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
             }
             other => die!(
                 "Package '{}': invalid [build={}] (expected local or chroot)",
-                spec.name, other
+                spec.name,
+                other
             ),
         },
         "nocheck" | "no_check" => spec.no_check = Some(parse_bool_flag(value)),
         "compiler" => {
             if value.is_empty() {
-                die!("Package '{}': [compiler] requires a value (e.g. compiler=llvm)", spec.name);
+                die!(
+                    "Package '{}': [compiler] requires a value (e.g. compiler=llvm)",
+                    spec.name
+                );
             }
             spec.compiler = Some(value.to_string());
         }
@@ -131,7 +140,9 @@ fn parse_attr(key: &str, value: &str, spec: &mut PackageSpec) {
             if value.is_empty() {
                 die!(
                     "Package '{}': [{}] requires a value (e.g. {}=26.5.9)",
-                    spec.name, key, key
+                    spec.name,
+                    key,
+                    key
                 );
             }
             spec.pkgbuild_overrides
@@ -168,7 +179,10 @@ pub fn parse_package_spec(input: &str) -> PackageSpec {
 
     let name = input[..open].trim();
     if name.is_empty() {
-        die!("Invalid package spec '{}': missing package name before '['", input);
+        die!(
+            "Invalid package spec '{}': missing package name before '['",
+            input
+        );
     }
 
     let inner = input[open + 1..input.len() - 1].trim();
@@ -220,15 +234,27 @@ mod tests {
     fn parse_pkgbuild_overrides() {
         let spec = parse_package_spec("xray[pkgver=26.5.9,pkgrel=2]");
         assert_eq!(spec.name, "xray");
-        assert_eq!(spec.pkgbuild_overrides.get("pkgver").map(String::as_str), Some("26.5.9"));
-        assert_eq!(spec.pkgbuild_overrides.get("pkgrel").map(String::as_str), Some("2"));
+        assert_eq!(
+            spec.pkgbuild_overrides.get("pkgver").map(String::as_str),
+            Some("26.5.9")
+        );
+        assert_eq!(
+            spec.pkgbuild_overrides.get("pkgrel").map(String::as_str),
+            Some("2")
+        );
     }
 
     #[test]
     fn parse_slash_separated_overrides() {
         let spec = parse_package_spec("xray[pkgver=26.5.9/pkgrel=2]");
-        assert_eq!(spec.pkgbuild_overrides.get("pkgver").map(String::as_str), Some("26.5.9"));
-        assert_eq!(spec.pkgbuild_overrides.get("pkgrel").map(String::as_str), Some("2"));
+        assert_eq!(
+            spec.pkgbuild_overrides.get("pkgver").map(String::as_str),
+            Some("26.5.9")
+        );
+        assert_eq!(
+            spec.pkgbuild_overrides.get("pkgrel").map(String::as_str),
+            Some("2")
+        );
     }
 
     #[test]
@@ -236,7 +262,10 @@ mod tests {
         let spec = parse_package_spec("xray[repo=aur,chroot,pkgver=1.0]");
         assert_eq!(spec.repo.as_deref(), Some("aur"));
         assert_eq!(spec.chroot_build, Some(true));
-        assert_eq!(spec.pkgbuild_overrides.get("pkgver").map(String::as_str), Some("1.0"));
+        assert_eq!(
+            spec.pkgbuild_overrides.get("pkgver").map(String::as_str),
+            Some("1.0")
+        );
     }
 
     #[test]

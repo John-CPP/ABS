@@ -199,7 +199,9 @@ fn console_write(line: &str, to_stderr: bool) {
     if let Some(owner) = state.exclusive_owner
         && owner != me
     {
-        state.buffer.push((to_stderr, line.trim_end_matches(['\r', '\n']).to_string()));
+        state
+            .buffer
+            .push((to_stderr, line.trim_end_matches(['\r', '\n']).to_string()));
         return;
     }
     drop(state);
@@ -226,10 +228,7 @@ pub fn with_exclusive_console<R>(label: &str, f: impl FnOnce() -> R) -> R {
             state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
-        state = gate
-            .cvar
-            .wait(state)
-            .unwrap_or_else(|e| e.into_inner());
+        state = gate.cvar.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     state.exclusive_owner = Some(std::thread::current().id());
     drop(state);
@@ -334,11 +333,18 @@ fn write_private_script(path: &Path, contents: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o700);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|e| format!("failed to create build helper script {}: {e}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|e| format!("failed to write build helper script {}: {e}", path.display()))?;
+    let mut file = options.open(path).map_err(|e| {
+        format!(
+            "failed to create build helper script {}: {e}",
+            path.display()
+        )
+    })?;
+    file.write_all(contents.as_bytes()).map_err(|e| {
+        format!(
+            "failed to write build helper script {}: {e}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -460,6 +466,145 @@ pub fn sh_single_quote(s: &str) -> String {
     out
 }
 
+/// Split a config command into argv. Rejects unquoted shell metacharacters so
+/// `abs.toml` cannot smuggle `|`, `;`, `$()`, or similar through `sh -c`.
+pub fn parse_command_argv(input: &str) -> Result<Vec<String>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("empty command".into());
+    }
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            } else if c == '\\' {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    args.push(std::mem::take(&mut cur));
+                }
+            }
+            '|' | '&' | ';' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r' => {
+                return Err(format!(
+                    "command contains shell metacharacter {c:?}; use a program plus flags, or a script file"
+                ));
+            }
+            _ => cur.push(c),
+        }
+    }
+    if in_single || in_double {
+        return Err("unclosed quote in command".into());
+    }
+    if !cur.is_empty() {
+        args.push(cur);
+    }
+    if args.is_empty() {
+        return Err("empty command".into());
+    }
+    reject_config_shell_dash_c(&args)?;
+    Ok(args)
+}
+
+fn reject_config_shell_dash_c(argv: &[String]) -> Result<(), String> {
+    let mut i = 0;
+    if argv
+        .first()
+        .is_some_and(|c| c == "sudo" || c.ends_with("/sudo"))
+    {
+        i = 1;
+    }
+    let Some(cmd) = argv.get(i) else {
+        return Ok(());
+    };
+    let base = cmd.rsplit('/').next().unwrap_or(cmd);
+    if matches!(base, "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish")
+        && argv[i + 1..].iter().any(|a| a == "-c")
+    {
+        return Err("refusing to run a shell with -c from config; use a script file".into());
+    }
+    Ok(())
+}
+
+/// Quote each argv word for embedding in a bash snippet.
+pub fn shell_quote_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| sh_single_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run a parsed argv list via [`run_command`].
+pub fn run_argv_command<P: AsRef<Path>>(argv: &[String], cwd: Option<P>) -> Result<(), String> {
+    let (cmd, rest) = argv
+        .split_first()
+        .ok_or_else(|| "empty command".to_string())?;
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    run_command(cmd, &args, cwd)
+}
+
+/// Common curl flags: fail on HTTP errors, HTTPS-only, no cleartext redirects.
+pub fn curl_base_args() -> Vec<String> {
+    vec![
+        "-fsSL".into(),
+        "--proto".into(),
+        "=https".into(),
+        "--proto-redir".into(),
+        "=https".into(),
+    ]
+}
+
+/// Write `contents` with an explicit Unix mode (and chmod if the file already existed).
+pub fn write_file_mode(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+    Ok(())
+}
+
 fn format_command_error(
     cmd: &str,
     args: &[&str],
@@ -501,22 +646,31 @@ fn is_readonly_command(cmd: &str, args: &[&str]) -> bool {
     if cmd == "bsdtar" {
         return args.contains(&"-xOf") || args.contains(&"-xO");
     }
-    if cmd == "bash"
-        && args.contains(&"-c")
-            && let Some(script) = args.last()
-                && script.contains("source PKGBUILD") && script.contains("pkgver") {
-                    return true;
-                }
-    if cmd == "curl" {
-        return true;
-    }
     false
 }
 
 /// System paths that must never appear as a configured ABS root or sudo deletion target.
 const BLOCKED_DELETION_ROOTS: &[&str] = &[
-    "/", "/usr", "/etc", "/bin", "/sbin", "/home", "/root", "/var", "/lib", "/lib64", "/opt",
-    "/srv", "/boot", "/proc", "/sys", "/dev", "/run",
+    "/",
+    "/usr",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/home",
+    "/root",
+    "/var",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/srv",
+    "/boot",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/tmp",
+    "/var/tmp",
+    "/usr/local",
 ];
 
 static DELETABLE_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
@@ -529,12 +683,7 @@ fn signal_pid(pid: i32, sig: i32) {
 
 /// Send SIGINT/TERM/KILL to ABS-spawned subprocess trees (e.g. rsync, makepkg, sudo).
 pub fn terminate_foreground_children() {
-    let roots: Vec<u32> = tracked_children()
-        .lock()
-        .unwrap()
-        .keys()
-        .copied()
-        .collect();
+    let roots: Vec<u32> = tracked_children().lock().unwrap().keys().copied().collect();
     if roots.is_empty() {
         return;
     }
@@ -597,6 +746,18 @@ pub fn kill_abs_cli_processes(package: &str) {
         if pid == self_pid {
             continue;
         }
+        let exe_path = PathBuf::from(format!("/proc/{pid}/exe"));
+        let Ok(exe) = fs::read_link(&exe_path) else {
+            continue;
+        };
+        let name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // `/proc/pid/exe` for a replaced binary is `abs (deleted)`.
+        if name != "abs" && !name.starts_with("abs ") {
+            continue;
+        }
         let cmdline_path = format!("/proc/{pid}/cmdline");
         let Ok(data) = fs::read(&cmdline_path) else {
             continue;
@@ -610,9 +771,6 @@ pub fn kill_abs_cli_processes(package: &str) {
             .map(|part| String::from_utf8_lossy(part))
             .collect::<Vec<_>>()
             .join(" ");
-        if !cmdline.contains("abs") {
-            continue;
-        }
         if cmdline.contains("--pgo-abort") || cmdline.contains("--pgo-status") {
             continue;
         }
@@ -697,9 +855,22 @@ pub fn path_has_prefix(prefix: &Path, path: &Path) -> bool {
 }
 
 fn is_blocked_deletion_root(path: &Path) -> bool {
-    BLOCKED_DELETION_ROOTS
+    if BLOCKED_DELETION_ROOTS
         .iter()
         .any(|blocked| path == Path::new(blocked))
+    {
+        return true;
+    }
+    // `/home/$USER` is a full home tree, not an ABS cache.
+    if path.parent() == Some(Path::new("/home")) {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir()
+        && path == home
+    {
+        return true;
+    }
+    false
 }
 
 /// Resolve a path for containment checks: canonicalize when it exists, otherwise normalize to absolute.
@@ -715,12 +886,15 @@ pub fn resolve_path_for_deletion(path: &Path) -> Result<PathBuf, String> {
     }
     if path.exists() {
         fs::canonicalize(path).map_err(|e| {
-            format!("failed to canonicalize {} for deletion check: {}", path.display(), e)
+            format!(
+                "failed to canonicalize {} for deletion check: {}",
+                path.display(),
+                e
+            )
         })
     } else {
-        std::path::absolute(path).map_err(|e| {
-            format!("failed to resolve absolute path {}: {}", path.display(), e)
-        })
+        std::path::absolute(path)
+            .map_err(|e| format!("failed to resolve absolute path {}: {}", path.display(), e))
     }
 }
 
@@ -808,9 +982,7 @@ pub fn validate_deletable_path(path: &Path) -> Result<(), String> {
 
     let roots = deletable_roots().lock().unwrap();
     if roots.is_empty() {
-        return Err(
-            "deletable path roots are not initialized (internal error)".into(),
-        );
+        return Err("deletable path roots are not initialized (internal error)".into());
     }
     if roots.iter().any(|root| path_has_prefix(root, &resolved)) {
         return Ok(());
@@ -896,10 +1068,7 @@ pub fn shell_sudo() -> &'static str {
 
 /// Prepend `sudo -A` when a GUI askpass is configured so prompts never steal the parent terminal.
 fn sudo_prefixed_args(args: &[&str]) -> Vec<String> {
-    if use_sudo_askpass()
-        && !args.contains(&"-A")
-        && !args.contains(&"-n")
-    {
+    if use_sudo_askpass() && !args.contains(&"-A") && !args.contains(&"-n") {
         let mut v = vec!["-A".to_string()];
         v.extend(args.iter().map(|s| (*s).to_string()));
         v
@@ -988,11 +1157,7 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
     }
 }
 
-fn run_command_labeled(
-    mut command: Command,
-    cmd: &str,
-    args: &[&str],
-) -> Result<(), String> {
+fn run_command_labeled(mut command: Command, cmd: &str, args: &[&str]) -> Result<(), String> {
     let label = current_output_label().unwrap_or_else(|| cmd.to_string());
     command
         .stdin(Stdio::null())
@@ -1013,12 +1178,10 @@ fn run_command_labeled(
     let stderr = child.stderr.take();
     let label_out = label.clone();
     let label_err = label.clone();
-    let out_handle = stdout.map(|pipe| {
-        std::thread::spawn(move || stream_labeled_pipe(pipe, &label_out))
-    });
-    let err_handle = stderr.map(|pipe| {
-        std::thread::spawn(move || stream_labeled_pipe(pipe, &label_err))
-    });
+    let out_handle =
+        stdout.map(|pipe| std::thread::spawn(move || stream_labeled_pipe(pipe, &label_out)));
+    let err_handle =
+        stderr.map(|pipe| std::thread::spawn(move || stream_labeled_pipe(pipe, &label_err)));
 
     let status = child
         .wait()
@@ -1082,7 +1245,10 @@ fn sudo_args_with_noninteractive(args: &[&str]) -> Vec<String> {
     v
 }
 
-fn spawn_sudo_and_wait(args: &[String], cwd: Option<&Path>) -> Result<std::process::ExitStatus, String> {
+fn spawn_sudo_and_wait(
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<std::process::ExitStatus, String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     echo_command("sudo", &refs, cwd);
 
@@ -1166,7 +1332,11 @@ fn run_sudo_command(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
 
 /// Like [`run_command`], but captures stdout/stderr instead of inheriting them when silent.
 /// At normal or verbose log level, behaves like [`run_command`] (echo + live output).
-pub fn run_command_quiet<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> Result<(), String> {
+pub fn run_command_quiet<P: AsRef<Path>>(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<P>,
+) -> Result<(), String> {
     if crate::verbosity() >= crate::Verbosity::Normal {
         return run_command(cmd, args, cwd);
     }
@@ -1329,9 +1499,7 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(
         } else {
             ""
         };
-        format!(
-            "{stdbuf}bash {inner_arg} 2>&1 | {stdbuf}tee {log_arg}; exit ${{PIPESTATUS[0]}}",
-        )
+        format!("{stdbuf}bash {inner_arg} 2>&1 | {stdbuf}tee {log_arg}; exit ${{PIPESTATUS[0]}}",)
     } else if command_exists("script") && io::stdin().is_terminal() {
         let stdbuf = if command_exists("stdbuf") {
             "stdbuf -oL -eL "
@@ -1349,17 +1517,11 @@ pub fn run_shell_in_dir_with_tee<P: AsRef<Path>>(
         } else {
             ""
         };
-        format!(
-            "{stdbuf}bash {inner_arg} 2>&1 | {stdbuf}tee {log_arg}; exit ${{PIPESTATUS[0]}}",
-        )
+        format!("{stdbuf}bash {inner_arg} 2>&1 | {stdbuf}tee {log_arg}; exit ${{PIPESTATUS[0]}}",)
     };
 
     let mut command = Command::new("bash");
-    command
-        .arg("-o")
-        .arg("pipefail")
-        .arg("-c")
-        .arg(&pipeline);
+    command.arg("-o").arg("pipefail").arg("-c").arg(&pipeline);
 
     let child = command
         .spawn()
@@ -1796,15 +1958,17 @@ pub fn spawn_sudo_keepalive() {
     if crate::is_dry_run_mode() {
         return;
     }
-    std::thread::spawn(|| loop {
-        std::thread::sleep(std::time::Duration::from_secs(3 * 60));
-        // Never prompt from a background thread (`sudo -v` would steal/break the TTY).
-        let _ = Command::new("sudo")
-            .args(["-n", "-v"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3 * 60));
+            // Never prompt from a background thread (`sudo -v` would steal/break the TTY).
+            let _ = Command::new("sudo")
+                .args(["-n", "-v"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     });
 }
 
@@ -1879,8 +2043,8 @@ pub fn makepkg_printsrcinfo_full_version(repo_dir: &Path) -> Result<String, Stri
     parse_srcinfo_full_version(&text)
 }
 
-/// Fast version read for comparisons: `.SRCINFO` if present, else `source PKGBUILD` in bash,
-/// else **`makepkg --printsrcinfo`** (slowest).
+/// Fast version read for comparisons: `.SRCINFO` if present and not older than PKGBUILD,
+/// else **`makepkg --printsrcinfo`**. Never `source`s the PKGBUILD on the host.
 pub fn read_pkg_full_version_from_dir(pkg_dir: &Path) -> Result<String, String> {
     if crate::is_dry_run_mode() {
         return Err("dry-run".into());
@@ -1889,7 +2053,9 @@ pub fn read_pkg_full_version_from_dir(pkg_dir: &Path) -> Result<String, String> 
     let pkgbuild_path = pkg_dir.join("PKGBUILD");
 
     let use_srcinfo = if srcinfo_path.is_file() {
-        if let (Ok(src_meta), Ok(pkg_meta)) = (fs::metadata(&srcinfo_path), fs::metadata(&pkgbuild_path)) {
+        if let (Ok(src_meta), Ok(pkg_meta)) =
+            (fs::metadata(&srcinfo_path), fs::metadata(&pkgbuild_path))
+        {
             if let (Ok(src_time), Ok(pkg_time)) = (src_meta.modified(), pkg_meta.modified()) {
                 pkg_time <= src_time
             } else {
@@ -1906,21 +2072,6 @@ pub fn read_pkg_full_version_from_dir(pkg_dir: &Path) -> Result<String, String> 
         let text = fs::read_to_string(&srcinfo_path)
             .map_err(|e| format!("read {}: {}", srcinfo_path.display(), e))?;
         return parse_srcinfo_full_version(&text);
-    }
-
-    let script = r#"set -e; [[ -f PKGBUILD ]] || exit 1; source PKGBUILD 2>/dev/null || exit 1; [[ -n "${pkgver:-}" && -n "${pkgrel:-}" ]] || exit 1; e="${epoch:-0}"; if [[ -n "$e" && "$e" != "0" ]]; then printf '%s:%s-%s' "$e" "$pkgver" "$pkgrel"; else printf '%s-%s' "$pkgver" "$pkgrel"; fi"#;
-
-    let output = Command::new("bash")
-        .current_dir(pkg_dir)
-        .args(["-c", script])
-        .output()
-        .map_err(|e| format!("bash PKGBUILD probe: {}", e))?;
-
-    if output.status.success() {
-        let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !v.is_empty() {
-            return Ok(v);
-        }
     }
 
     makepkg_printsrcinfo_full_version(pkg_dir)
@@ -2148,11 +2299,12 @@ pub fn import_gpg_key_for_build(key: &str) -> Result<(), String> {
 
 fn import_gpg_key_via_http(key: &str) -> Result<(), String> {
     let short = gpg_key_short_id(key);
-    let url = format!(
-        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{short}"
-    );
+    let url = format!("https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{short}");
+    let mut args = crate::utils::curl_base_args();
+    args.push(url);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = Command::new("curl")
-        .args(["-fsSL", &url])
+        .args(&arg_refs)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2183,7 +2335,9 @@ fn import_gpg_key_via_http(key: &str) -> Result<(), String> {
     if import_out.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&import_out.stderr).trim().to_string())
+        Err(String::from_utf8_lossy(&import_out.stderr)
+            .trim()
+            .to_string())
     }
 }
 
@@ -2251,7 +2405,10 @@ Repository      : extra
 Name            : systemd
 Version         : 260.1-3
 ";
-        assert_eq!(parse_pacman_si_output(sample_with_staging), Some("260.1-3".to_string()));
+        assert_eq!(
+            parse_pacman_si_output(sample_with_staging),
+            Some("260.1-3".to_string())
+        );
     }
 }
 
@@ -2281,10 +2438,7 @@ mod path_safety_tests {
             Path::new("/foo"),
             Path::new("/foobar/baz")
         ));
-        assert!(path_has_prefix(
-            Path::new("/foo"),
-            Path::new("/foo/bar")
-        ));
+        assert!(path_has_prefix(Path::new("/foo"), Path::new("/foo/bar")));
         assert!(path_has_prefix(
             Path::new("/foo/bar"),
             Path::new("/foo/bar")
@@ -2372,6 +2526,25 @@ mod path_safety_tests {
     fn validate_config_path_rejects_system_root() {
         assert!(validate_config_path("paths.packages_path", "/").is_err());
         assert!(validate_config_path("paths.packages_path", "/usr").is_err());
+        assert!(validate_config_path("paths.packages_path", "/tmp").is_err());
+        assert!(validate_config_path("paths.packages_path", "/run").is_err());
+    }
+
+    #[test]
+    fn parse_command_argv_splits_and_rejects_metacharacters() {
+        assert_eq!(
+            parse_command_argv("sudo pacman -Syu").unwrap(),
+            vec!["sudo", "pacman", "-Syu"]
+        );
+        assert_eq!(parse_command_argv("yay -Syu").unwrap(), vec!["yay", "-Syu"]);
+        assert!(parse_command_argv("pacman -Syu; id").is_err());
+        assert!(parse_command_argv("pacman -Syu && id").is_err());
+        assert!(parse_command_argv("sh -c 'rm -rf /'").is_err());
+        assert!(parse_command_argv("sudo bash -c id").is_err());
+        assert_eq!(
+            parse_command_argv("echo 'hello world'").unwrap(),
+            vec!["echo", "hello world"]
+        );
     }
 
     #[test]
@@ -2394,8 +2567,8 @@ mod path_safety_tests {
 #[cfg(test)]
 mod console_gate_tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     /// Console gate + parallel flag are process-global; serialize these tests.
@@ -2415,10 +2588,7 @@ mod console_gate_tests {
     fn sanitize_strips_ansi_erase_and_trailing_progress_padding() {
         let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let raw = "Receiving objects:  50%\x1b[K                    ";
-        assert_eq!(
-            sanitize_console_fragment(raw),
-            "Receiving objects:  50%"
-        );
+        assert_eq!(sanitize_console_fragment(raw), "Receiving objects:  50%");
     }
 
     #[test]

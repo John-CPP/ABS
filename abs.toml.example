@@ -1,6 +1,11 @@
 config_version = 1
 
-# ABS example config. Copy to ~/.config/abs/abs.toml or /etc/abs/abs.toml.
+# ABS example config. Copy to ~/.config/abs/abs.toml or /etc/abs/abs.toml,
+# or create/edit it with:
+#   abs --config-wizard
+#   abs --configure
+#   abs --configure=nano
+# (tested editors: vim, nano, kate)
 
 # Self-Updates (Root-level configurations)
 # check_for_update_on_startup = true
@@ -43,9 +48,13 @@ skip_install_packages_after_compilation = [
 #   abs --wizard[=add|remove|edit|hold]
 
 [paths]
-packages_path = "$XDG_CONFIG_HOME/.cache/abs/packages"
-chroot_base_path = "$XDG_CONFIG_HOME/.cache/abs/chroot"
-ready_made_packages_path = "$XDG_CONFIG_HOME/.cache/abs/ready"
+# Git clones / sources. Optional to share across machines; the folder that skips
+# compiles is ready_made_packages_path (see README "Several computers").
+packages_path = "$XDG_CACHE_HOME/abs/packages"
+chroot_base_path = "$XDG_CACHE_HOME/abs/chroot"
+# Finished .pkg.tar.* files (PKGDEST). Share this directory so other PCs reuse
+# compiles, including abs --self-update packages. Do not use pacman's CacheDir here.
+ready_made_packages_path = "$XDG_CACHE_HOME/abs/ready"
 # Optional: path to a custom makepkg.conf file to inject into the chroot container
 # chroot_makepkg_conf = "~/.config/abs/makepkg.conf"
 
@@ -88,6 +97,7 @@ compile_first_install_after = false
 clean_install_by_default = false
 # When false (default), skip compilation if matching .pkg.tar.* already exist in
 # ready_made_packages_path and install those instead (unless -o). Use -n or set true to force rebuild.
+# Keep false on machines that should reuse packages compiled on another PC.
 ignore_already_made_packages = false
 concurrent_repos_downloads_limit = 10
 # Maximum number of clean chroot compilations to run concurrently

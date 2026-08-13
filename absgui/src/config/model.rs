@@ -139,9 +139,9 @@ pub struct PathsSection {
 impl Default for PathsSection {
     fn default() -> Self {
         Self {
-            packages_path: "$XDG_CONFIG_HOME/.cache/abs/packages".into(),
-            chroot_base_path: "$XDG_CONFIG_HOME/.cache/abs/chroot".into(),
-            ready_made_packages_path: "$XDG_CONFIG_HOME/.cache/abs/ready".into(),
+            packages_path: "$XDG_CACHE_HOME/abs/packages".into(),
+            chroot_base_path: "$XDG_CACHE_HOME/abs/chroot".into(),
+            ready_made_packages_path: "$XDG_CACHE_HOME/abs/ready".into(),
             chroot_makepkg_conf: None,
         }
     }
@@ -222,11 +222,15 @@ impl Default for BuildSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemUpdateSection {
-    #[serde(default = "default_pacman_sy")]
+    #[serde(default = "default_pacman_sy", alias = "command")]
     pub command_to_update_repositories: String,
-    #[serde(default = "default_pacman_syu")]
+    #[serde(default = "default_pacman_syu", alias = "command_with_refresh")]
     pub command_to_perform_system_update: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "command_no_refresh"
+    )]
     pub command_to_perform_system_update_no_refresh: Option<String>,
     #[serde(default = "default_ignore")]
     pub ignore_flag: String,
@@ -358,7 +362,10 @@ pub struct PackageSection {
     pub compilation_threads: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub compile_alone: bool,
-    #[serde(default = "default_compilation_priority", skip_serializing_if = "is_default_priority")]
+    #[serde(
+        default = "default_compilation_priority",
+        skip_serializing_if = "is_default_priority"
+    )]
     pub compilation_priority: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_already_made_packages: Option<bool>,
@@ -407,7 +414,11 @@ pub struct KernelSection {
     pub preempt: Option<String>,
     #[serde(default, rename = "_hugepage", skip_serializing_if = "Option::is_none")]
     pub hugepage: Option<String>,
-    #[serde(default, rename = "_cc_harder", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_cc_harder",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cc_harder: Option<String>,
 }
 

@@ -18,8 +18,7 @@ pub fn package_matches_pattern(name: &str, pattern: &str) -> bool {
     if !is_glob_pattern(pattern) {
         return name == pattern;
     }
-    glob_pattern_to_regex(pattern)
-        .is_some_and(|re| re.is_match(name))
+    glob_pattern_to_regex(pattern).is_some_and(|re| re.is_match(name))
 }
 
 pub fn package_matches_any_pattern(name: &str, patterns: &[String]) -> bool {
@@ -84,9 +83,7 @@ fn glob_pattern_to_regex(glob: &str) -> Option<Regex> {
 
 fn pacman_package_names_for_glob_expansion() -> Vec<String> {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    NAMES
-        .get_or_init(collect_pacman_package_names)
-        .clone()
+    NAMES.get_or_init(collect_pacman_package_names).clone()
 }
 
 fn collect_pacman_package_names() -> Vec<String> {
@@ -126,8 +123,14 @@ mod tests {
 
     #[test]
     fn patterns_are_trimmed() {
-        assert!(package_matches_pattern("qbittorrent-nox", "qbittorrent-nox "));
-        assert!(package_matches_pattern("qbittorrent-nox", " qbittorrent-nox"));
+        assert!(package_matches_pattern(
+            "qbittorrent-nox",
+            "qbittorrent-nox "
+        ));
+        assert!(package_matches_pattern(
+            "qbittorrent-nox",
+            " qbittorrent-nox"
+        ));
         assert!(!package_matches_pattern("qbittorrent-nox", "  "));
     }
 
@@ -148,11 +151,7 @@ mod tests {
 
     #[test]
     fn expand_keeps_literals_and_dedupes() {
-        let expanded = expand_package_patterns(&[
-            "mesa".into(),
-            "mesa".into(),
-            "curl".into(),
-        ]);
+        let expanded = expand_package_patterns(&["mesa".into(), "mesa".into(), "curl".into()]);
         assert_eq!(expanded, vec!["mesa", "curl"]);
     }
 }

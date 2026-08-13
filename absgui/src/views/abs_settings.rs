@@ -1,8 +1,8 @@
+use crate::app_settings::AppTheme;
 use crate::config::ConfigDocument;
 use crate::field_help;
 use crate::list_editors::{ListEditors, PackageListField};
 use crate::messages::Message;
-use crate::app_settings::AppTheme;
 use crate::widgets::{
     card_section, field_checkbox, field_number, field_path, field_pick, field_text,
     optional_bool_field, packages_list_editor, page_title, PathField, PathKind,
@@ -28,7 +28,7 @@ pub fn view<'a>(
                 "packages_path",
                 Some(field_help::PATH_PACKAGES),
                 &config.paths.packages_path,
-                "$XDG_CONFIG_HOME/.cache/abs/packages",
+                "$XDG_CACHE_HOME/abs/packages",
                 PathField::PackagesPath,
                 PathKind::Folder,
                 app_theme,
@@ -38,7 +38,7 @@ pub fn view<'a>(
                 "chroot_base_path",
                 Some(field_help::PATH_CHROOT),
                 &config.paths.chroot_base_path,
-                "$XDG_CONFIG_HOME/.cache/abs/chroot",
+                "$XDG_CACHE_HOME/abs/chroot",
                 PathField::ChrootPath,
                 PathKind::Folder,
                 app_theme,
@@ -48,7 +48,7 @@ pub fn view<'a>(
                 "ready_made_packages_path",
                 Some(field_help::PATH_READY),
                 &config.paths.ready_made_packages_path,
-                "$XDG_CONFIG_HOME/.cache/abs/ready",
+                "$XDG_CACHE_HOME/abs/ready",
                 PathField::ReadyPath,
                 PathKind::Folder,
                 app_theme,
@@ -475,53 +475,85 @@ pub fn view<'a>(
     repo_names.sort();
     for name in repo_names {
         let url = config.repositories.get(&name).cloned().unwrap_or_default();
-        repo_rows = repo_rows.push(row![
-            text(name.clone()).size(14).width(Length::Fixed(100.0)),
-            field_text("url", Some(field_help::REPO_URL), &url, "https://…", app_theme, {
-                let n = name.clone();
-                move |v| Message::RepoUrlChanged(n.clone(), v)
-            }),
-            button(text("Remove").size(13))
-                .style(button::danger)
-                .on_press(Message::RepoRemove(name)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center));
+        repo_rows = repo_rows.push(
+            row![
+                text(name.clone()).size(14).width(Length::Fixed(100.0)),
+                field_text(
+                    "url",
+                    Some(field_help::REPO_URL),
+                    &url,
+                    "https://…",
+                    app_theme,
+                    {
+                        let n = name.clone();
+                        move |v| Message::RepoUrlChanged(n.clone(), v)
+                    }
+                ),
+                button(text("Remove").size(13))
+                    .style(button::danger)
+                    .on_press(Message::RepoRemove(name)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
     }
 
     let repositories = card_section(
         "Repositories",
         app_theme,
-        column![repo_rows, button(text("+ Add repository").size(13)).on_press(Message::RepoAdd)]
-            .spacing(8),
+        column![
+            repo_rows,
+            button(text("+ Add repository").size(13)).on_press(Message::RepoAdd)
+        ]
+        .spacing(8),
     );
 
     let mut compiler_rows = column![].spacing(8);
     let mut compiler_names: Vec<_> = config.compilers.keys().cloned().collect();
     compiler_names.sort();
     for name in compiler_names {
-        let cc = config.compilers.get(&name).map(|c| c.cc.clone()).unwrap_or_default();
+        let cc = config
+            .compilers
+            .get(&name)
+            .map(|c| c.cc.clone())
+            .unwrap_or_default();
         let cxx = config
             .compilers
             .get(&name)
             .map(|c| c.cxx.clone())
             .unwrap_or_default();
-        compiler_rows = compiler_rows.push(row![
-            text(name.clone()).size(14).width(Length::Fixed(80.0)),
-            field_text("cc", Some(field_help::COMPILER_CC), &cc, "gcc-14", app_theme, {
-                let n = name.clone();
-                move |v| Message::CompilerCcChanged(n.clone(), v)
-            }),
-            field_text("cxx", Some(field_help::COMPILER_CXX), &cxx, "g++-14", app_theme, {
-                let n = name.clone();
-                move |v| Message::CompilerCxxChanged(n.clone(), v)
-            }),
-            button(text("Remove").size(13))
-                .style(button::danger)
-                .on_press(Message::CompilerRemove(name)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center));
+        compiler_rows = compiler_rows.push(
+            row![
+                text(name.clone()).size(14).width(Length::Fixed(80.0)),
+                field_text(
+                    "cc",
+                    Some(field_help::COMPILER_CC),
+                    &cc,
+                    "gcc-14",
+                    app_theme,
+                    {
+                        let n = name.clone();
+                        move |v| Message::CompilerCcChanged(n.clone(), v)
+                    }
+                ),
+                field_text(
+                    "cxx",
+                    Some(field_help::COMPILER_CXX),
+                    &cxx,
+                    "g++-14",
+                    app_theme,
+                    {
+                        let n = name.clone();
+                        move |v| Message::CompilerCxxChanged(n.clone(), v)
+                    }
+                ),
+                button(text("Remove").size(13))
+                    .style(button::danger)
+                    .on_press(Message::CompilerRemove(name)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
     }
 
     let compilers = card_section(
@@ -557,8 +589,7 @@ pub fn view<'a>(
         .spacing(8);
         if has_pkg_config {
             actions = actions.push(
-                button(text("Edit package").size(12))
-                    .on_press(Message::OpenPackage(name.clone())),
+                button(text("Edit package").size(12)).on_press(Message::OpenPackage(name.clone())),
             );
         } else if !held.name.is_empty() {
             actions = actions.push(
@@ -621,9 +652,7 @@ pub fn view<'a>(
             if let Some(report) = hold_check_report {
                 column![
                     text("Hold check result").size(13),
-                    text(report)
-                        .size(12)
-                        .font(iced::Font::MONOSPACE),
+                    text(report).size(12).font(iced::Font::MONOSPACE),
                 ]
                 .spacing(4)
             } else {

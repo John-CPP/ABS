@@ -1,10 +1,12 @@
+use crate::app_settings::AppTheme;
 use crate::field_help;
 use crate::list_editors::PackageListField;
 use crate::messages::{EditTarget, Message, RamdiskLetter};
-use crate::app_settings::AppTheme;
 use crate::style;
-use iced::widget::{button, checkbox, column, pick_list, row, text, text_editor, text_input, Space};
-use iced::{Element, Length, Font};
+use iced::widget::{
+    button, checkbox, column, pick_list, row, text, text_editor, text_input, Space,
+};
+use iced::{Element, Font, Length};
 
 pub use crate::messages::{PathField, PathKind};
 

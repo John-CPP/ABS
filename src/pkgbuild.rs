@@ -3,7 +3,12 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
+
+static PKGREL_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^pkgrel=(.*)$").expect("pkgrel regex"));
+static PKGREL_SUFFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.*)\.([0-9]+)$").expect("pkgrel suffix regex"));
 
 /// Repo dirs with a live `.PKGBUILD.emerge_backup` that still needs restoring. Because `die!`
 /// calls `process::exit` (skipping `Drop`/`PkgbuildGuard`), a fatal error mid-build would otherwise
@@ -51,8 +56,7 @@ fn bash_strip_pkgrel_value(raw: &str) -> String {
 }
 
 fn extract_pkgrel_stripped(pkgbuild_text: &str) -> Option<String> {
-    let line_re = Regex::new(r"(?m)^pkgrel=(.*)$").unwrap();
-    let caps = line_re.captures(pkgbuild_text)?;
+    let caps = PKGREL_LINE_RE.captures(pkgbuild_text)?;
     let raw_value = caps.get(1).map(|m| m.as_str()).unwrap_or("");
     let no_comment = raw_value.split('#').next().unwrap_or("").trim();
     let stripped = bash_strip_pkgrel_value(no_comment);
@@ -63,7 +67,7 @@ fn extract_pkgrel_stripped(pkgbuild_text: &str) -> Option<String> {
 fn compute_next_pkgrel(baseline: &str) -> String {
     debug_assert!(!baseline.is_empty());
 
-    let re_suffix = Regex::new(r"^(.*)\.([0-9]+)$").unwrap();
+    let re_suffix = &*PKGREL_SUFFIX_RE;
     if let Some(caps) = re_suffix.captures(baseline) {
         let base = caps.get(1).unwrap().as_str();
         let suffix: u32 = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
@@ -81,10 +85,12 @@ fn replace_all_pkgrel_lines(content: &str, next: &str) -> String {
 }
 
 /// Replace the first `^key=...` line or append `key=value` when missing.
+/// `value` is written as a bash single-quoted string so metacharacters cannot inject.
 pub fn replace_pkgbuild_field(content: &str, key: &str, value: &str) -> String {
+    let quoted = crate::utils::sh_single_quote(value);
     let replace_re = Regex::new(&format!(r"(?m)^{}=.*$", regex::escape(key))).unwrap();
     if replace_re.is_match(content) {
-        let replacement = format!("{key}={value}");
+        let replacement = format!("{key}={quoted}");
         replace_re
             .replace_all(content, regex::NoExpand(&replacement))
             .to_string()
@@ -93,13 +99,29 @@ pub fn replace_pkgbuild_field(content: &str, key: &str, value: &str) -> String {
         if !out.ends_with('\n') && !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("{key}={value}\n"));
+        out.push_str(&format!("{key}={quoted}\n"));
         out
     }
 }
 
+fn is_safe_pkgbuild_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_safe_pkgbuild_value(value: &str) -> bool {
+    !value.contains('\n') && !value.contains('\r') && !value.contains('\0')
+}
+
 /// Apply CLI `[key=value,...]` overrides to the working `PKGBUILD`.
-pub fn apply_pkgbuild_overrides(repo_dir: &Path, overrides: &std::collections::HashMap<String, String>) {
+pub fn apply_pkgbuild_overrides(
+    repo_dir: &Path,
+    overrides: &std::collections::HashMap<String, String>,
+) {
     if overrides.is_empty() {
         return;
     }
@@ -112,6 +134,14 @@ pub fn apply_pkgbuild_overrides(repo_dir: &Path, overrides: &std::collections::H
 
     let mut content = fs::read_to_string(&pkgbuild_path).unwrap_or_default();
     for (key, value) in overrides {
+        if !is_safe_pkgbuild_key(key) {
+            vlog!("Skipping PKGBUILD override with invalid key {key:?}");
+            continue;
+        }
+        if !is_safe_pkgbuild_value(value) {
+            vlog!("Skipping PKGBUILD override {key}: value contains a newline");
+            continue;
+        }
         content = replace_pkgbuild_field(&content, key, value);
         vlog!("PKGBUILD override: {}={}", key, value);
     }
@@ -142,15 +172,12 @@ pub fn bump_pkgrel(repo_dir: &Path) {
     let backup_text = if backup_path.exists() {
         fs::read_to_string(&backup_path).unwrap_or_default()
     } else {
-        vlog!(
-            "No PKGBUILD backup found; using live PKGBUILD as bump baseline"
-        );
+        vlog!("No PKGBUILD backup found; using live PKGBUILD as bump baseline");
         String::new()
     };
 
-    let line_re = Regex::new(r"(?m)^pkgrel=(.*)$").unwrap();
-    let live_has_pkgrel = line_re.is_match(&live_text);
-    let backup_has_pkgrel = !backup_text.is_empty() && line_re.is_match(&backup_text);
+    let live_has_pkgrel = PKGREL_LINE_RE.is_match(&live_text);
+    let backup_has_pkgrel = !backup_text.is_empty() && PKGREL_LINE_RE.is_match(&backup_text);
     if !live_has_pkgrel && !backup_has_pkgrel {
         let mut out = live_text;
         if !out.ends_with('\n') && !out.is_empty() {
@@ -276,8 +303,7 @@ pub fn inject_compiler_env(repo_dir: &Path, cc: &str, cxx: &str) -> Result<(), S
     );
     modified.push_str(&original);
 
-    fs::write(&pkgbuild_path, modified)
-        .map_err(|e| format!("Failed to write PKGBUILD: {}", e))?;
+    fs::write(&pkgbuild_path, modified).map_err(|e| format!("Failed to write PKGBUILD: {}", e))?;
     Ok(())
 }
 
@@ -294,10 +320,7 @@ pub fn update_pkgsums(repo_dir: &Path) -> bool {
 /// Download source tarballs with `updpkgsums` before ramdisk setup (PGO stage 1 only, on disk).
 /// When compilation uses tmpfs (`w`) but the git tree stays on disk, store tarballs in
 /// `.makepkg-src/` on disk so they survive ramdisk teardown between PGO stages.
-pub fn prefetch_pgo_sources(
-    repo_dir: &Path,
-    targets: &crate::ramdisk::RamdiskTargets,
-) -> bool {
+pub fn prefetch_pgo_sources(repo_dir: &Path, targets: &crate::ramdisk::RamdiskTargets) -> bool {
     if targets.build_workdir && !targets.packages {
         let srcdest = crate::ramdisk::srcdest_for_repo(repo_dir);
         if let Err(e) = std::fs::create_dir_all(&srcdest) {
@@ -365,7 +388,10 @@ pub fn parse_pkg_provided_names(pkg_dir: &Path) -> Vec<String> {
                 let _ = key;
                 let raw = rest.trim().trim_matches(|c| c == '\'' || c == '"');
                 if raw.starts_with('(') {
-                    for word in raw.trim_matches(|c| c == '(' || c == ')').split_whitespace() {
+                    for word in raw
+                        .trim_matches(|c| c == '(' || c == ')')
+                        .split_whitespace()
+                    {
                         let clean = word.trim_matches(|c| c == '\'' || c == '"');
                         let name = extract_base_package_name(clean);
                         if !name.is_empty() {
@@ -441,7 +467,7 @@ mod tests {
     fn replace_pkgbuild_field_preserves_dollar_signs() {
         let content = "pkgver=1.0\n";
         let out = replace_pkgbuild_field(content, "pkgver", "foo$bar");
-        assert_eq!(out, "pkgver=foo$bar\n");
+        assert_eq!(out, "pkgver='foo$bar'\n");
     }
 
     #[test]
@@ -514,7 +540,13 @@ source=("git+https://github.com/curl/curl.git?signed#tag=curl-${pkgver//./_}")
 
     #[test]
     fn test_inject_compiler_env() {
-        let temp = std::env::temp_dir().join(format!("abs_test_pkgbuild_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let temp = std::env::temp_dir().join(format!(
+            "abs_test_pkgbuild_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp).unwrap();
         let pkgbuild = temp.join("PKGBUILD");
         fs::write(&pkgbuild, "pkgname=foo\nbuild() {\n  make\n}\n").unwrap();

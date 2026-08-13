@@ -71,19 +71,25 @@ fn github_api_get(path: &str) -> Result<String, String> {
     let url = format!("https://api.github.com{}", path);
     vlog!("Fetching {}", url);
     let start = std::time::Instant::now();
-    let out = run_command_with_output(
-        "curl",
-        &[
-            "-fsSL",
-            "--compressed",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: abs-upstream-check",
-            &url,
-        ],
-        None::<&str>,
-    )?;
+    let mut args = crate::utils::curl_base_args();
+    args.extend([
+        "--compressed".into(),
+        "-m".into(),
+        "15".into(),
+        "-H".into(),
+        "Accept: application/vnd.github+json".into(),
+        "-H".into(),
+        "User-Agent: abs-upstream-check".into(),
+    ]);
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN"))
+        && !token.is_empty()
+    {
+        args.push("-H".into());
+        args.push(format!("Authorization: Bearer {token}"));
+    }
+    args.push(url.clone());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_command_with_output("curl", &arg_refs, None::<&str>)?;
     vlog!("Fetched {} in {:?}", url, start.elapsed());
     Ok(out)
 }
@@ -247,7 +253,10 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
                     )
                     .pkg_dir;
 
-                    let upstream_pkgver = match fetch_github_latest_version(&task.github, task.upstream_prereleases) {
+                    let upstream_pkgver = match fetch_github_latest_version(
+                        &task.github,
+                        task.upstream_prereleases,
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
                             ewarn!("{}: upstream check failed: {}", task.pkg, e);
@@ -260,9 +269,10 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
                     // needs to be bumped or has already been bumped.
                     if let Ok(Some(inst_ver)) = crate::utils::pacman_query_version(&base_pkg)
                         && let Ok(c) = vercmp(&upstream_pkgver, &inst_ver)
-                            && c > 0 {
-                                crate::build::unmark_aur_package_up_to_date(&task.pkg);
-                            }
+                        && c > 0
+                    {
+                        crate::build::unmark_aur_package_up_to_date(&task.pkg);
+                    }
 
                     if crate::is_dry_run_mode() {
                         println!(
@@ -272,8 +282,11 @@ pub fn sync_upstream_pkgbuilds(config: &Config, cli: &Cli) {
                         continue;
                     }
 
-                    match maybe_bump_pkgbuild_to_upstream(&task.pkg, pkg_dir.as_path(), &upstream_pkgver)
-                    {
+                    match maybe_bump_pkgbuild_to_upstream(
+                        &task.pkg,
+                        pkg_dir.as_path(),
+                        &upstream_pkgver,
+                    ) {
                         Ok(true) => {
                             // The PKGBUILD now has a newer version than what AUR RPC reported;
                             // clear the "up-to-date" flag so version checks and compilation

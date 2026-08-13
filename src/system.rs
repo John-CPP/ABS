@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::utils::{run_command, sh_single_quote};
+use crate::utils::{parse_command_argv, run_argv_command};
 use crate::{die, vlog};
 use colored::Colorize;
 
@@ -13,24 +13,22 @@ pub enum SystemUpdateMode {
 fn is_root() -> bool {
     if let Ok(output) = std::process::Command::new("id").arg("-u").output()
         && let Ok(uid_str) = std::str::from_utf8(&output.stdout)
-            && let Ok(uid) = uid_str.trim().parse::<u32>() {
-                return uid == 0;
-            }
+        && let Ok(uid) = uid_str.trim().parse::<u32>()
+    {
+        return uid == 0;
+    }
     if let Ok(user) = std::env::var("USER") {
         return user == "root";
     }
     false
 }
 
-fn transform_system_update_command(mut cmd_str: String, is_root_user: bool) -> String {
-    let trimmed = cmd_str.trim();
-    if (trimmed.starts_with("pacman ") || trimmed == "pacman")
-        && !trimmed.starts_with("sudo ")
-        && !is_root_user
-    {
-        cmd_str = format!("sudo {}", cmd_str);
+fn transform_system_update_argv(mut argv: Vec<String>, is_root_user: bool) -> Vec<String> {
+    let cmd = argv.first().map(String::as_str).unwrap_or("");
+    if (cmd == "pacman" || cmd.ends_with("/pacman")) && !is_root_user {
+        argv.insert(0, "sudo".into());
     }
-    cmd_str
+    argv
 }
 
 fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
@@ -59,28 +57,32 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
         return false;
     }
 
-    let mut cmd_str = match mode {
+    let cmd_str = match mode {
         SystemUpdateMode::UpdateRepositories => {
             config.system_update.command_to_update_repositories.clone()
         }
-        SystemUpdateMode::PerformUpdateWithRefresh => {
-            config.system_update.command_to_perform_system_update.clone()
-        }
-        SystemUpdateMode::PerformUpdateNoRefresh => {
-            config.system_update.get_command_to_perform_system_update_no_refresh()
-        }
+        SystemUpdateMode::PerformUpdateWithRefresh => config
+            .system_update
+            .command_to_perform_system_update
+            .clone(),
+        SystemUpdateMode::PerformUpdateNoRefresh => config
+            .system_update
+            .get_command_to_perform_system_update_no_refresh(),
     };
 
-    cmd_str = transform_system_update_command(cmd_str, is_root());
+    let mut argv = match parse_command_argv(&cmd_str) {
+        Ok(v) => transform_system_update_argv(v, is_root()),
+        Err(e) => die!("Invalid system update command: {e}"),
+    };
 
     for pkg in packages_ignored_during_system_update(config) {
-        cmd_str.push_str(&format!(" {} {}", config.system_update.ignore_flag, sh_single_quote(&pkg)));
+        argv.push(config.system_update.ignore_flag.clone());
+        argv.push(pkg);
     }
 
-    vlog!("Executing system update: {}", cmd_str);
+    vlog!("Executing system update: {}", argv.join(" "));
 
-    // We run it via sh -c to allow complex yay commands from config
-    if let Err(e) = run_command("sh", &["-c", &cmd_str], None::<&str>) {
+    if let Err(e) = run_argv_command(&argv, None::<&str>) {
         die!("System update failed: {}", e);
     }
     true
@@ -104,7 +106,9 @@ fn warn_system_update_blocked_during_pgo(
     eprintln!(
         "{} {}",
         "==> PGO IN PROGRESS — SYSTEM UPDATE SKIPPED".red().bold(),
-        format!("({action} blocked while kernel PGO pipeline(s) are active)").yellow().bold()
+        format!("({action} blocked while kernel PGO pipeline(s) are active)")
+            .yellow()
+            .bold()
     );
     for pipeline in pipelines {
         eprintln!(
@@ -240,11 +244,7 @@ mod tests {
             expected_package_base: None,
             stage_history: vec![],
         };
-        std::fs::write(
-            &state_path,
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
         let mut config = minimal_config(vec![], vec![], vec![]);
         let pgo = PgoConfig {
@@ -288,34 +288,34 @@ mod tests {
     fn test_transform_system_update_command() {
         // Non-root user: pacman commands should get sudo prepended
         assert_eq!(
-            transform_system_update_command("pacman -Su".to_string(), false),
-            "sudo pacman -Su"
+            transform_system_update_argv(vec!["pacman".into(), "-Su".into()], false),
+            vec!["sudo", "pacman", "-Su"]
         );
         assert_eq!(
-            transform_system_update_command("pacman".to_string(), false),
-            "sudo pacman"
+            transform_system_update_argv(vec!["pacman".into()], false),
+            vec!["sudo", "pacman"]
         );
 
         // Root user: pacman commands should NOT get sudo prepended
         assert_eq!(
-            transform_system_update_command("pacman -Su".to_string(), true),
-            "pacman -Su"
+            transform_system_update_argv(vec!["pacman".into(), "-Su".into()], true),
+            vec!["pacman", "-Su"]
         );
 
         // Already has sudo: should NOT get sudo prepended for either
         assert_eq!(
-            transform_system_update_command("sudo pacman -Su".to_string(), false),
-            "sudo pacman -Su"
+            transform_system_update_argv(vec!["sudo".into(), "pacman".into(), "-Su".into()], false),
+            vec!["sudo", "pacman", "-Su"]
         );
         assert_eq!(
-            transform_system_update_command("sudo pacman -Su".to_string(), true),
-            "sudo pacman -Su"
+            transform_system_update_argv(vec!["sudo".into(), "pacman".into(), "-Su".into()], true),
+            vec!["sudo", "pacman", "-Su"]
         );
 
         // Non-pacman command (e.g. yay): should NOT get sudo prepended
         assert_eq!(
-            transform_system_update_command("yay -Su".to_string(), false),
-            "yay -Su"
+            transform_system_update_argv(vec!["yay".into(), "-Su".into()], false),
+            vec!["yay", "-Su"]
         );
     }
 }

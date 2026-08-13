@@ -153,10 +153,8 @@ pub fn artifact_filename_belongs_to_package(
 }
 
 fn makepkg_env_pairs(env: &HashMap<String, String>) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
 }
@@ -174,12 +172,9 @@ fn collect_pgo_candidate_files(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    if let Ok(output) = run_command_with_output_env(
-        "makepkg",
-        &["--packagelist"],
-        Some(repo_dir),
-        &env_refs,
-    ) {
+    if let Ok(output) =
+        run_command_with_output_env("makepkg", &["--packagelist"], Some(repo_dir), &env_refs)
+    {
         let mut files = Vec::new();
         for line in output.lines() {
             if let Some(p) = resolve_packagelist_line(line, repo_dir, ready_packages_path)
@@ -199,10 +194,7 @@ fn collect_pgo_candidate_files(
     collect_candidate_files_from_pkgdest(pkgbase, ready_packages_path)
 }
 
-fn collect_candidate_files_from_pkgdest(
-    pkgbase: &str,
-    ready_packages_path: &str,
-) -> Vec<PathBuf> {
+fn collect_candidate_files_from_pkgdest(pkgbase: &str, ready_packages_path: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(ready_packages_path) {
         for entry in entries.flatten() {
@@ -526,10 +518,7 @@ fn dependency_names_from_file(pkg_file: &Path) -> Vec<String> {
     deps
 }
 
-fn auto_include_local_dependencies(
-    selected: &mut Vec<PathBuf>,
-    available: &[PathBuf],
-) {
+fn auto_include_local_dependencies(selected: &mut Vec<PathBuf>, available: &[PathBuf]) {
     let mut file_by_pkg: HashMap<String, PathBuf> = HashMap::new();
     for file in available {
         if let Some(pkg_name) = package_name_from_file(file) {
@@ -553,10 +542,7 @@ fn auto_include_local_dependencies(
                     continue;
                 }
                 if let Some(dep_file) = file_by_pkg.get(&dep_name) {
-                    vlog!(
-                        "Auto-including dependency from built set: {}",
-                        dep_name
-                    );
+                    vlog!("Auto-including dependency from built set: {}", dep_name);
                     selected_pkgs.insert(dep_name);
                     selected.push(dep_file.clone());
                     changed = true;
@@ -648,10 +634,7 @@ mod tests {
             parse_pkgname_and_version("ntfsprogs-2026.2.25-1-x86_64.pkg.tar.zst"),
             Some(("ntfsprogs".to_string(), "2026.2.25-1".to_string()))
         );
-        assert_eq!(
-            parse_pkgname_and_version("invalid-file.pkg.tar"),
-            None
-        );
+        assert_eq!(parse_pkgname_and_version("invalid-file.pkg.tar"), None);
     }
 
     #[test]
@@ -682,8 +665,7 @@ mod tests {
         // Older ready artifact must not satisfy a newer packagelist target.
         let stale_only = ready_dir.join("qbittorrent-5.2.3-1.2-x86_64.pkg.tar.zst");
         fs::write(&stale_only, "fake").unwrap();
-        let newer_line =
-            "/media/storage/packages/abs/ready/qbittorrent-5.2.3-2-x86_64.pkg.tar.zst";
+        let newer_line = "/media/storage/packages/abs/ready/qbittorrent-5.2.3-2-x86_64.pkg.tar.zst";
         assert_eq!(
             resolve_packagelist_line(newer_line, &repo_dir, ready_dir.to_str().unwrap()),
             None
@@ -694,8 +676,14 @@ mod tests {
 
     #[test]
     fn artifact_belongs_to_pkgbase_excludes_sibling_variants() {
-        assert!(artifact_belongs_to_pkgbase("linux-cachyos", "linux-cachyos"));
-        assert!(artifact_belongs_to_pkgbase("linux-cachyos-dbg", "linux-cachyos"));
+        assert!(artifact_belongs_to_pkgbase(
+            "linux-cachyos",
+            "linux-cachyos"
+        ));
+        assert!(artifact_belongs_to_pkgbase(
+            "linux-cachyos-dbg",
+            "linux-cachyos"
+        ));
         assert!(artifact_belongs_to_pkgbase(
             "linux-cachyos-headers",
             "linux-cachyos"
@@ -753,21 +741,11 @@ mod tests {
         fs::create_dir_all(&ready_dir).unwrap();
         let ready = ready_dir.to_str().unwrap();
 
-        assert!(!has_ready_made_artifacts(
-            "firefox",
-            "firefox",
-            ready,
-            None
-        ));
+        assert!(!has_ready_made_artifacts("firefox", "firefox", ready, None));
 
         let artifact = ready_dir.join("firefox-140.0-1-x86_64.pkg.tar.zst");
         fs::write(&artifact, "fake").unwrap();
-        assert!(has_ready_made_artifacts(
-            "firefox",
-            "firefox",
-            ready,
-            None
-        ));
+        assert!(has_ready_made_artifacts("firefox", "firefox", ready, None));
         // Alias/input name also matches when base name is in the filename prefix.
         assert!(has_ready_made_artifacts(
             "firefox-bin",

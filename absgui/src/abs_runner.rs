@@ -1,6 +1,6 @@
+use iced::futures::channel::mpsc;
 use iced::futures::SinkExt;
 use iced::futures::Stream;
-use iced::futures::channel::mpsc;
 use iced::futures::StreamExt;
 use iced::stream;
 use serde::Deserialize;
@@ -354,9 +354,11 @@ pub fn launch_in_terminal(command: &str, pid_file: Option<&Path>) -> Result<Stri
         }
     }
     if tried.is_empty() {
-        Err("No terminal emulator found. Install one (kitty, alacritty, konsole, gnome-terminal, \
+        Err(
+            "No terminal emulator found. Install one (kitty, alacritty, konsole, gnome-terminal, \
              xterm, …) or set ABSGUI_TERMINAL to your terminal command."
-            .into())
+                .into(),
+        )
     } else {
         Err(format!(
             "Failed to launch a terminal emulator (tried: {}).",
@@ -370,9 +372,8 @@ fn command_exists(name: &str) -> bool {
     if path.components().count() > 1 {
         return path.is_file();
     }
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 /// Find a graphical askpass program so sudo can prompt for a password from the GUI (there is no
@@ -434,37 +435,38 @@ fn apply_gui_sudo_env(cmd: &mut Command) {
 /// streams to absgui instead of block-buffering for minutes.
 /// Returns `(Command, optional wrapper line if different from inner)`.
 fn spawn_pgo_command(inner: &str) -> (Command, Option<String>) {
-    let (program, args, wrapper_display): (String, Vec<String>, String) = if command_exists("script") {
-        // `-f` flushes script's pipe output after each write; without it the GUI sees silence
-        // for minutes while kernel builds stream to the pseudo-TTY.
-        (
-            "script".into(),
-            vec![
-                "-q".into(),
-                "-f".into(),
-                "-c".into(),
-                inner.to_string(),
-                "/dev/null".into(),
-            ],
-            format!("$ script -q -f -c {} /dev/null", shell_quote(inner)),
-        )
-    } else if command_exists("stdbuf") {
-        let wrapped = format!("stdbuf -oL -eL {inner}");
-        (
-            "sh".into(),
-            vec!["-c".into(), wrapped.clone()],
-            format!("$ {wrapped}"),
-        )
-    } else {
-        return (
-            {
-                let mut cmd = Command::new("sh");
-                cmd.args(["-c", inner]);
-                cmd
-            },
-            None,
-        );
-    };
+    let (program, args, wrapper_display): (String, Vec<String>, String) =
+        if command_exists("script") {
+            // `-f` flushes script's pipe output after each write; without it the GUI sees silence
+            // for minutes while kernel builds stream to the pseudo-TTY.
+            (
+                "script".into(),
+                vec![
+                    "-q".into(),
+                    "-f".into(),
+                    "-c".into(),
+                    inner.to_string(),
+                    "/dev/null".into(),
+                ],
+                format!("$ script -q -f -c {} /dev/null", shell_quote(inner)),
+            )
+        } else if command_exists("stdbuf") {
+            let wrapped = format!("stdbuf -oL -eL {inner}");
+            (
+                "sh".into(),
+                vec!["-c".into(), wrapped.clone()],
+                format!("$ {wrapped}"),
+            )
+        } else {
+            return (
+                {
+                    let mut cmd = Command::new("sh");
+                    cmd.args(["-c", inner]);
+                    cmd
+                },
+                None,
+            );
+        };
 
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -502,9 +504,7 @@ fn list_process_tree(root: u32) -> Vec<u32> {
 #[cfg(unix)]
 fn terminate_process_group(pid: u32) {
     let pgid = format!("-{pid}");
-    let _ = Command::new("kill")
-        .args(["-TERM", &pgid])
-        .status();
+    let _ = Command::new("kill").args(["-TERM", &pgid]).status();
     for child in list_process_tree(pid) {
         if child != pid {
             let _ = Command::new("kill")
@@ -516,9 +516,7 @@ fn terminate_process_group(pid: u32) {
         .args(["-TERM", &pid.to_string()])
         .status();
     thread::sleep(Duration::from_millis(2000));
-    let _ = Command::new("kill")
-        .args(["-KILL", &pgid])
-        .status();
+    let _ = Command::new("kill").args(["-KILL", &pgid]).status();
     for child in list_process_tree(pid) {
         let _ = Command::new("kill")
             .args(["-KILL", &child.to_string()])
@@ -624,7 +622,9 @@ fn run_abs_pgo_streaming(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            send(PgoStreamEvent::Done(Err(format!("Failed to start abs: {e}"))));
+            send(PgoStreamEvent::Done(Err(format!(
+                "Failed to start abs: {e}"
+            ))));
             return;
         }
     };
@@ -635,14 +635,12 @@ fn run_abs_pgo_streaming(
     let stderr = child.stderr.take();
 
     let tx_out = tx.clone();
-    let stdout_handle = stdout.map(|out| {
-        thread::spawn(move || stream_pipe_lines(out, None, tx_out))
-    });
+    let stdout_handle =
+        stdout.map(|out| thread::spawn(move || stream_pipe_lines(out, None, tx_out)));
 
     let tx_err = tx.clone();
-    let stderr_handle = stderr.map(|err| {
-        thread::spawn(move || stream_pipe_lines(err, Some("stderr"), tx_err))
-    });
+    let stderr_handle =
+        stderr.map(|err| thread::spawn(move || stream_pipe_lines(err, Some("stderr"), tx_err)));
 
     if let Some(h) = stdout_handle {
         let _ = h.join();
@@ -657,7 +655,9 @@ fn run_abs_pgo_streaming(
     let status = match child.wait() {
         Ok(s) => s,
         Err(e) => {
-            send(PgoStreamEvent::Done(Err(format!("Failed waiting for abs: {e}"))));
+            send(PgoStreamEvent::Done(Err(format!(
+                "Failed waiting for abs: {e}"
+            ))));
             return;
         }
     };
@@ -728,9 +728,7 @@ pub fn run_abs_abort(package: &str) -> Result<String, String> {
     let mut cmd = Command::new(abs_binary());
     cmd.args(["--pgo-abort", package, "--pgo-keep-stage"]);
     apply_gui_sudo_env(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("spawn: {e}"))?;
+    let output = cmd.output().map_err(|e| format!("spawn: {e}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -826,7 +824,10 @@ mod tests {
 
     #[test]
     fn shell_quote_always_quotes_shell_metacharacters() {
-        assert_eq!(shell_quote("kernel; touch /tmp/pwned"), "'kernel; touch /tmp/pwned'");
+        assert_eq!(
+            shell_quote("kernel; touch /tmp/pwned"),
+            "'kernel; touch /tmp/pwned'"
+        );
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
     }
 }
