@@ -28,7 +28,11 @@ pub fn split_pkgver_pkgrel(version: &str) -> Result<(String, String), String> {
 
 /// Names of all held packages.
 pub fn held_names(config: &Config) -> Vec<String> {
-    config.held_packages.iter().map(|h| h.name.clone()).collect()
+    config
+        .held_packages
+        .iter()
+        .map(|h| h.name.clone())
+        .collect()
 }
 
 pub fn is_held(config: &Config, pkg: &str) -> bool {
@@ -48,12 +52,10 @@ pub fn apply_held_overrides_to_spec(spec: &mut PackageSpec, config: &Config) {
         return;
     };
     if !spec.pkgbuild_overrides.contains_key("pkgver") {
-        spec.pkgbuild_overrides
-            .insert("pkgver".to_string(), pkgver);
+        spec.pkgbuild_overrides.insert("pkgver".to_string(), pkgver);
     }
     if !spec.pkgbuild_overrides.contains_key("pkgrel") {
-        spec.pkgbuild_overrides
-            .insert("pkgrel".to_string(), pkgrel);
+        spec.pkgbuild_overrides.insert("pkgrel".to_string(), pkgrel);
     }
 }
 
@@ -134,10 +136,8 @@ pub fn specs_for_trigger_drifts(drifts: &[TriggerDrift]) -> Vec<PackageSpec> {
         if seen.insert(d.held_name.clone()) {
             let mut spec = PackageSpec::plain(&d.held_name);
             if let Ok((pkgver, pkgrel)) = split_pkgver_pkgrel(&d.held_version) {
-                spec.pkgbuild_overrides
-                    .insert("pkgver".to_string(), pkgver);
-                spec.pkgbuild_overrides
-                    .insert("pkgrel".to_string(), pkgrel);
+                spec.pkgbuild_overrides.insert("pkgver".to_string(), pkgver);
+                spec.pkgbuild_overrides.insert("pkgrel".to_string(), pkgrel);
             }
             specs.push(spec);
         }

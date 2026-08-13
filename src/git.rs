@@ -73,36 +73,16 @@ fn find_pkg_dir_in_list(dirs: &[PathBuf], pkg_name: &str) -> Option<PathBuf> {
         return Some(exact.clone());
     }
 
-    let pkg_name_lower = pkg_name.to_lowercase();
-
     // 2. Case-insensitive exact match.
-    if let Some(ci_exact) = dirs
-        .iter()
-        .find(|d| dir_name(d).map(|n| n.eq_ignore_ascii_case(pkg_name)).unwrap_or(false))
-    {
+    if let Some(ci_exact) = dirs.iter().find(|d| {
+        dir_name(d)
+            .map(|n| n.eq_ignore_ascii_case(pkg_name))
+            .unwrap_or(false)
+    }) {
         return Some(ci_exact.clone());
     }
 
-    // 3. Substring fallback. Multiple package dirs can contain the query as a substring
-    // (e.g. `mesa` is in `lib32-mesa` and `mesa-utils`). Prefer the closest by name length to
-    // avoid silently building the wrong package, and warn so the choice is visible.
-    let mut candidates: Vec<&PathBuf> = dirs
-        .iter()
-        .filter(|d| {
-            dir_name(d)
-                .map(|n| n.to_lowercase().contains(&pkg_name_lower))
-                .unwrap_or(false)
-        })
-        .collect();
-    candidates.sort_by_key(|d| dir_name(d).map(|n| n.len()).unwrap_or(usize::MAX));
-
-    let chosen = candidates.first()?;
-    ewarn!(
-        "No exact PKGBUILD directory for '{}'; using closest match '{}'",
-        pkg_name,
-        dir_name(chosen).unwrap_or_default()
-    );
-    Some((*chosen).clone())
+    None
 }
 
 fn find_pkg_dir(repo_dir: &Path, pkg_name: &str) -> Option<PathBuf> {
@@ -124,10 +104,7 @@ pub fn find_pkg_dir_cached(
 
 /// Repositories where each package lives in its own git clone (`{base}/{repo}/{pkg}.git`).
 pub fn is_per_package_repo(repo_name: &str) -> bool {
-    matches!(
-        repo_name.to_ascii_lowercase().as_str(),
-        "arch" | "aur"
-    )
+    matches!(repo_name.to_ascii_lowercase().as_str(), "arch" | "aur")
 }
 
 fn per_package_repo_key(repo_name: &str) -> String {
@@ -204,6 +181,15 @@ fn clone_git_repo(clone_url: &str, repo_dir: &Path) -> Result<(), String> {
             ));
         }
     }
+    accept_clone_dest(repo_dir, crate::is_dry_run_mode())
+}
+
+/// After `git clone`, the dest must be a usable repo. `--dry-run` only prints the clone,
+/// so a missing dest is expected rather than a corrupt clone.
+fn accept_clone_dest(repo_dir: &Path, dry_run: bool) -> Result<(), String> {
+    if dry_run {
+        return Ok(());
+    }
     if !is_usable_git_repo(repo_dir) {
         let _ = check_sudo_removal(repo_dir);
         return Err(format!(
@@ -240,7 +226,11 @@ pub fn prepare_repo(
         }
 
         if let Err(e) = scrub_incomplete_git_repo(&repo_dir, base_pkg_name) {
-            die!("Failed to remove incomplete repository {}: {}", repo_dir.display(), e);
+            die!(
+                "Failed to remove incomplete repository {}: {}",
+                repo_dir.display(),
+                e
+            );
         }
 
         if !repo_dir.exists() {
@@ -264,7 +254,11 @@ pub fn prepare_repo(
                 repo_key.to_uppercase(),
                 base_pkg_name
             );
-            match git_run("git", &["pull", "--ff-only", "-q"], Some(repo_dir.as_path())) {
+            match git_run(
+                "git",
+                &["pull", "--ff-only", "-q"],
+                Some(repo_dir.as_path()),
+            ) {
                 Ok(()) => {
                     sync_action = RepoSyncAction::Updated;
                     shared_repo_remote_note_updated(&repo_dir);
@@ -289,7 +283,11 @@ pub fn prepare_repo(
     }
 
     if let Err(e) = scrub_incomplete_git_repo(&repo_dir, repo_name) {
-        die!("Failed to remove incomplete repository {}: {}", repo_dir.display(), e);
+        die!(
+            "Failed to remove incomplete repository {}: {}",
+            repo_dir.display(),
+            e
+        );
     }
 
     if !is_usable_git_repo(&repo_dir) {
@@ -306,7 +304,13 @@ pub fn prepare_repo(
         shared_repo_remote_note_updated(&repo_dir);
     } else if force_update && !shared_repo_remote_already_updated(&repo_dir) {
         loop {
-            if git_run("git", &["pull", "--ff-only", "-q"], Some(repo_dir.as_path())).is_ok() {
+            if git_run(
+                "git",
+                &["pull", "--ff-only", "-q"],
+                Some(repo_dir.as_path()),
+            )
+            .is_ok()
+            {
                 sync_action = RepoSyncAction::Updated;
                 shared_repo_remote_note_updated(&repo_dir);
                 break;
@@ -360,6 +364,9 @@ pub fn prepare_repo(
     };
     let pkg_dir = match found {
         Some(path) => path,
+        None if crate::is_dry_run_mode() && sync_action == RepoSyncAction::Cloned => {
+            repo_dir.join(base_pkg_name)
+        }
         None => die!("Package {} not found in repository {}", pkg_name, repo_name),
     };
     PrepareRepoResult {
@@ -370,13 +377,16 @@ pub fn prepare_repo(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_pkg_dir_in_list, is_usable_git_repo};
+    use super::{accept_clone_dest, find_pkg_dir_in_list, is_usable_git_repo};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
 
     fn dirs(names: &[&str]) -> Vec<PathBuf> {
-        names.iter().map(|n| PathBuf::from("/repo").join(n)).collect()
+        names
+            .iter()
+            .map(|n| PathBuf::from("/repo").join(n))
+            .collect()
     }
 
     #[test]
@@ -387,11 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn substring_fallback_prefers_shortest_name() {
+    fn substring_is_not_a_match() {
         let list = dirs(&["lib32-mesa", "mesa-extra-utils"]);
-        let found = find_pkg_dir_in_list(&list, "mesa").unwrap();
-        // Both contain "mesa"; the shorter directory name is the closer match.
-        assert_eq!(found.file_name().unwrap(), "lib32-mesa");
+        assert!(find_pkg_dir_in_list(&list, "mesa").is_none());
     }
 
     #[test]
@@ -440,5 +448,12 @@ mod tests {
         assert!(status.success());
         assert!(is_usable_git_repo(&tmp));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dry_run_accepts_missing_clone_dest() {
+        let missing = PathBuf::from("/tmp/abs_missing_clone_dest_does_not_exist");
+        assert!(accept_clone_dest(&missing, true).is_ok());
+        assert!(accept_clone_dest(&missing, false).is_err());
     }
 }

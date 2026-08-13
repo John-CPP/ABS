@@ -1,69 +1,66 @@
 # ABS
 
-Arch Linux / CachyOS package builder. Maybe works with other arch-based distros.
-Main idea of ABS is add gentoo-emerge like functionality to arch-like systems.
-Current code in repo is already a stable version so no releases necessary.
+ABS is a package builder for Arch Linux and CachyOS (and likely other Arch-based distros). The idea is Gentoo-emerge-like: you choose packages, ABS fetches the PKGBUILD, compiles, and can install.
+
+The git `HEAD` of this repository is the working version. There are no GitHub Releases.
 
 ---
 
-## Requirements
+## Minimum to start
 
-- Rust stable (edition 2024) — install via [rustup](https://rustup.rs/)
-- `base-devel`, `git`, `sudo`, `pacman`
-- `devtools` — required for chroot builds (`makechrootpkg`)
-
----
-
-## Install
+You need [rustup](https://rustup.rs/) (stable Rust), plus `base-devel`, `git`, `sudo`, and `pacman`. Install `devtools` only if you want chroot builds (`-h`).
 
 ```bash
 git clone https://github.com/John-CPP/ABS.git
-cd ABS/aur
-makepkg -si
+cd ABS/aur && makepkg -si
+abs --config-wizard          # first-time setup (also asked automatically if no config exists)
+abs --repo=aur some-package  # or: abs mesa
 ```
 
-This installs three pacman packages:
+That `makepkg -si` installs the CLI, the GUI, and the `abs-full` metapackage.
 
-| Package    | Role                                      |
-| ---------- | ----------------------------------------- |
-| `abs`      | CLI, PGO benchmark script, documentation  |
-| `absgui`   | GUI (depends on `abs`)                    |
-| `abs-full` | Metapackage pulling in both               |
+- Guided config: `abs --config-wizard` (Enter keeps the suggested/current value). Reconfigure copies the previous `abs.toml` to `abs.toml.bak` beside it.
+- Edit the file in an editor instead: `abs --configure` or `abs --configure=nano` (`$EDITOR`, then `$VISUAL`, then `vi`; tested: vim, nano, kate).
+- Everyday: `abs -U` upgrades the system; `abs -RU` also refreshes watched packages and compiles what is newer ([Everyday use](#everyday-use)).
+- Later: `abs --self-update` to pull a newer git `HEAD`. `abs --purge` or `pacman -Rns abs-full` to remove ABS itself ([Update ABS](#update-abs), [Uninstall](#uninstall)).
 
-Install only the CLI: build with `makepkg -si` and install `abs-*.pkg.tar.zst` only.  
-Install everything: install `abs`, `absgui`, and `abs-full` artifacts (or `pacman -U` all three after `makepkg -s`).
+Config file (first match wins): `$XDG_CONFIG_HOME/abs/abs.toml` (usually `~/.config/abs/abs.toml`), then `/etc/abs/abs.toml`. Full key list: [abs.toml.example](abs.toml.example).
 
-Remove pacman-tracked files:
+---
+
+## Install options
+
+`cd aur && makepkg -si` builds and installs **all three** split packages:
+
+| Package    | Role                                     |
+| ---------- | ---------------------------------------- |
+| `abs`      | CLI, PGO benchmark script, documentation |
+| `absgui`   | GUI (depends on `abs`)                   |
+| `abs-full` | Metapackage that depends on both         |
+
+CLI only (do **not** use `makepkg -si` for this — `-i` would install everything):
 
 ```bash
-sudo pacman -Rns abs-full   # also removes abs and absgui when nothing else needs them
+cd aur
+makepkg -s
+sudo pacman -U abs-[0-9]*.pkg.tar.zst   # CLI only; not absgui-*.pkg.tar.zst or abs-full-*.pkg.tar.zst
 ```
 
-User config under `~/.config/abs` is not removed by pacman; use `abs --purge --yes` for that.
-
-Manual install (development):
+From a git checkout without pacman, **`make install` already builds the release profile**, then installs binaries, the PGO script, and the desktop icon:
 
 ```bash
-# Fast smoke-test build (optimized, no LTO) — use this while iterating
-make fast                 # → target/fast/{abs,absgui}
-make install-fast         # install those binaries to /usr/bin
-# or: cargo fast
-
-# Production / release build (thin LTO)
-make release              # → target/release/{abs,absgui}
-make install              # binaries + PGO script + desktop icon
-# or: cargo rel
-
-# AUR package from checkout
-make aur                  # cd aur && makepkg -si
+make install                 # = release build + install to /usr (PREFIX/DESTDIR work as usual)
+make install-fast            # quicker optimized build (no LTO); binaries only, no desktop/PGO assets
+make aur                     # same as: cd aur && makepkg -si
 ```
 
-`PREFIX` / `DESTDIR` work as usual (`make install-fast PREFIX=$$HOME/.local`).
+Install to your home prefix: `make install-fast PREFIX=$HOME/.local`.
 
-Equivalent without Make:
+Cargo aliases: `cargo fast` → `target/fast/`, `cargo rel` → `target/release/`. There is no `make uninstall`.
+
+Equivalent without Make (release layout):
 
 ```bash
-cargo build --profile fast
 cargo build --release
 sudo install -Dm755 ./target/release/abs /usr/bin/abs
 sudo install -Dm755 ./target/release/absgui /usr/bin/absgui
@@ -74,201 +71,266 @@ sudo install -Dm644 ./absgui/absgui.desktop /usr/share/applications/absgui.deskt
 
 ---
 
-## Configuration
+## Update ABS
 
-ABS reads one TOML file (first match wins):
-
-1. `$XDG_CONFIG_HOME/abs/abs.toml`
-2. `/etc/abs/abs.toml`
-
-On first run, if neither file exists, ABS creates `~/.config/abs/abs.toml` from
-`[abs.toml.example](abs.toml.example)` and prints:
-
-```
-ABS config has been created from the example. Please configure using --configure
-```
-
-Edit the config with:
+ABS does not use GitHub Releases. `abs --self-update` compares `Cargo.toml` versions at git **HEAD**. With `self_update_use_pacman = true` (the default), it looks in `ready_made_packages_path` for already-built `abs` / `absgui` / `abs-full` packages of that version and installs them. If they are missing, it clones this repo, builds `aur/` with `makepkg` (`PKGDEST` = `ready_made_packages_path`), then upgrades with pacman.
 
 ```bash
-abs --configure              # uses $EDITOR (then $VISUAL, then vi)
-abs --configure=kate         # uses a specific editor
+abs --check-update    # print whether HEAD is newer
+abs --self-update     # install from ready packages, or fetch HEAD, compile, install
 ```
 
-See `[abs.toml.example](abs.toml.example)` for all available keys.
+If `self_update_use_pacman = false` in `abs.toml`, it copies `abs` and `absgui` next to `self_update_install_path` (default `/usr/bin/abs`) instead of using pacman. When that path is under `/usr/bin`, it also installs the desktop file and icon. Shared compile machines should keep pacman self-update enabled.
+
+With `check_for_update_on_startup = true` (the default), ABS checks in the background and, if HEAD is newer, prints a reminder **when that run exits**. `auto_update_on_startup` updates before doing anything else. `self_update_at_updates` updates ABS before `abs -U` / `-RU`.
 
 ---
 
-## Usage
+## Several computers, one compile machine
+
+Give every machine the **same** `ready_made_packages_path` (NFS, SMB, or another shared folder). Keep `ignore_already_made_packages = false` (the default) and `self_update_use_pacman = true`. The compile PC runs `abs` as usual; the others skip compilation when matching `.pkg.tar.*` files are already in that folder, then install. `abs --self-update` on the others installs the shared `abs` / `absgui` / `abs-full` packages and does not compile ABS again.
+
+Use the same `abs.toml` package lists and `[packages.*]` overrides on every machine. Install `abs-full` on each PC so the self-update artifact set matches.
+
+`packages_path` (git clones) can be shared too, but it is optional. Prefer **not** sharing it if the compile PC might still be cloning or building: consumers only need the ready folder to skip compiles. Leave `[ramdisk] packages = false` when `packages_path` is on a network share.
+
+Do **not** point pacman’s download cache at `ready_made_packages_path`. A repo tarball with the same name as an ABS build would look like a finished compile and skip a rebuild.
+
+On NFS, attribute caching can hide new files for a while. Mount with `actimeo=0` (or equivalent) so other PCs see packages as soon as the compile machine finishes.
+
+### Pacman, yay, and makepkg on the same share
+
+Create one network share with **separate subfolders**:
+
+| What | Example path | Config |
+| --- | --- | --- |
+| ABS sources (optional) | `/mnt/pkgshare/abs/packages` | `[paths] packages_path` |
+| ABS compiled packages (required) | `/mnt/pkgshare/abs/ready` | `[paths] ready_made_packages_path` |
+| Pacman / yay repo downloads | `/mnt/pkgshare/pacman` | `/etc/pacman.conf` `CacheDir` |
+| Yay AUR build trees (optional) | `/mnt/pkgshare/yay` | yay `buildDir` |
+
+On every machine, in `/etc/pacman.conf`:
+
+```
+CacheDir = /mnt/pkgshare/pacman/
+```
+
+Yay uses that cache for repo packages automatically. Optional: put AUR build trees on the share in `~/.config/yay/config.json`:
+
+```json
+{
+    "buildDir": "/mnt/pkgshare/yay"
+}
+```
+
+Optional: send **yay / raw makepkg** packages into the ABS ready folder (ABS already sets `PKGDEST` for its own builds). In `/etc/makepkg.conf`:
+
+```
+PKGDEST=/mnt/pkgshare/abs/ready
+```
+
+The compile user needs write access to `abs/ready` (and `abs/packages` if you share sources). Other PCs only need to read `abs/ready` for `pacman -U`. Pacman writes `CacheDir` as root during `-Syu`, so that folder must be writable by root on each machine (watch NFS `root_squash`). Run `paccache` from one machine only.
+
+Mount the share before running abs, pacman, or yay (`fstab` or a systemd `.mount`). Then on the compile PC:
+
+```bash
+abs --self-update
+abs -RU
+```
+
+On the other PCs, after that finishes:
+
+```bash
+abs --self-update
+abs mesa                 # skips compile when the ready folder already has this version
+abs --install-only mesa  # install from the ready folder only
+abs -U                   # system update; watched packages reuse ready artifacts
+```
+
+---
+
+## Uninstall
+
+Remove the pacman packages (config under `~/.config/abs` is **kept**):
+
+```bash
+sudo pacman -Rns abs-full    # also removes abs and absgui when nothing else needs them
+```
+
+Remove ABS itself **and** user config, state, cache, and the build directories from `abs.toml`:
+
+```bash
+abs --purge              # lists paths and asks
+abs --purge --yes        # no prompt
+abs --purge --dry-run
+```
+
+`--purge` does **not** uninstall packages you compiled and installed with `pacman -U` (mesa, a kernel, …). After a purge, a new ABS comes from git + `makepkg` / `make install` again, then `abs --self-update` as usual.
+
+---
+
+## Everyday use
 
 ```
 abs [FLAGS] [PACKAGE...]
 ```
 
-### Flags
+**`-h` is chroot build (`makechrootpkg`), not help.** Use `--help`.
 
+Build one package (local `makepkg` unless you pass `-h` or the config default is chroot):
 
-| Flag                 | Description                                                              |
-| -------------------- | ------------------------------------------------------------------------ |
-| `-d`                 | Download sources only                                                    |
-| `-l`                 | Local `makepkg` build                                                    |
-| `-h`                 | Chroot `makechrootpkg` build                                             |
-| `-o`                 | Compile only; skip install                                               |
-| `-t`                 | Skip tests (`--nocheck`)                                                 |
-| `-n`                 | Force rebuild even if package artifacts already exist in PKGDEST         |
-| `-c`                 | Re-clone package repo                                                    |
-| `-u`                 | Run `updpkgsums` before build                                            |
-| `-e`                 | Full clean                                                               |
-| `-s`                 | Sudo clean                                                               |
-| `-r`                 | Remove chroot                                                            |
-| `-k`                 | Install keyrings                                                         |
-| `-v` / `-i`          | Verbose / silent                                                         |
-| `-R`                 | Refresh all git remotes, print PKGBUILD vs installed report, no compile  |
-| `-U`                 | Print pending updates, pre-build manuals, run system update              |
-| `-RU`                | `-R` + compile qualifying manuals, then run system update                |
-| `--repo`             | Default repository for packages without `[repo=...]` (e.g. `--repo=aur`) |
-| `--install-only`     | Install existing packages from `ready_made_packages_path`                |
-| `--clean-install`    | Remove `src/` and `pkg/` before compile                                  |
-| `--dry-run`          | Print without executing                                                  |
-| `--list`             | Dump resolved config                                                     |
-| `--configure`        | Open user config in `$EDITOR`                                            |
-| `--configure=EDITOR` | Open user config in the given editor (e.g. `--configure=kate`)           |
-| `--list-add=LIST`    | Add packages to a config list (see below)                                |
-| `--list-remove=LIST` | Remove packages from a config list                                       |
-| `--wizard[=ACTION]`  | Interactive config wizard (`add` / `remove` / `edit` / `hold`)           |
-| `--pkg-list=LIST`    | Prefill list name for `--wizard`                                         |
-| `--hold PKG`         | Pin a package version in `held_packages`                                 |
-| `--hold-version=`    | Version for `--hold` (`pkgver-pkgrel`)                                   |
-| `--trigger=PKG`      | Trigger package(s) for hold `on_packages_updated` (comma or repeatable)  |
-| `--unhold PKG`       | Remove package(s) from `held_packages`                                   |
-| `--hold-check`       | Show held vs installed versions and trigger drift                        |
-| `--check-update`     | Query latest remote version of ABS and check against local version       |
-| `--self-update`      | Fetch, compile, and install the latest remote version of ABS             |
-| `--pgo PKG`          | Start CachyOS kernel 3-stage PGO pipeline (debug → AutoFDO → Propeller)  |
-| `--pgo-resume PKG`   | Resume PGO pipeline after reboot                                         |
-| `--pgo-status PKG`   | Show current PGO stage (`--json` for machine-readable output)            |
-| `--pgo-abort PKG`    | Abort PGO pipeline (releases system-update holds; use `--pgo-keep-stage` to preserve stage) |
-| `--json`             | JSON output (with `--pgo-status` or PGO event stream)                    |
-| `--purge`            | Remove ABS from the system (binaries, config, cache, build data)         |
-| `--yes` / `-y`       | Skip confirmation when used with `--purge`                               |
+```bash
+abs mesa
+abs --repo=aur xray
+abs -l firefox-pure          # force local
+abs -h mesa                  # force chroot (needs devtools)
+```
 
+In zsh (and bash with globbing on), **quote arguments that contain `[`**:
 
-### Config lists and held packages
+```bash
+abs -h 'firefox-pure[ramdisk=wcp]'
+abs --ramdisk=wcp firefox-pure    # no quoting needed
+```
 
-Manage package lists without editing `abs.toml` by hand. List names (aliases in parentheses):
+**Watched packages and system updates**
 
-- `manual_update_packages` (`manual`, `watched`)
-- `skip_install_packages` (`skip`, `skip_install`)
-- `skip_install_packages_after_compilation` (`skip_after`)
-- `ignore_packages` (`ignore`)
+- `abs -R` — refresh git clones for `manual_update_packages`, print PKGBUILD vs installed, then run the repo-sync command (no compile).
+- `abs -U` — system update (and compile watched/held packages that qualify).
+- `abs -RU` — `-R` plus compile what is newer, then the full system update command.
+
+Add packages to watch without editing TOML by hand:
 
 ```bash
 abs --list-add=manual_update_packages mesa linux-cachyos
-abs --list-remove=skip_install_packages qemu*
-abs --wizard=add --pkg-list=manual_update_packages go   # prefills; still prints Reproduce/Undo
-abs --wizard                                          # full interactive menu
+abs --wizard=add --pkg-list=manual_update_packages go
+abs --wizard                 # add / remove / edit / hold
 ```
 
-After list/wizard/hold mutations ABS prints:
+`--config-wizard` edits **global** settings (paths, build, ramdisk, repos). `--wizard` edits **package lists and holds**. They are different commands.
 
-```
-Reproduce: abs --list-add=manual_update_packages go
-Undo: abs --list-remove=manual_update_packages go
-```
+List names (aliases in parentheses): `manual_update_packages` (`manual`, `watched`), `skip_install_packages` (`skip`, `skip_install`), `skip_install_packages_after_compilation` (`skip_after`), `ignore_packages` (`ignore`).
 
-**Held packages** pin a `pkgver-pkgrel`, are ignored during system update, and are skipped in `-R`/`-RU` version compares. Rebuild with `abs <pkg>` (applies the held version). Optional `on_packages_updated` triggers recompile the held package on `abs -U` when those packages change outside ABS:
+**Held packages** pin a `pkgver-pkgrel`. They are ignored during system update and skipped in `-R`/`-RU` version compares. Rebuild with `abs <pkg>`. Optional triggers recompile the held package on `-U` when those packages change outside ABS:
 
 ```bash
 abs --hold libfoo --hold-version=1.2.3-1 --trigger=glibc,icu
 abs --hold-check
 abs --unhold libfoo
-abs --wizard=hold libfoo
 ```
 
-### Uninstall
+---
 
-Remove installed binaries, user config, state, default cache, and configured build directories:
+## absgui
+
+Graphical editor for the same `abs.toml`, plus kernel PGO controls:
 
 ```bash
-abs --purge          # lists paths and asks for confirmation
-abs --purge --yes    # remove without prompting
-abs --purge --dry-run
+absgui
 ```
 
-This removes `/usr/bin/abs`, `/usr/bin/absgui`, `/usr/share/abs/`, `~/.config/abs/`, `~/.local/state/abs/`, package/chroot/ready paths from `abs.toml`, PGO profile archives, and related data. It does **not** remove packages you installed to the system with `pacman -U`.
+Set `ABS_BINARY` if `abs` is not on `PATH`. Window theme/size: `~/.config/abs/absgui-settings.toml`. Save the config before **Start PGO**. Kernel PGO details are in [Kernel PGO](#kernel-pgo-linux-cachyos) below.
 
-### Per-package overrides
+---
 
-Put options in square brackets after the package name. **In zsh (and bash with `glob` on), you must quote arguments that contain `[`** — otherwise the shell treats brackets as globs and the command fails before ABS runs:
+## Reference
 
-```bash
-abs -h 'firefox-pure[ramdisk=wcp]'
-abs -h 'firefox-pure[wcp]'
-abs -h --ramdisk=wcp firefox-pure    # no quoting needed
-abs --repo=aur xray[pkgver=26.5.9,pkgrel=2] 'mesa[repo=cachyos]'
-```
+### Flags
 
-Note: `-h` is chroot build (makechrootpkg), not help. Use `--help` for usage.
+| Flag | Description |
+| ---- | ----------- |
+| `-d` | Download sources only |
+| `-l` | Local `makepkg` |
+| `-h` | Chroot `makechrootpkg` (not help; use `--help`) |
+| `-o` | Compile only; skip install prompt |
+| `-t` | Skip tests (`--nocheck`) |
+| `-n` | Force rebuild even if matching artifacts exist in PKGDEST |
+| `-c` | Re-clone the package repo |
+| `-u` | Run `updpkgsums` before build |
+| `-e` | Full clean (repos, chroot, ready packages) |
+| `-s` | Use sudo when deleting build artifacts |
+| `-r` | Remove the configured chroot |
+| `-k` | Install Arch / CachyOS keyrings |
+| `-v` / `-i` | Verbose / silent |
+| `-j` / `--jobs=N` | Default `-j` for this run (does not override per-package `compilation_threads`) |
+| `-R` | Refresh `manual_update_packages` clones, version report, repo-sync command (no compile) |
+| `-U` | System update; compile watched/held packages that qualify |
+| `-RU` | `-R` + compile what qualifies + full system update |
+| `--repo=NAME` | Default repository when the package has no `source=` / `[repo=…]` |
+| `--ramdisk=wcp\|disabled` | Ramdisk targets for every package on this run (`w` workdir, `c` chroot, `p` packages) |
+| `--install-only` | Install existing artifacts from `ready_made_packages_path` |
+| `--clean-install` | Remove `src/` and `pkg/` before compile |
+| `--dry-run` | Print commands without running them |
+| `--list` | Print the resolved config |
+| `--config-wizard` | Guided setup / reconfigure of `abs.toml` (copies an existing user file to `abs.toml.bak` first) |
+| `--configure` / `--configure=EDITOR` | Open config in `$EDITOR` (tested: vim, nano, kate) |
+| `--list-add=LIST` / `--list-remove=LIST` | Mutate a package list |
+| `--wizard[=ACTION]` | Package-list / hold wizard (`add`, `remove`, `edit`, `hold`) |
+| `--pkg-list=LIST` | Prefill list name for `--wizard` |
+| `--hold` / `--hold-version=` / `--trigger=` / `--unhold` / `--hold-check` | Held packages |
+| `--check-update` / `--self-update` | Compare / install newer ABS from git HEAD |
+| `--kernel-build=PKG` | One-shot kernel build from `[packages.PKG.kernel]` (no PGO) |
+| `--pgo` / `--pgo-resume` / `--pgo-status` / `--pgo-abort` / `--pgo-restart` | Kernel PGO pipeline |
+| `--pgo-stage` / `--pgo-once` / `--pgo-goto` / `--pgo-keep-stage` / `--pgo-auto` | PGO stage control |
+| `--ramdisk-shutdown` | Unmount the configured tmpfs |
+| `--json` | Machine-readable output (PGO status / events) |
+| `--event-log=PATH` | Append JSON-lines PGO events |
+| `--purge` | Remove ABS binaries, config, cache, build dirs |
+| `--yes` / `-y` | Skip `--purge` confirmation; on first run with no config, write example defaults |
+| `--no-wait` | Skip “Press Enter to exit” (scripts / GUI) |
+| `--help` | Help |
 
+### Per-package bracket overrides
 
-| Bracket key                             | Effect                                                  |
-| --------------------------------------- | ------------------------------------------------------- |
-| `repo=NAME`                             | Repository for this package only (overrides `--repo`)   |
-| `pkgver=`, `pkgrel=`, `epoch=`, …       | Replace or append that PKGBUILD assignment before build |
-| `local`, `chroot`, `build=local|chroot` | Build environment for this package only                 |
-| `nocheck`                               | Skip tests for this package only                        |
-| `ramdisk=wcp`, `wcp`, `ramdisk=disabled` | Ramdisk targets: **w**=workdir, **c**=chroot, **p**=packages; **disabled**=disk only (overrides global `[ramdisk]` and `--ramdisk`) |
+Put options in `[` `]` after the package name. Use `,` or `/` between options. Quote in zsh.
 
+| Bracket key | Effect |
+| ----------- | ------ |
+| `repo=NAME` | Repository for this package only (overrides `--repo`) |
+| `pkgver=`, `pkgrel=`, `epoch=`, … | Replace or append that PKGBUILD assignment before build |
+| `local`, `chroot`, `build=local\|chroot` | Build environment for this package only |
+| `nocheck` | Skip tests for this package only |
+| `ramdisk=wcp`, `wcp`, `ramdisk=disabled` | Ramdisk targets; **disabled** = disk only |
 
-Use `,` or `/` between bracket options. When `pkgrel` is set explicitly, automatic pkgrel bump is skipped for that build. Any PKGBUILD override triggers `updpkgsums` before compile (same as `-u`).
+When `pkgrel` is set explicitly, automatic pkgrel bump is skipped. Any PKGBUILD override triggers `updpkgsums` (same as `-u`). Global `--ramdisk=wcp` applies to every package unless that package has a bracket override.
 
-Global **`--ramdisk=wcp`** applies to every package on the command line unless a bracket override is present for that package.
+### `-R` / `-RU` and AUR
 
-### `-RU` and AUR packages
+Add AUR packages to `manual_update_packages` with `source = "aur"` under `[packages]`. On `-R` / `-RU`, ABS updates each AUR git clone, compares PKGBUILD versions to installed, and (with `-U`) rebuilds when newer.
 
-Add AUR packages to `manual_update_packages` with `source = "aur"` in `[packages]`. On `**-R**` / `**-RU**`, ABS pulls each AUR git clone (same as official `arch` packages), compares PKGBUILD versions to installed, and rebuilds when newer.
-
-Optional **upstream GitHub** tracking for packages that lag behind upstream (e.g. AUR only ships stable):
+Optional GitHub tracking when the PKGBUILD lags upstream:
 
 ```toml
 manual_update_packages = ["xray"]
 
 [packages.xray]
 source = "aur"
-upstream_github = "xtls/xray-core"   # or https://github.com/xtls/xray-core
-upstream_prereleases = true          # include GitHub prereleases (default: false)
+upstream_github = "xtls/xray-core"
+upstream_prereleases = true
 ```
 
-On `**-R**` / `**-RU**`, after syncing the AUR clone, ABS queries the GitHub API (via `curl`). If upstream is newer than `pkgver` in the PKGBUILD, it sets `pkgver`, resets `pkgrel=1`, runs `updpkgsums`, then continues the normal version report / build flow. Requires network access and `curl`.
+On `-R` / `-RU`, after the git sync, ABS queries the GitHub API (`curl`). If upstream is newer, it sets `pkgver`, resets `pkgrel=1`, runs `updpkgsums`, then continues. Needs network and `curl`.
 
-### `[ramdisk]` config keys
+### `[ramdisk]`
 
-Optional tmpfs/ramdisk support to speed up compiles and reduce disk wear. Disk `[paths]` remain the persistent locations; the ramdisk holds ephemeral build state for the ABS session.
+Optional tmpfs to speed compiles and spare the SSD. Disk `[paths]` stay the permanent locations. Mounted on the **first task that needs it**, not at ABS startup. Unmounted on normal exit, Ctrl+C / SIGTERM, and fatal errors. `kill -9` cannot unmount — use `sudo umount -l /run/abs-ram` if needed.
 
+| Key | Description |
+| --- | ----------- |
+| `enabled` | Allow tmpfs when a task requests targets (default `false`) |
+| `mount_point` | Absolute mount path (default `/run/abs-ram`; last component must start with `abs`) |
+| `size` | tmpfs `size=` cap, not pre-allocated (default `16G`) |
+| `mode` | Mount directory mode (default `0755`) |
+| `build_workdir` | `src/` / `pkg/` (and compiler caches) on tmpfs (default `false`) |
+| `chroot` | Chroot rootfs on tmpfs (default `false`) |
+| `packages` | Whole `packages_path` on tmpfs — high RAM (default `false`) |
+| `seed_chroot_from` | Optional disk tree to rsync into the ram chroot (unset = fresh `mkarchroot`) |
+| `sync_chroot_on_exit` | Rsync ram chroot back to `seed_chroot_from` (default `false`) |
+| `min_free_ram_mb` | Refuse to mount if `MemAvailable` is below this (default `4096`) |
+| `warn_packages_ram` | Warn when `packages = true` (default `true`) |
+| `reclaim_mount_on_startup` | Unmount a stale tmpfs at `mount_point` before mounting (default `true`) |
 
-| Key                        | Description                                                                                                              |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`                  | Allow tmpfs ramdisk when a package task requests targets (default: `false`; mounted lazily on first use, not at startup) |
-| `mount_point`              | Absolute path for the tmpfs mount (default: `/run/abs-ram`)                                                              |
-| `size`                     | tmpfs size passed to `mount -o size=` (default: `16G`)                                                                   |
-| `mode`                     | Directory mode for the mount (default: `0755`)                                                                           |
-| `build_workdir`            | Symlink each package's `src/` and `pkg/` to tmpfs during builds; also redirects ccache/TMPDIR/Cargo/Go/npm/pip caches to `$mount_point/cache` (default: `false`) |
-| `chroot`                   | Use tmpfs for `chroot_base_path` during chroot builds (default: `false`)                                                 |
-| `packages`                 | Move entire `packages_path` to tmpfs — high RAM use (default: `false`)                                                   |
-| `seed_chroot_from`         | Optional disk path to `rsync` into the ram chroot before first use (full copy). **Unset = fresh `mkarchroot` on RAM**    |
-| `sync_chroot_on_exit`      | `rsync` ram chroot back to `seed_chroot_from` on exit (requires `seed_chroot_from`; default: `false`)                    |
-| `min_free_ram_mb`          | Refuse mount when `MemAvailable` is below this (default: `4096`)                                                         |
-| `warn_packages_ram`        | Print a warning when `packages = true` (default: `true`)                                                                 |
-| `reclaim_mount_on_startup` | Unmount a stale tmpfs at `mount_point` before mounting (default: `true`)                                                 |
-
-
-**Per-package overrides:** When `[ramdisk].enabled = true`, you can leave global `build_workdir`, `chroot`, and `packages` as `false` and opt in per package. In `[packages.NAME]` set `ramdisk = "wcp"` (letters: **w** = workdir, **c** = chroot, **p** = packages). The string **replaces** the global defaults for that build. CLI: `'mesa[ramdisk=wcp]'` / `'mesa[wcp]'` (quote in zsh), or `abs --ramdisk=wcp mesa`.
-
-When `[ramdisk].enabled = true`, tmpfs is mounted on the **first package task** that needs ramdisk targets (global flags or per-package `ramdisk = "wcp"` / CLI `mesa[wcp]`). Runs that only refresh repos (`-R`), update the system, or build packages without ramdisk targets never mount tmpfs.
-
-When a ramdisk session is active, ABS unmounts the tmpfs on normal exit, on `**Ctrl+C` / SIGTERM** (stops running subprocesses first), and on error exits (`die!`). Uses lazy unmount (`umount -l`) if the mount is busy. `kill -9` cannot be handled — use `sudo umount -l /run/abs-ram` manually if needed.
-
-Example (ramdisk on, global targets off, heavy packages opt in):
+Per-package: `[packages.NAME] ramdisk = "wcp"` (letters **w** / **c** / **p**) replaces the global flags for that build. CLI: `'mesa[wcp]'` or `abs --ramdisk=wcp mesa`.
 
 ```toml
 [ramdisk]
@@ -284,67 +346,45 @@ build_env = "chroot"
 ramdisk = "wcp"
 ```
 
-Example (hybrid: git clones on disk, compile workdirs and chroot in RAM):
+### `[build]`
 
-```toml
-[paths]
-packages_path = "/media/storage/abs/packages"
-chroot_base_path = "/media/storage/abs/chroot"
-ready_made_packages_path = "/media/storage/abs/ready"
+| Key | Description |
+| --- | ----------- |
+| `default_environment` | `local` or `chroot` |
+| `ignore_compilation_failures` | Continue the queue if one package fails |
+| `compile_first_install_after` | Compile everything first, then install prompts |
+| `clean_install_by_default` | Remove `src/` and `pkg/` before every compile |
+| `ignore_already_made_packages` | Always rebuild even if PKGDEST already has this version (default `false`; `-n` per run). Per-package: `[packages.NAME] ignore_already_made_packages` |
+| `clean_chroot_after_compilation` | Reset the idle chroot after each chroot build (default `true`) |
+| `concurrent_compilations_limit` | Max packages compiling at once (default `1`) |
+| `concurrent_repos_downloads_limit` | Max git clones/pulls at once (default `10`) |
+| `fast_aur_rpc_update_checks` | Batch AUR version checks via the AUR RPC (default `true`) |
+| `system_update_first` | Run the system update command before compiling (default `true`) |
+| `global_cpu_threads_mode` | `strict` or `flexible` (default `strict`) |
+| `global_cpu_threads_cap` | Max sum of active `-j` (strict hard cap; flexible soft target) |
+| `maximum_cpu_threads_cap` | Flexible only: hard ceiling above the soft cap |
+| `default_compilation_threads` | Default `-j` when a package has no `compilation_threads` (override with `abs -j`) |
 
-[ramdisk]
-enabled = true
-mount_point = "/run/abs-ram"
-size = "16G"
-build_workdir = true
-chroot = true
-packages = false
-# seed_chroot_from = "/media/storage/abs/chroot-minimal"  # optional; omit for fresh mkarchroot
-```
+When `compilation_threads` (or `-j`) is set, ABS applies parallel limiters (`MAKEFLAGS`, `NPROC`, `CMAKE_BUILD_PARALLEL_LEVEL`, `NINJAFLAGS`, `CARGO_BUILD_JOBS`, `MAX_JOBS`) via a wrapper `makepkg.conf` (local) or `makepkg.conf.d/abs-parallel.conf` (chroot). PKGBUILDs that hardcode `make -j$(nproc)` ignore those. Packages with no thread setting are not counted against the CPU caps; only `concurrent_compilations_limit` applies.
 
-### `[build]` config keys
+### Self-update config keys
 
+Root-level (also accepted under `[build]` for old files):
 
-| Key                                | Description                                                                      |
-| ---------------------------------- | -------------------------------------------------------------------------------- |
-| `default_environment`              | `local` or `chroot`                                                              |
-| `ignore_compilation_failures`      | Log warning and continue on build failure instead of aborting                    |
-| `compile_first_install_after`      | Build all packages first, then install — useful for unattended runs              |
-| `clean_install_by_default`         | Remove `src/` and `pkg/` before every compile                                    |
-| `ignore_already_made_packages`     | Always rebuild even if matching artifacts exist in `ready_made_packages_path` (default: `false`; use `-n` per run). Per-package override: `[packages.NAME] ignore_already_made_packages` |
-| `clean_chroot_after_compilation`   | Reset devtools chroot after each chroot build (default: `true`)                  |
-| `concurrent_compilations_limit`    | Max packages building at once (default: `1`)                                     |
-| `global_cpu_threads_mode`          | `strict` or `flexible` — how concurrent `-j` sums are capped (default: `strict`) |
-| `global_cpu_threads_cap`           | Max sum of active compilation threads (strict hard cap; flexible soft target)  |
-| `maximum_cpu_threads_cap`          | Flexible mode only: hard ceiling above the soft cap                              |
-| `default_compilation_threads`      | Default `-j` for packages without `compilation_threads` (override with `abs -j`) |
-| `concurrent_repos_downloads_limit` | Maximum number of repository clones/updates to sync concurrently (default: `10`) |
-
-When `compilation_threads` (or `-j`) is set, ABS applies parallel limiters (`MAKEFLAGS`, `NPROC`, `CMAKE_BUILD_PARALLEL_LEVEL`, `NINJAFLAGS`, `CARGO_BUILD_JOBS`, `MAX_JOBS`). For local/PGO builds it generates a temporary wrapper `makepkg.conf` (sourcing your normal config chain first) and passes it via `MAKEPKG_CONF`; for chroot builds it writes `makepkg.conf.d/abs-parallel.conf` into the worker copy. Both override distro defaults such as `MAKEFLAGS="-j$(nproc)"`.
-
-PKGBUILDs that hardcode `make -j$(nproc)` ignore these env vars. Packages without any thread setting are not counted against `global_cpu_threads_cap` / `maximum_cpu_threads_cap`; only the `concurrent_compilations_limit` slot count constrains them.
-
-
-### Self-Updates config keys
-
-These are root-level properties (but are also parsed under the `[build]` section for backwards compatibility):
-
-
-| Key                           | Description                                                                                                                             |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `check_for_update_on_startup` | Check for newer ABS versions silently in the background at startup, notifying at exit if newer (default: `true`)                        |
-| `auto_update_on_startup`      | Check for newer ABS versions and automatically self-update synchronously at startup (default: `false`)                                  |
-| `self_update_at_updates`      | Check for newer ABS versions synchronously when `-U` is used and update before system packages (default: `false`)                       |
-| `self_update_raw_url`         | The raw Cargo.toml URL used to parse the latest version (default: `"https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml"`) |
-| `self_update_use_pacman`      | When `true` (default), `--self-update` runs `makepkg` in `aur/` and upgrades pacman packages. When `false`, copies `abs` and `absgui` next to `self_update_install_path` (plus desktop/icon when installing under `/usr/bin`). |
-| `self_update_install_path`    | Fallback `abs` binary path when not using pacman packages (default: `"/usr/bin/abs"`; `absgui` is installed beside it)                  |
-
+| Key | Description |
+| --- | ----------- |
+| `check_for_update_on_startup` | Background check at start; remind at **exit** if HEAD is newer (default `true`) |
+| `auto_update_on_startup` | Self-update before the rest of the run (default `false`) |
+| `self_update_at_updates` | Self-update before `-U` / `-RU` (default `false`) |
+| `self_update_raw_url` | Raw `Cargo.toml` URL used to read the remote version (default this repo’s `HEAD`) |
+| `self_update_use_pacman` | `true` (default): `makepkg` in `aur/` with `PKGDEST` = `ready_made_packages_path`, then pacman. Reuses packages already in that folder (other machines on a shared ready path skip the compile). `false`: copy binaries next to `self_update_install_path` (plus desktop/icon when installing under `/usr/bin`) |
+| `self_update_install_path` | `abs` path when not using pacman (default `/usr/bin/abs`; `absgui` is installed beside it) |
 
 ---
 
 ## Kernel PGO (linux-cachyos)
 
-ABS supports the 3-stage CachyOS kernel pipeline (debug build → AutoFDO profile → Propeller profile) with reboot checkpoints. Configure `[packages.linux-cachyos]` and `[packages.linux-cachyos.pgo]` in `abs.toml` (see `abs.toml.example`).
+Three-stage CachyOS pipeline (debug build → AutoFDO → Propeller) with reboot checkpoints. Configure `[packages.linux-cachyos]` and `[packages.linux-cachyos.pgo]` (see `abs.toml.example`).
 
 ```bash
 abs --pgo linux-cachyos
@@ -355,28 +395,11 @@ abs --pgo-resume linux-cachyos
 abs --pgo-status linux-cachyos --json
 ```
 
-Profiles are archived to `profiles_archive_dir` (required; HDD path is fine). Use `ramdisk = "w"` for compile I/O on tmpfs while keeping sources on disk.
+`profiles_archive_dir` is required. `ramdisk = "w"` keeps sources on disk and compile I/O on tmpfs.
 
-PGO profiling runs the bundled benchmark script (`assets/pgo-benchmark.sh`, installed to `/usr/share/abs/pgo-benchmark.sh`) unless you set `benchmark_command` in `[packages.PKG.pgo]`. When running from `cargo build` without installing that file, ABS materializes the same script at `~/.local/share/abs/pgo-benchmark.sh`. It expects `cachyos-benchmarker`, `sysbench`, and optionally `rg` on `PATH`.
+Profiling uses the bundled `assets/pgo-benchmark.sh` (installed to `/usr/share/abs/pgo-benchmark.sh`) unless you set `benchmark_command`. From a `cargo build` without that file, ABS writes the same script to `~/.local/share/abs/pgo-benchmark.sh`. It expects `cachyos-benchmarker`, `sysbench`, and optionally `rg` on `PATH`.
 
-### absgui
-
-`absgui` is an iced-based GUI for editing `abs.toml` and driving the kernel PGO pipeline (installed with `abs` above).
-
-```bash
-absgui
-```
-
-It reads and writes the same config as the CLI (`~/.config/abs/abs.toml` by default). Set `ABS_BINARY` if `abs` is not on `PATH` (e.g. `ABS_BINARY=/usr/bin/abs absgui`).
-
-- **Kernels** — CachyOS Kernel Manager–style list; **Edit defaults** opens the default kernel config template.
-- **Per-kernel page** — kernel/PGO options, pipeline controls, and build log (log only appears here).
-- **ABS settings** — full `abs.toml` editor (paths, build, self-update, package lists, system update, ramdisk, repositories, compilers). Folder/file browse buttons open native dialogs.
-- **App settings** — theme (dark/light) and window size/position (restored on next launch).
-
-Window position/size is stored in `~/.config/abs/absgui-settings.toml`. For the taskbar icon on Wayland, install the `.desktop` file and icon (see install commands above).
-
-Save the config before **Start PGO**; the GUI writes `abs.toml` then runs `abs --pgo` or `abs --pgo-resume`.
+absgui pages: **Kernels** (list + default template), **per-kernel** (PGO controls and build log), **ABS settings** (full `abs.toml`), **App settings** (theme, window). For a taskbar icon on Wayland, install the `.desktop` file and icon (see install commands above).
 
 ---
 
@@ -389,8 +412,42 @@ cargo test
 cargo build -p absgui
 ```
 
+The `abs` crate uses Rust edition 2024; `absgui` uses edition 2021. Use a current stable toolchain from rustup.
+
 ---
 
 ## License
 
 **CC BY 4.0** — use, modify, and share with attribution.
+
+---
+
+## For AI assistants
+
+A human may paste this README and ask how to do something with ABS. Use only facts from this file and `abs.toml.example`. Do not invent GitHub Releases, a `--configure-wizard` flag, or `make uninstall`.
+
+**What ABS is.** A local Arch/CachyOS package builder (emerge-like). It is not a distro. Working code is git `HEAD`.
+
+**Config.** Read `$XDG_CONFIG_HOME/abs/abs.toml` (usually `~/.config/abs/abs.toml`), else `/etc/abs/abs.toml`. Create or reconfigure globals with `abs --config-wizard` (an existing user file is copied to `abs.toml.bak` before saving). Open in an editor with `abs --configure` or `abs --configure=nano` (`$EDITOR` / `$VISUAL` / `vi`; tested: vim, nano, kate). Per-package tables, holds, and compilers: `abs --wizard` or absgui. `--wizard` is not `--config-wizard`.
+
+**Shell traps.** `-h` means chroot build. Help is `--help`. Quote `[` `]` in zsh.
+
+**Map user intent**
+
+| They want | Point them at |
+| --------- | ------------- |
+| First-time setup | `abs --config-wizard` |
+| Watch packages and rebuild when newer | `manual_update_packages`, then `abs -RU` |
+| Don’t install pre-built repo binaries (they will compile instead) | `skip_install_packages` |
+| Don’t offer extra packages after a compile (e.g. `qemu-docs`) | `skip_install_packages_after_compilation` |
+| Pin a version | `abs --hold` / `--wizard=hold` |
+| Update ABS itself | `abs --self-update` (HEAD, not Releases) |
+| Share compiled packages across PCs | Same `ready_made_packages_path` on every machine; see [Several computers, one compile machine](#several-computers-one-compile-machine) |
+| Remove ABS packages but keep config | `sudo pacman -Rns abs-full` |
+| Remove ABS and its config/cache/build dirs | `abs --purge` (does not remove packages they built for the system) |
+| Compile in RAM | `[ramdisk]` + `enabled = true`; letters `w`/`c`/`p` |
+| Kernel PGO | `abs --pgo` / absgui; needs `profiles_archive_dir` |
+
+**Install facts.** `make install` already runs the release build. `cd aur && makepkg -si` installs `abs`, `absgui`, and `abs-full`. CLI-only: `makepkg -s` then `pacman -U` only `abs-[0-9]*.pkg.tar.zst` (not `absgui-…` or `abs-full-…`).
+
+For key names and examples, prefer `abs.toml.example` and the Reference section above.

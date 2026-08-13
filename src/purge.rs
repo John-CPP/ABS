@@ -1,5 +1,5 @@
-use crate::config::{self, Config};
 use crate::blog;
+use crate::config::{self, Config};
 use crate::ramdisk;
 use crate::utils::{check_sudo_removal, init_deletable_roots, run_command};
 use std::collections::HashSet;
@@ -90,7 +90,13 @@ fn collect_targets(config: Option<&Config>) -> Vec<PurgeTarget> {
     let mut out = Vec::new();
 
     for path in standard_install_files() {
-        push_file(&mut seen, &mut out, path, "installed file", RemovalKind::SudoFile);
+        push_file(
+            &mut seen,
+            &mut out,
+            path,
+            "installed file",
+            RemovalKind::SudoFile,
+        );
     }
 
     push_tree(
@@ -120,6 +126,15 @@ fn collect_targets(config: Option<&Config>) -> Vec<PurgeTarget> {
             &mut seen,
             &mut out,
             config_dir.join(".cache/abs"),
+            "legacy misplaced cache path",
+            RemovalKind::UserTree,
+        );
+    }
+    if let Some(cache_dir) = dirs::cache_dir() {
+        push_tree(
+            &mut seen,
+            &mut out,
+            cache_dir.join("abs"),
             "default package/chroot cache",
             RemovalKind::UserTree,
         );
@@ -278,7 +293,9 @@ fn prepare_deletable_roots(cfg: &Config, targets: &[PurgeTarget]) {
     )
     .is_err()
     {
-        crate::ewarn!("Some configured paths could not be registered for safe deletion; sudo removals may be skipped.");
+        crate::ewarn!(
+            "Some configured paths could not be registered for safe deletion; sudo removals may be skipped."
+        );
     }
 }
 
@@ -338,7 +355,9 @@ fn is_safe_install_path(path: &Path) -> bool {
         return true;
     }
     path.parent() == Some(Path::new("/usr/bin"))
-        && path.file_name().is_some_and(|n| n == "abs" || n == "absgui")
+        && path
+            .file_name()
+            .is_some_and(|n| n == "abs" || n == "absgui")
 }
 
 #[cfg(test)]

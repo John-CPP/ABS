@@ -1,5 +1,5 @@
 use crate::die;
-use crate::utils::{run_command, sh_single_quote};
+use crate::utils::run_command;
 use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -33,8 +33,10 @@ pub struct Config {
     pub self_update_raw_url: String,
     #[serde(default = "default_self_update_install_path")]
     pub self_update_install_path: String,
-    /// When `true` (default), `--self-update` builds `aur/PKGBUILD` and installs with pacman.
-    /// When `false`, copies compiled `abs`/`absgui` next to `self_update_install_path`.
+    /// When `true` (default), `--self-update` builds `aur/PKGBUILD` into
+    /// `ready_made_packages_path` and installs with pacman. Matching packages already
+    /// in that folder are reused (no compile). When `false`, copies compiled `abs`/`absgui`
+    /// next to `self_update_install_path`.
     /// Unset / `null` is treated as `true`.
     #[serde(default = "default_self_update_use_pacman")]
     pub self_update_use_pacman: Option<bool>,
@@ -557,6 +559,7 @@ pub fn expand_user_path(raw: &str) -> PathBuf {
     for (var, val) in [
         ("$HOME", dirs::home_dir()),
         ("$XDG_CONFIG_HOME", dirs::config_dir()),
+        ("$XDG_CACHE_HOME", dirs::cache_dir()),
     ] {
         if let Some(ref path) = val {
             s = s.replace(var, &path.to_string_lossy());
@@ -567,10 +570,23 @@ pub fn expand_user_path(raw: &str) -> PathBuf {
 
 const CONFIG_TEMPLATE: &str = include_str!("../abs.toml.example");
 
+pub fn example_config_text() -> &'static str {
+    CONFIG_TEMPLATE
+}
+
 pub fn user_config_path() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("abs").join("abs.toml"))
         .unwrap_or_else(|| die!("Could not determine config directory ($XDG_CONFIG_HOME)"))
+}
+
+pub fn etc_config_path() -> PathBuf {
+    PathBuf::from("/etc/abs/abs.toml")
+}
+
+/// True when a user or system `abs.toml` already exists.
+pub fn config_exists() -> bool {
+    user_config_path().exists() || etc_config_path().exists()
 }
 
 /// Ensure the user config file exists (seed from example if missing) and return its path.
@@ -583,14 +599,27 @@ fn ensure_user_config_exists() -> PathBuf {
     if path.exists() {
         return path;
     }
+    write_example_user_config()
+}
+
+/// Write `abs.toml.example` to the user config path (must not already exist).
+pub fn write_example_user_config() -> PathBuf {
+    let path = user_config_path();
+    if path.exists() {
+        return path;
+    }
 
     if let Some(parent) = path.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
-        die!("Failed to create config directory '{}': {}", parent.display(), e);
+        die!(
+            "Failed to create config directory '{}': {}",
+            parent.display(),
+            e
+        );
     }
 
-    if let Err(e) = fs::write(&path, CONFIG_TEMPLATE) {
+    if let Err(e) = crate::utils::write_file_mode(&path, CONFIG_TEMPLATE, 0o600) {
         die!("Failed to write config file '{}': {}", path.display(), e);
     }
 
@@ -610,7 +639,10 @@ fn resolve_editor(explicit: Option<&str>) -> String {
 fn run_editor(editor: &str, path: &Path) {
     let path_str = path.to_string_lossy();
     let editor_trimmed = editor.trim();
-    let cmd_name = editor_trimmed.split_whitespace().next().unwrap_or(editor_trimmed);
+    let cmd_name = editor_trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or(editor_trimmed);
 
     if cmd_name == "kate" {
         // Spawn a background instance of Kate to guarantee a running instance exists.
@@ -620,8 +652,16 @@ fn run_editor(editor: &str, path: &Path) {
     }
 
     let result = if editor.chars().any(char::is_whitespace) {
-        let script = format!("{} {}", editor, sh_single_quote(&path_str));
-        run_command("sh", &["-c", &script], None::<&str>)
+        match crate::utils::parse_command_argv(editor_trimmed) {
+            Ok(mut argv) => {
+                if cmd_name == "kate" && !argv.iter().any(|a| a == "-b") {
+                    argv.insert(1, "-b".into());
+                }
+                argv.push(path_str.to_string());
+                crate::utils::run_argv_command(&argv, None::<&str>)
+            }
+            Err(e) => Err(e),
+        }
     } else {
         let mut args = Vec::new();
         if cmd_name == "kate" {
@@ -660,7 +700,15 @@ impl Config {
 
     pub fn open_in_editor(editor: Option<&str>) {
         use std::io::{self, Write};
+        let path = user_config_path();
+        let created = !path.exists();
         let path = ensure_user_config_exists();
+        if created {
+            println!(
+                "Created {} from the example. For a guided setup, run `abs --config-wizard`.",
+                path.display()
+            );
+        }
         let editor_str = resolve_editor(editor);
         loop {
             run_editor(&editor_str, &path);
@@ -676,14 +724,22 @@ impl Config {
                 Ok(config) => {
                     let env = config.build.default_environment.as_str();
                     if env != "local" && env != "chroot" {
-                        println!("{} Invalid [build] default_environment: {:?} (expected \"local\" or \"chroot\")", "==> ERROR:".red(), env);
+                        println!(
+                            "{} Invalid [build] default_environment: {:?} (expected \"local\" or \"chroot\")",
+                            "==> ERROR:".red(),
+                            env
+                        );
                     } else {
                         println!("{}", "==> Configuration validated successfully!".green());
                         break;
                     }
                 }
                 Err(e) => {
-                    println!("{} Failed to parse configuration file: {}", "==> ERROR:".red(), e);
+                    println!(
+                        "{} Failed to parse configuration file: {}",
+                        "==> ERROR:".red(),
+                        e
+                    );
                 }
             }
 
@@ -710,11 +766,11 @@ impl Config {
         } else if etc_config.exists() {
             etc_config
         } else {
-            let path = ensure_user_config_exists();
-            println!(
-                "ABS config has been created from the example. Please configure using --configure"
+            die!(
+                "No ABS config at {} or {}. Run `abs --config-wizard` (guided) or `abs --configure`.",
+                user_config.display(),
+                etc_config.display()
             );
-            path
         };
 
         let config_content = match fs::read_to_string(&config_path) {
@@ -733,9 +789,18 @@ impl Config {
 
         // Merge self-update settings parsed under [build] for backwards-compatibility
         Self::merge_legacy_build_fields(&mut config);
-
+        config.expand_paths();
         config.validate();
         config
+    }
+
+    /// Parse TOML, expand paths, and validate without exiting.
+    pub(crate) fn from_toml_text(text: &str) -> Result<Config, String> {
+        let mut config: Config = toml::from_str(text).map_err(|e| format!("parse TOML: {e}"))?;
+        Self::merge_legacy_build_fields(&mut config);
+        config.expand_paths();
+        config.check()?;
+        Ok(config)
     }
 
     /// Load an existing config without creating a default file (for `--purge`).
@@ -753,7 +818,23 @@ impl Config {
         let config_content = fs::read_to_string(&config_path).ok()?;
         let mut config: Config = toml::from_str(&config_content).ok()?;
         Self::merge_legacy_build_fields(&mut config);
+        config.expand_paths();
         Some(config)
+    }
+
+    fn expand_paths(&mut self) {
+        let expand = |s: &str| expand_user_path(s).to_string_lossy().into_owned();
+        self.paths.packages_path = expand(&self.paths.packages_path);
+        self.paths.chroot_base_path = expand(&self.paths.chroot_base_path);
+        self.paths.ready_made_packages_path = expand(&self.paths.ready_made_packages_path);
+        if let Some(ref conf) = self.paths.chroot_makepkg_conf {
+            self.paths.chroot_makepkg_conf = Some(expand(conf));
+        }
+        self.ramdisk.mount_point = expand(&self.ramdisk.mount_point);
+        if let Some(ref seed) = self.ramdisk.seed_chroot_from {
+            self.ramdisk.seed_chroot_from = Some(expand(seed));
+        }
+        self.self_update_install_path = expand(&self.self_update_install_path);
     }
 
     fn merge_legacy_build_fields(config: &mut Config) {
@@ -778,15 +859,20 @@ impl Config {
     }
 
     fn validate(&self) {
+        if let Err(e) = self.check() {
+            die!("{}", e);
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), String> {
         if self.config_version == 0 {
-            die!("Invalid config_version: 0 (expected >= 1)");
+            return Err("Invalid config_version: 0 (expected >= 1)".into());
         }
         let env = self.build.default_environment.as_str();
         if env != "local" && env != "chroot" {
-            die!(
-                "Invalid [build] default_environment: {:?} (expected \"local\" or \"chroot\")",
-                env
-            );
+            return Err(format!(
+                "Invalid [build] default_environment: {env:?} (expected \"local\" or \"chroot\")"
+            ));
         }
         match self.build.global_cpu_threads_mode.as_str() {
             "flexible" => {
@@ -795,9 +881,9 @@ impl Config {
                     self.build.maximum_cpu_threads_cap,
                 ) && hard < soft
                 {
-                    die!(
+                    return Err(format!(
                         "Invalid [build] maximum_cpu_threads_cap ({hard}) must be >= global_cpu_threads_cap ({soft})"
-                    );
+                    ));
                 }
             }
             "strict" => {
@@ -807,78 +893,69 @@ impl Config {
                     );
                 }
             }
-            cpu_mode => die!(
-                "Invalid [build] global_cpu_threads_mode: {:?} (expected \"strict\" or \"flexible\")",
-                cpu_mode
-            ),
+            cpu_mode => {
+                return Err(format!(
+                    "Invalid [build] global_cpu_threads_mode: {cpu_mode:?} (expected \"strict\" or \"flexible\")"
+                ));
+            }
         }
         for held in &self.held_packages {
             if held.name.trim().is_empty() {
-                die!("held_packages entry has empty name");
+                return Err("held_packages entry has empty name".into());
             }
             if let Err(e) = crate::held::split_pkgver_pkgrel(&held.version) {
-                die!("held_packages[{}]: {}", held.name, e);
+                return Err(format!("held_packages[{}]: {e}", held.name));
             }
         }
         for (pkg_name, pkg) in &self.packages {
             if let Some(be) = &pkg.build_env {
                 let be = be.as_str();
                 if be != "local" && be != "chroot" {
-                    die!(
-                        "Invalid build_env for package {:?}: {:?} (expected \"local\" or \"chroot\")",
-                        pkg_name,
-                        be
-                    );
+                    return Err(format!(
+                        "Invalid build_env for package {pkg_name:?}: {be:?} (expected \"local\" or \"chroot\")"
+                    ));
                 }
             }
             if let Some(code) = &pkg.ramdisk
                 && !crate::ramdisk::is_ramdisk_disabled(code)
                 && let Err(e) = crate::ramdisk::parse_ramdisk_targets(code)
             {
-                die!("Invalid ramdisk for package {:?}: {}", pkg_name, e);
+                return Err(format!("Invalid ramdisk for package {pkg_name:?}: {e}"));
             }
         }
         for (key, path) in [
             ("paths.packages_path", self.paths.packages_path.as_str()),
-            ("paths.chroot_base_path", self.paths.chroot_base_path.as_str()),
+            (
+                "paths.chroot_base_path",
+                self.paths.chroot_base_path.as_str(),
+            ),
             (
                 "paths.ready_made_packages_path",
                 self.paths.ready_made_packages_path.as_str(),
             ),
         ] {
-            if let Err(e) = crate::utils::validate_config_path(key, path) {
-                die!("{}", e);
-            }
+            crate::utils::validate_config_path(key, path)?;
         }
-        if self.ramdisk.enabled {
-            if let Err(e) = crate::utils::validate_config_path(
-                "ramdisk.mount_point",
-                self.ramdisk.mount_point.as_str(),
-            ) {
-                die!("{}", e);
+        crate::utils::validate_config_path(
+            "ramdisk.mount_point",
+            self.ramdisk.mount_point.as_str(),
+        )?;
+        crate::ramdisk::validate_ramdisk_mount_point(&self.ramdisk.mount_point)?;
+        crate::ramdisk::validate_ramdisk_size(&self.ramdisk.size)?;
+        crate::ramdisk::validate_ramdisk_mode(&self.ramdisk.mode)?;
+        if let Some(seed) = &self.ramdisk.seed_chroot_from {
+            if seed.trim().is_empty() {
+                return Err("ramdisk.seed_chroot_from cannot be empty when set".into());
             }
-            if self.ramdisk.size.trim().is_empty() {
-                die!("ramdisk.size cannot be empty when [ramdisk] is enabled");
-            }
-            if let Some(seed) = &self.ramdisk.seed_chroot_from {
-                if seed.trim().is_empty() {
-                    die!("ramdisk.seed_chroot_from cannot be empty when set");
-                }
-                if let Err(e) =
-                    crate::utils::validate_config_path("ramdisk.seed_chroot_from", seed.as_str())
-                {
-                    die!("{}", e);
-                }
-            }
+            crate::utils::validate_config_path("ramdisk.seed_chroot_from", seed.as_str())?;
         }
-        if let Err(e) = crate::utils::init_deletable_roots(
+        crate::utils::init_deletable_roots(
             &self.paths.packages_path,
             &self.paths.chroot_base_path,
             &self.paths.ready_made_packages_path,
             &[],
-        ) {
-            die!("{}", e);
-        }
+        )?;
+        Ok(())
     }
 
     pub fn print_human_readable(&self) {
@@ -895,7 +972,10 @@ impl Config {
         );
         println!(
             "  chroot_makepkg_conf: {}",
-            self.paths.chroot_makepkg_conf.as_deref().unwrap_or("(none)")
+            self.paths
+                .chroot_makepkg_conf
+                .as_deref()
+                .unwrap_or("(none)")
         );
 
         println!("\n{}", "Ramdisk".green().bold());
@@ -909,12 +989,12 @@ impl Config {
             println!("  packages: {}", self.ramdisk.packages);
             println!(
                 "  seed_chroot_from: {}",
-                self.ramdisk
-                    .seed_chroot_from
-                    .as_deref()
-                    .unwrap_or("(none)")
+                self.ramdisk.seed_chroot_from.as_deref().unwrap_or("(none)")
             );
-            println!("  sync_chroot_on_exit: {}", self.ramdisk.sync_chroot_on_exit);
+            println!(
+                "  sync_chroot_on_exit: {}",
+                self.ramdisk.sync_chroot_on_exit
+            );
             println!("  min_free_ram_mb: {}", self.ramdisk.min_free_ram_mb);
             println!(
                 "  reclaim_mount_on_startup: {}",
@@ -956,10 +1036,7 @@ impl Config {
             "  default_compiler: {}",
             self.build.default_compiler.as_deref().unwrap_or("(none)")
         );
-        println!(
-            "  system_update_first: {}",
-            self.build.system_update_first
-        );
+        println!("  system_update_first: {}", self.build.system_update_first);
         println!(
             "  clean_chroot_after_compilation: {}",
             self.build.clean_chroot_after_compilation
@@ -1001,7 +1078,8 @@ impl Config {
         );
         println!(
             "  command_to_perform_system_update_no_refresh: {}",
-            self.system_update.get_command_to_perform_system_update_no_refresh()
+            self.system_update
+                .get_command_to_perform_system_update_no_refresh()
         );
         println!("  ignore_flag: {}", self.system_update.ignore_flag);
         if self.system_update.ignore_packages.is_empty() {
@@ -1036,7 +1114,10 @@ impl Config {
             }
         }
 
-        println!("\n{}", "Skip Install Packages (system update)".green().bold());
+        println!(
+            "\n{}",
+            "Skip Install Packages (system update)".green().bold()
+        );
         if self.skip_install_packages.is_empty() {
             println!("  (none)");
         } else {
@@ -1098,11 +1179,17 @@ impl Config {
         }
 
         println!("\n{}", "Self-Updates".green().bold());
-        println!("  check_for_update_on_startup: {}", self.check_for_update_on_startup);
+        println!(
+            "  check_for_update_on_startup: {}",
+            self.check_for_update_on_startup
+        );
         println!("  auto_update_on_startup: {}", self.auto_update_on_startup);
         println!("  self_update_at_updates: {}", self.self_update_at_updates);
         println!("  self_update_raw_url: {}", self.self_update_raw_url);
-        println!("  self_update_install_path: {}", self.self_update_install_path);
+        println!(
+            "  self_update_install_path: {}",
+            self.self_update_install_path
+        );
         println!(
             "  self_update_use_pacman: {}",
             match self.self_update_use_pacman {

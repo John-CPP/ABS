@@ -49,16 +49,10 @@ pub fn fetch_aur_packages_info(packages: &[String]) -> Result<HashMap<String, St
 
         vlog!("AUR RPC: Querying versions for chunk: {:?}", chunk);
         let start = std::time::Instant::now();
-        let body = run_command_with_output(
-            "curl",
-            &[
-                "-fsSL",
-                "--compressed",
-                "-m", "10", // 10 seconds timeout
-                &url,
-            ],
-            None::<&str>,
-        )?;
+        let mut args = crate::utils::curl_base_args();
+        args.extend(["--compressed".into(), "-m".into(), "10".into(), url]);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let body = run_command_with_output("curl", &arg_refs, None::<&str>)?;
         vlog!("AUR RPC: Query returned in {:?}", start.elapsed());
 
         let response: AurRpcResponse = serde_json::from_str(&body)

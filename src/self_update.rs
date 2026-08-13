@@ -1,5 +1,8 @@
 use crate::config::Config;
-use crate::utils::{run_command, run_command_quiet, run_command_with_output_silent, vercmp_silent};
+use crate::utils::{
+    is_package_artifact, run_command, run_command_quiet, run_command_with_output_silent,
+    sh_single_quote, vercmp_silent,
+};
 use crate::{blog, vlog};
 use colored::Colorize;
 use std::fs;
@@ -37,9 +40,7 @@ fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String>
             matches_name = name == package;
             continue;
         }
-        if matches_name
-            && let Some(version) = trimmed.strip_prefix("version = ")
-        {
+        if matches_name && let Some(version) = trimmed.strip_prefix("version = ") {
             return Some(version.trim().trim_matches('"').to_string());
         }
     }
@@ -50,17 +51,19 @@ fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String>
 fn fetch_latest_version(raw_url: &str) -> Result<String, String> {
     vlog!("Checking upstream ABS release at {}...", raw_url);
     let start = std::time::Instant::now();
-    let out = run_command_with_output_silent(
-        "curl",
-        &[
-            "-fsSL",
-            "--compressed",
-            "-m", "5", // 5 seconds timeout
-            raw_url,
-        ],
-        None::<&str>,
-    )?;
-    vlog!("Upstream ABS version check finished in {:?}", start.elapsed());
+    let mut args = crate::utils::curl_base_args();
+    args.extend([
+        "--compressed".into(),
+        "-m".into(),
+        "5".into(),
+        raw_url.to_string(),
+    ]);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_command_with_output_silent("curl", &arg_refs, None::<&str>)?;
+    vlog!(
+        "Upstream ABS version check finished in {:?}",
+        start.elapsed()
+    );
     parse_cargo_toml_version(&out)
         .ok_or_else(|| "Failed to parse version from remote Cargo.toml".to_string())
 }
@@ -103,14 +106,21 @@ fn pacman_packages_to_upgrade() -> Vec<&'static str> {
 /// True when `filename` is a non-debug package for `pkg` at `pkgver` (any pkgrel/arch).
 /// e.g. `abs-1.3.7-1-x86_64.pkg.tar.zst` for pkg=`abs`, pkgver=`1.3.7`.
 fn is_pkg_artifact_for_version(filename: &str, pkg: &str, pkgver: &str) -> bool {
-    filename.starts_with(&format!("{pkg}-{pkgver}-"))
-        && filename.ends_with(".pkg.tar.zst")
+    is_package_artifact(filename)
+        && filename.starts_with(&format!("{pkg}-{pkgver}-"))
         && !filename.contains("-debug-")
 }
 
-fn find_pkg_artifacts_for_version(aur_dir: &Path, pkg: &str, pkgver: &str) -> Result<Vec<PathBuf>, String> {
+fn find_pkg_artifacts_for_version(
+    dir: &Path,
+    pkg: &str,
+    pkgver: &str,
+) -> Result<Vec<PathBuf>, String> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut matches = Vec::new();
-    for entry in fs::read_dir(aur_dir).map_err(|e| format!("read {}: {e}", aur_dir.display()))? {
+    for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
         let path = entry.path();
         if !path.is_file() {
@@ -127,39 +137,41 @@ fn find_pkg_artifacts_for_version(aur_dir: &Path, pkg: &str, pkgver: &str) -> Re
     Ok(matches)
 }
 
-fn find_pkg_artifact(aur_dir: &Path, pkg: &str, pkgver: &str) -> Result<PathBuf, String> {
-    find_pkg_artifacts_for_version(aur_dir, pkg, pkgver)?
+fn find_pkg_artifact(dir: &Path, pkg: &str, pkgver: &str) -> Result<PathBuf, String> {
+    find_pkg_artifacts_for_version(dir, pkg, pkgver)?
         .pop()
         .ok_or_else(|| {
             format!(
                 "no built package artifact for {pkg} {pkgver} in {}",
-                aur_dir.display()
+                dir.display()
             )
         })
 }
 
 /// Split-package leftovers for this `pkgver` block `makepkg` without `-f`.
 /// Remove them only when we are about to rebuild (not when reusing a complete set).
-fn remove_pkg_artifacts_for_version(aur_dir: &Path, pkgver: &str) -> Result<(), String> {
+fn remove_pkg_artifacts_for_version(dir: &Path, pkgver: &str) -> Result<(), String> {
     for pkg in ["abs", "absgui", "abs-full"] {
-        for path in find_pkg_artifacts_for_version(aur_dir, pkg, pkgver)? {
-            fs::remove_file(&path).map_err(|e| {
-                format!("failed to remove leftover {}: {e}", path.display())
-            })?;
+        for path in find_pkg_artifacts_for_version(dir, pkg, pkgver)? {
+            fs::remove_file(&path)
+                .map_err(|e| format!("failed to remove leftover {}: {e}", path.display()))?;
             vlog!("Removed leftover package artifact {}", path.display());
         }
     }
     Ok(())
 }
 
-fn try_ready_pkg_artifacts(
-    aur_dir: &Path,
-    pkgs: &[&str],
-    pkgver: &str,
-) -> Option<Vec<PathBuf>> {
+fn remove_pkg_artifacts_for_version_in_dirs(dirs: &[PathBuf], pkgver: &str) -> Result<(), String> {
+    for dir in dirs {
+        remove_pkg_artifacts_for_version(dir, pkgver)?;
+    }
+    Ok(())
+}
+
+fn try_ready_pkg_artifacts(dir: &Path, pkgs: &[&str], pkgver: &str) -> Option<Vec<PathBuf>> {
     let mut artifacts = Vec::with_capacity(pkgs.len());
     for pkg in pkgs {
-        match find_pkg_artifact(aur_dir, pkg, pkgver) {
+        match find_pkg_artifact(dir, pkg, pkgver) {
             Ok(path) => artifacts.push(path),
             Err(_) => return None,
         }
@@ -167,7 +179,73 @@ fn try_ready_pkg_artifacts(
     Some(artifacts)
 }
 
-fn run_pacman_self_update(repo_dir: &Path, expected_version: &str) -> Result<(), String> {
+fn try_ready_pkg_artifacts_in_dirs(
+    dirs: &[PathBuf],
+    pkgs: &[&str],
+    pkgver: &str,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    for dir in dirs {
+        if let Some(found) = try_ready_pkg_artifacts(dir, pkgs, pkgver) {
+            return Some((dir.clone(), found));
+        }
+    }
+    None
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.as_os_str().is_empty() && !dirs.iter().any(|d| d == &path) {
+        dirs.push(path);
+    }
+}
+
+/// Directories that may already hold `abs` / `absgui` / `abs-full` packages.
+/// Prefer `ready_made_packages_path` (shared PKGDEST); `aur/` is a legacy fallback.
+fn self_update_artifact_dirs(config: &Config, repo_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    push_unique_dir(
+        &mut dirs,
+        PathBuf::from(&config.paths.ready_made_packages_path),
+    );
+    if let Some(repo) = repo_dir {
+        push_unique_dir(&mut dirs, repo.join("aur"));
+    } else {
+        push_unique_dir(
+            &mut dirs,
+            PathBuf::from(&config.paths.packages_path)
+                .join("abs")
+                .join("aur"),
+        );
+    }
+    dirs
+}
+
+fn install_pacman_artifacts(artifacts: &[PathBuf], pkg_names: &[&str]) -> Result<(), String> {
+    blog!("Installing pacman package(s): {}", pkg_names.join(", "));
+
+    let mut args = vec!["-U".to_string(), "--noconfirm".to_string()];
+    for artifact in artifacts {
+        args.push(artifact.to_string_lossy().into_owned());
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if run_command_quiet("pacman", &arg_refs, None::<&str>).is_err() {
+        vlog!("Non-root pacman failed; retrying with sudo...");
+        let mut sudo_args = vec!["pacman".to_string()];
+        sudo_args.extend(args);
+        run_command(
+            "sudo",
+            &sudo_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            None::<&str>,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_pacman_self_update(
+    config: &Config,
+    repo_dir: &Path,
+    expected_version: &str,
+) -> Result<(), String> {
     let aur_dir = repo_dir.join("aur");
     if !aur_dir.join("PKGBUILD").exists() {
         return Err(format!(
@@ -176,53 +254,44 @@ fn run_pacman_self_update(repo_dir: &Path, expected_version: &str) -> Result<(),
         ));
     }
 
+    let pkgdest = config.paths.ready_made_packages_path.as_str();
     let to_install = pacman_packages_to_upgrade();
-    let artifacts = if let Some(ready) = try_ready_pkg_artifacts(&aur_dir, &to_install, expected_version)
+    let search_dirs = self_update_artifact_dirs(config, Some(repo_dir));
+    let artifacts = if let Some((dir, ready)) =
+        try_ready_pkg_artifacts_in_dirs(&search_dirs, &to_install, expected_version)
     {
         blog!(
-            "Using already-built pacman packages for {}...",
-            expected_version
+            "Using already-built pacman packages for {} from {}...",
+            expected_version,
+            dir.display()
         );
         ready
     } else {
         // Partial same-version artifacts make makepkg exit with "already been built".
-        remove_pkg_artifacts_for_version(&aur_dir, expected_version)?;
-        blog!("Building pacman packages from {}...", aur_dir.display());
-        run_command(
-            "makepkg",
-            &["-Csr", "--noconfirm"],
-            Some(&aur_dir),
-        )?;
+        remove_pkg_artifacts_for_version_in_dirs(&search_dirs, expected_version)?;
+        fs::create_dir_all(pkgdest)
+            .map_err(|e| format!("Failed to create ready_made_packages_path {}: {e}", pkgdest))?;
+        blog!(
+            "Building pacman packages from {} into {}...",
+            aur_dir.display(),
+            pkgdest
+        );
+        let cmdline = format!(
+            "PKGDEST={} makepkg -Csr --noconfirm",
+            sh_single_quote(pkgdest)
+        );
+        run_command("sh", &["-c", &cmdline], Some(&aur_dir))?;
         let mut built = Vec::new();
         for pkg in &to_install {
-            built.push(find_pkg_artifact(&aur_dir, pkg, expected_version)?);
+            built.push(
+                find_pkg_artifact(Path::new(pkgdest), pkg, expected_version)
+                    .or_else(|_| find_pkg_artifact(&aur_dir, pkg, expected_version))?,
+            );
         }
         built
     };
 
-    blog!(
-        "Installing pacman package(s): {}",
-        to_install.join(", ")
-    );
-
-    let mut args = vec!["-U".to_string(), "--noconfirm".to_string()];
-    for artifact in &artifacts {
-        args.push(artifact.to_string_lossy().into_owned());
-    }
-
-    let install_res = run_command_quiet("pacman", &args.iter().map(String::as_str).collect::<Vec<_>>(), Some(&aur_dir));
-    if install_res.is_err() {
-        vlog!("Non-root pacman failed; retrying with sudo...");
-        let mut sudo_args = vec!["pacman".to_string()];
-        sudo_args.extend(args);
-        run_command(
-            "sudo",
-            &sudo_args.iter().map(String::as_str).collect::<Vec<_>>(),
-            Some(&aur_dir),
-        )?;
-    }
-
-    Ok(())
+    install_pacman_artifacts(&artifacts, &to_install)
 }
 
 fn source_version_matches(repo_dir: &Path, expected_version: &str) -> Result<bool, String> {
@@ -259,7 +328,9 @@ fn sync_source_repo(config: &Config, expected_version: &str) -> Result<PathBuf, 
             let _ = fs::remove_dir_all(&abs_dir);
         }
     } else if abs_dir.exists() {
-        vlog!("Existing self-update checkout has an unexpected origin. Re-cloning the official repository...");
+        vlog!(
+            "Existing self-update checkout has an unexpected origin. Re-cloning the official repository..."
+        );
         let _ = fs::remove_dir_all(&abs_dir);
     }
 
@@ -302,7 +373,10 @@ fn install_file(src: &Path, dest: &Path, mode: &str) -> Result<(), String> {
         None::<&str>,
     );
     if install_res.is_err() {
-        vlog!("Standard install failed for {}. Retrying with sudo...", dest.display());
+        vlog!(
+            "Standard install failed for {}. Retrying with sudo...",
+            dest.display()
+        );
         run_command(
             "sudo",
             &[
@@ -324,11 +398,7 @@ fn absgui_install_path(abs_install_path: &str) -> PathBuf {
 
 fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String> {
     blog!("Compiling latest release...");
-    run_command(
-        "cargo",
-        &["build", "--release"],
-        Some(repo_dir),
-    )?;
+    run_command("cargo", &["build", "--release"], Some(repo_dir))?;
 
     let release_dir = repo_dir.join("target").join("release");
     let abs_binary = release_dir.join("abs");
@@ -347,7 +417,10 @@ fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String
         install_file(&gui_binary, &gui_install, "755")?;
 
         // Match README / pacman package layout when installing under /usr/bin.
-        if abs_install.parent().is_some_and(|p| p == Path::new("/usr/bin")) {
+        if abs_install
+            .parent()
+            .is_some_and(|p| p == Path::new("/usr/bin"))
+        {
             let desktop = repo_dir.join("absgui").join("absgui.desktop");
             let icon = repo_dir.join("absgui").join("assets").join("icon.png");
             if desktop.exists() {
@@ -427,10 +500,28 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         env!("CARGO_PKG_VERSION").yellow()
     );
 
-    let repo_dir = sync_source_repo(config, &latest)?;
-
     if should_use_pacman_update(config) {
-        run_pacman_self_update(&repo_dir, &latest)
+        let to_install = pacman_packages_to_upgrade();
+        let search_dirs = self_update_artifact_dirs(config, None);
+        if let Some((dir, ready)) =
+            try_ready_pkg_artifacts_in_dirs(&search_dirs, &to_install, &latest)
+        {
+            blog!(
+                "Using already-built pacman packages for {} from {}...",
+                latest,
+                dir.display()
+            );
+            install_pacman_artifacts(&ready, &to_install)
+                .map_err(|e| format!("Pacman self-update failed: {e}"))?;
+            blog!(
+                "ABS successfully updated to version {} via pacman!",
+                latest.green()
+            );
+            return Ok(true);
+        }
+
+        let repo_dir = sync_source_repo(config, &latest)?;
+        run_pacman_self_update(config, &repo_dir, &latest)
             .map_err(|e| format!("Pacman self-update failed: {e}"))?;
         blog!(
             "ABS successfully updated to version {} via pacman!",
@@ -439,6 +530,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         return Ok(true);
     }
 
+    let repo_dir = sync_source_repo(config, &latest)?;
     run_binary_self_update(config, &repo_dir)?;
     blog!("ABS successfully updated to version {}!", latest.green());
     Ok(true)
@@ -474,6 +566,11 @@ version = "1.3.4"
             "abs",
             "1.3.7"
         ));
+        assert!(is_pkg_artifact_for_version(
+            "abs-1.3.7-1-x86_64.pkg.tar.xz",
+            "abs",
+            "1.3.7"
+        ));
         assert!(!is_pkg_artifact_for_version(
             "abs-1.3.7-debug-1-x86_64.pkg.tar.zst",
             "abs",
@@ -485,6 +582,100 @@ version = "1.3.4"
             "abs",
             "1.3.7"
         ));
+    }
+
+    #[test]
+    fn missing_artifact_dir_is_empty_not_error() {
+        let missing = PathBuf::from("/no/such/abs-self-update-dir");
+        assert!(
+            find_pkg_artifacts_for_version(&missing, "abs", "1.5.0")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn try_ready_pkg_artifacts_requires_complete_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs_self_update_ready_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("abs-1.5.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
+        assert!(try_ready_pkg_artifacts(&dir, &["abs", "absgui"], "1.5.0").is_none());
+        fs::write(dir.join("absgui-1.5.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
+        let found = try_ready_pkg_artifacts(&dir, &["abs", "absgui"], "1.5.0").unwrap();
+        assert_eq!(found.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_ready_pkg_artifacts_in_dirs_uses_first_complete_set() {
+        let root = std::env::temp_dir().join(format!(
+            "abs_self_update_dirs_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pkgdest = root.join("ready");
+        let aur = root.join("aur");
+        fs::create_dir_all(&pkgdest).unwrap();
+        fs::create_dir_all(&aur).unwrap();
+        fs::write(pkgdest.join("abs-1.5.0-1-x86_64.pkg.tar.zst"), b"a").unwrap();
+        fs::write(pkgdest.join("absgui-1.5.0-1-x86_64.pkg.tar.zst"), b"b").unwrap();
+        fs::write(aur.join("abs-1.5.0-1-x86_64.pkg.tar.zst"), b"old").unwrap();
+        let (dir, files) =
+            try_ready_pkg_artifacts_in_dirs(&[pkgdest.clone(), aur], &["abs", "absgui"], "1.5.0")
+                .unwrap();
+        assert_eq!(dir, pkgdest);
+        assert_eq!(files.len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn self_update_artifact_dirs_prefers_ready_made_packages_path() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+manual_update_packages = []
+skip_install_packages = []
+[paths]
+packages_path = "/mnt/share/packages"
+chroot_base_path = "/mnt/share/chroot"
+ready_made_packages_path = "/mnt/share/ready"
+[build]
+default_environment = "local"
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+[repositories]
+default = "arch"
+[packages]
+"#,
+        )
+        .unwrap();
+        let dirs = self_update_artifact_dirs(&config, None);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/mnt/share/ready"),
+                PathBuf::from("/mnt/share/packages/abs/aur"),
+            ]
+        );
+        let repo = PathBuf::from("/mnt/share/packages/abs");
+        let dirs = self_update_artifact_dirs(&config, Some(&repo));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/mnt/share/ready"),
+                PathBuf::from("/mnt/share/packages/abs/aur"),
+            ]
+        );
     }
 
     /// A stale absgui version breaks `cargo build --locked` in the AUR PKGBUILD after a

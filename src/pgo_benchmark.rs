@@ -35,6 +35,24 @@ pub fn materialize_bundled_benchmark() -> Result<PathBuf, String> {
 pub fn resolve_benchmark_command(configured: &Option<String>) -> Result<PathBuf, String> {
     if let Some(raw) = configured.as_ref().filter(|s| !s.trim().is_empty()) {
         let path = crate::config::expand_user_path(raw.trim());
+        if !path.is_absolute() {
+            return Err(format!(
+                "benchmark_command must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        let allowed = dirs::home_dir().is_some_and(|h| crate::utils::path_has_prefix(&h, &path))
+            || crate::utils::path_has_prefix(Path::new("/usr/share/abs"), &path)
+            || crate::utils::path_has_prefix(
+                &bundled_benchmark_path().parent().unwrap_or(Path::new("/")),
+                &path,
+            );
+        if !allowed {
+            return Err(format!(
+                "benchmark_command must be under $HOME or /usr/share/abs: {}",
+                path.display()
+            ));
+        }
         if !path.is_file() {
             return Err(format!(
                 "benchmark_command is not a file: {}",
@@ -48,16 +66,21 @@ pub fn resolve_benchmark_command(configured: &Option<String>) -> Result<PathBuf,
     materialize_bundled_benchmark()
         .and_then(|path| ensure_usable_script(&path).map(|()| path))
         .or_else(|e| {
-        let tmp = std::env::temp_dir().join(format!("abs-pgo-benchmark-{}.sh", std::process::id()));
-        write_executable(&tmp, BENCHMARK_SCRIPT.as_bytes())
-            .map_err(|write_err| format!("{e}; fallback write {}: {write_err}", tmp.display()))?;
-        Ok(tmp)
-    })
+            let tmp =
+                std::env::temp_dir().join(format!("abs-pgo-benchmark-{}.sh", std::process::id()));
+            write_executable(&tmp, BENCHMARK_SCRIPT.as_bytes()).map_err(|write_err| {
+                format!("{e}; fallback write {}: {write_err}", tmp.display())
+            })?;
+            Ok(tmp)
+        })
 }
 
 /// Shell word(s) to run a benchmark script under `sudo -H -u` (bash avoids lost +x / root-owned scripts).
 pub fn shell_benchmark_runner(path: &Path) -> String {
-    format!("bash {}", crate::utils::sh_single_quote(&path.to_string_lossy()))
+    format!(
+        "bash {}",
+        crate::utils::sh_single_quote(&path.to_string_lossy())
+    )
 }
 
 #[cfg(unix)]
@@ -91,11 +114,7 @@ fn reclaim_script_for_build_user(path: &Path) -> Result<(), String> {
     let (uid, gid) = crate::utils::build_uid_gid();
     let owner = format!("{uid}:{gid}");
     let path_s = path.to_string_lossy();
-    crate::utils::run_command(
-        "sudo",
-        &["chown", &owner, path_s.as_ref()],
-        None::<&str>,
-    )?;
+    crate::utils::run_command("sudo", &["chown", &owner, path_s.as_ref()], None::<&str>)?;
     crate::utils::run_command("sudo", &["chmod", "755", path_s.as_ref()], None::<&str>)?;
     Ok(())
 }
@@ -124,8 +143,8 @@ fn ensure_usable_script(path: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn ensure_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = fs::metadata(path)
-        .map_err(|e| format!("benchmark script {}: {e}", path.display()))?;
+    let meta =
+        fs::metadata(path).map_err(|e| format!("benchmark script {}: {e}", path.display()))?;
     if meta.permissions().mode() & 0o111 == 0 {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod benchmark script {}: {e}", path.display()))?;
@@ -176,8 +195,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_configured_path_when_set() {
-        let path = resolve_benchmark_command(&Some("/bin/true".into())).unwrap();
-        assert_eq!(path, PathBuf::from("/bin/true"));
+    fn resolve_rejects_configured_path_outside_allowlist() {
+        let err = resolve_benchmark_command(&Some("/bin/true".into())).unwrap_err();
+        assert!(err.contains("must be under $HOME or /usr/share/abs"));
     }
 }

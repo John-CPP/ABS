@@ -189,7 +189,7 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub no_wait: bool,
 
-    /// Skip confirmation prompts (used with --purge)
+    /// Skip confirmation prompts (used with --purge). On first run with no config, write example defaults.
     #[arg(long, short = 'y', action = ArgAction::SetTrue)]
     pub yes: bool,
 
@@ -202,7 +202,12 @@ pub struct Cli {
     #[arg(long, value_name = "LIST")]
     pub list_remove: Option<String>,
 
-    /// Interactive config wizard. Optional ACTION: `add`, `remove`, `edit`, `hold`.
+    /// Guided setup of abs.toml (paths, build, ramdisk, repositories, …).
+    /// Re-run anytime; Enter keeps the current value. Green "(Suggested)" marks ABS defaults.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub config_wizard: bool,
+
+    /// Interactive package-list wizard. Optional ACTION: `add`, `remove`, `edit`, `hold`.
     /// Prefill with `--pkg-list`, `--hold-version`, `--trigger`, and package args.
     #[arg(long, value_name = "ACTION", num_args = 0..=1, default_missing_value = "")]
     pub wizard: Option<String>,

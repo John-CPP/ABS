@@ -14,8 +14,7 @@ pub const TICKRATE: &str =
     "Tickless behaviour: full (always tickless), idle, or periodic. Maps to _tickrate.";
 pub const PREEMPT: &str =
     "Kernel preemption model (full, voluntary, server, lazy). Maps to _preempt.";
-pub const HUGEPAGE: &str =
-    "Transparent hugepage policy: always or madvise. Maps to _hugepage.";
+pub const HUGEPAGE: &str = "Transparent hugepage policy: always or madvise. Maps to _hugepage.";
 pub const CC_HARDER: &str =
     "Enable stricter compiler flags in the PKGBUILD (_cc_harder). May increase build time.";
 pub const LTO_SUFFIX: &str =
@@ -27,10 +26,8 @@ pub const KCFI: &str =
 
 // --- Per-package ABS build ---
 
-pub const SOURCE: &str =
-    "Where ABS fetches the PKGBUILD: aur, cachyos, or arch official repos.";
-pub const BUILD_ENV: &str =
-    "Build environment: local (host makepkg) or chroot (isolated rootfs).";
+pub const SOURCE: &str = "Where ABS fetches the PKGBUILD: aur, cachyos, or arch official repos.";
+pub const BUILD_ENV: &str = "Build environment: local (host makepkg) or chroot (isolated rootfs).";
 pub const PACKAGE_ALIAS: &str =
     "Alternate upstream package name checked for updates (e.g. the repo package this AUR package tracks).";
 pub const PACKAGE_COMPILER: &str =
@@ -53,7 +50,8 @@ pub const RAMDISK_TARGETS: &str =
     "Place parts of the build on tmpfs (ramdisk). Letters combine into the ramdisk= value in abs.toml.";
 pub const RAMDISK_W: &str =
     "Build workdir (src/, pkg/) on tmpfs — speeds compile I/O for large trees like the kernel.";
-pub const RAMDISK_C: &str = "Chroot root filesystem on tmpfs — faster package installs inside chroot.";
+pub const RAMDISK_C: &str =
+    "Chroot root filesystem on tmpfs — faster package installs inside chroot.";
 pub const RAMDISK_P: &str =
     "Git clone / extract under packages_path on tmpfs. Uses a lot of RAM; enable only if you have spare memory.";
 pub const RAMDISK_R: &str =
@@ -106,7 +104,8 @@ pub const PGO_PERF_EXTRA_ARGS: &str =
 pub const PGO_VMLINUX: &str =
     "Path to DWARF vmlinux for llvm-profgen. auto = /usr/src/debug/<pkgbase>/vmlinux from the installed -dbg package.";
 pub const PGO_AFDO_TOOL: &str = "Profile conversion tool for stage 2 (default llvm-profgen).";
-pub const PGO_PROPELLER_TOOL: &str = "Profile conversion tool for stage 3 (default create_llvm_prof).";
+pub const PGO_PROPELLER_TOOL: &str =
+    "Profile conversion tool for stage 3 (default create_llvm_prof).";
 pub const PGO_AFDO_PROFILE_NAME: &str =
     "Filename of the AutoFDO profile copied into the kernel source tree (default kernel-compilation.afdo).";
 pub const PGO_STATE_FILE: &str =
@@ -115,10 +114,11 @@ pub const PGO_STATE_FILE: &str =
 // --- ABS global paths ---
 
 pub const PATH_PACKAGES: &str =
-    "Directory where ABS stores cloned sources and built package trees.";
-pub const PATH_CHROOT: &str = "Base directory for chroot build roots (one subfolder per environment).";
+    "Directory where ABS stores cloned sources (git trees). Sharing this across machines is optional.";
+pub const PATH_CHROOT: &str =
+    "Base directory for chroot build roots (one subfolder per environment).";
 pub const PATH_READY: &str =
-    "Directory for pre-built .pkg.tar.zst files installed without recompiling.";
+    "Directory for finished .pkg.tar.* files (PKGDEST). Share this folder so other PCs skip compiles, including abs --self-update. Do not use pacman's CacheDir here.";
 pub const PATH_CHROOT_MAKEPKG: &str =
     "Optional makepkg.conf copied into chroots; leave empty to use the chroot default.";
 
@@ -138,7 +138,7 @@ pub const COMPILE_FIRST_INSTALL: &str =
 pub const CLEAN_INSTALL_DEFAULT: &str =
     "Default for clean install (-C) when not specified on the command line.";
 pub const IGNORE_ALREADY_MADE: &str =
-    "Always rebuild even when a ready package at the PKGBUILD version (or newer) already exists. When off, skip compilation and reuse those artifacts (unless -n). Stale older ready packages do not skip a rebuild.";
+    "Always rebuild even when a ready package at the PKGBUILD version (or newer) already exists. When off, skip compilation and reuse those artifacts (unless -n). Keep off so other computers sharing ready_made_packages_path skip compiles. Stale older ready packages do not skip a rebuild.";
 pub const FAST_AUR_RPC: &str =
     "Use fast AUR RPC checks for update detection (fewer requests, may miss edge cases).";
 pub const CLEAN_CHROOT_AFTER: &str =
@@ -161,16 +161,17 @@ pub const PACKAGE_COMPILATION_PRIORITY: &str =
 // --- Self-update & startup ---
 
 pub const CHECK_UPDATE_STARTUP: &str = "Check for a new ABS release when abs starts.";
-pub const AUTO_UPDATE_STARTUP: &str = "Automatically install a new ABS release on startup when found.";
+pub const AUTO_UPDATE_STARTUP: &str =
+    "Automatically install a new ABS release on startup when found.";
 pub const SELF_UPDATE_AT_UPDATES: &str =
     "Also check for ABS updates when running repository update commands.";
 pub const INSTALL_TESTING: &str =
     "Allow installing Arch testing/staging packages when resolving dependencies.";
-pub const SELF_UPDATE_RAW: &str =
-    "Raw URL of Cargo.toml checked for the latest version string.";
-pub const SELF_UPDATE_INSTALL: &str = "Fallback path for the abs binary when not using pacman packages (legacy manual install).";
+pub const SELF_UPDATE_RAW: &str = "Raw URL of Cargo.toml checked for the latest version string.";
+pub const SELF_UPDATE_INSTALL: &str =
+    "Fallback path for the abs binary when not using pacman packages (legacy manual install).";
 pub const SELF_UPDATE_USE_PACMAN: &str =
-    "When true (default), --self-update builds aur/PKGBUILD and upgrades pacman packages. When false, copies abs and absgui binaries (and desktop/icon under /usr).";
+    "When true (default), --self-update builds aur/PKGBUILD into ready_made_packages_path and upgrades pacman packages. Other machines that share that folder install those files instead of compiling. When false, copies abs and absgui binaries (and desktop/icon under /usr).";
 
 // --- Package lists ---
 
@@ -213,13 +214,13 @@ pub const RAMDISK_MOUNT: &str = "Filesystem path where the tmpfs ramdisk is moun
 pub const RAMDISK_SIZE: &str = "Tmpfs size limit (e.g. 16G). Passed to mount -o size=.";
 pub const RAMDISK_MODE: &str = "Directory permissions mode for the mount point (octal).";
 pub const RAMDISK_GLOBAL_W: &str = "Default: put build workdirs (src/, pkg/) on tmpfs for packages that use ramdisk w. Also redirects ccache/TMPDIR and similar caches onto the ramdisk.";
-pub const RAMDISK_GLOBAL_C: &str = "Default: put chroot rootfs on tmpfs for packages that use ramdisk c.";
+pub const RAMDISK_GLOBAL_C: &str =
+    "Default: put chroot rootfs on tmpfs for packages that use ramdisk c.";
 pub const RAMDISK_GLOBAL_P: &str =
     "Default: clone sources under packages_path on tmpfs for packages that use ramdisk p.";
 pub const RAMDISK_SEED: &str =
     "Optional existing chroot directory copied to seed a fresh ramdisk chroot.";
-pub const RAMDISK_SYNC: &str =
-    "Sync ramdisk chroot contents back to disk when the build finishes.";
+pub const RAMDISK_SYNC: &str = "Sync ramdisk chroot contents back to disk when the build finishes.";
 pub const RAMDISK_MIN_FREE: &str =
     "Minimum free RAM (MiB) required before mounting; ABS aborts if below this.";
 pub const RAMDISK_WARN_PACKAGES: &str =

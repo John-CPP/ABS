@@ -4,9 +4,7 @@ use crate::build::{self, PgoBuildContext};
 use crate::cli::Cli;
 use crate::config::{self, Config, KernelBuildConfig, PgoConfig};
 use crate::package_spec::PackageSpec;
-use crate::utils::{
-    run_command, run_command_with_output, sh_single_quote,
-};
+use crate::utils::{run_command, run_command_with_output, sh_single_quote};
 use crate::{blog, die, ewarn, vlog};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -151,11 +149,7 @@ impl EventLog {
             );
             return;
         }
-        if let Err(e) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
+        if let Err(e) = OpenOptions::new().create(true).append(true).open(path) {
             ewarn!("Failed to create event log file {}: {}", path.display(), e);
         }
     }
@@ -262,11 +256,9 @@ fn load_pgo_config(package: &str, config: &Config) -> (PgoConfig, KernelBuildCon
         .packages
         .get(package)
         .unwrap_or_else(|| die!("Package '{package}' is not configured in abs.toml"));
-    let pgo = pkg
-        .pgo
-        .clone()
-        .filter(|p| p.enabled)
-        .unwrap_or_else(|| die!("Package '{package}' has no enabled [packages.{package}.pgo] section"));
+    let pgo = pkg.pgo.clone().filter(|p| p.enabled).unwrap_or_else(|| {
+        die!("Package '{package}' has no enabled [packages.{package}.pgo] section")
+    });
     if pgo.preset != "cachyos-kernel" {
         die!(
             "Unsupported PGO preset '{}'; only 'cachyos-kernel' is implemented",
@@ -279,7 +271,11 @@ fn load_pgo_config(package: &str, config: &Config) -> (PgoConfig, KernelBuildCon
     if !archive.exists()
         && let Err(e) = fs::create_dir_all(&archive)
     {
-        die!("Failed to create profiles_archive_dir '{}': {}", archive.display(), e);
+        die!(
+            "Failed to create profiles_archive_dir '{}': {}",
+            archive.display(),
+            e
+        );
     }
     let kernel = pkg.kernel.clone().unwrap_or_default();
     (pgo, kernel)
@@ -308,6 +304,17 @@ fn pgo_auto_systemd_unit(package: &str) -> String {
     format!("abs-pgo@{package}.service")
 }
 
+fn systemd_quote_exec(path: &str) -> String {
+    if path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'))
+    {
+        path.to_string()
+    } else {
+        format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
 fn pgo_auto_systemd_dir() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("systemd").join("user"))
@@ -320,8 +327,7 @@ fn install_pgo_auto_resume_service(package: &str) -> Result<(), String> {
         .display()
         .to_string();
     let unit_dir = pgo_auto_systemd_dir();
-    fs::create_dir_all(&unit_dir)
-        .map_err(|e| format!("create {}: {e}", unit_dir.display()))?;
+    fs::create_dir_all(&unit_dir).map_err(|e| format!("create {}: {e}", unit_dir.display()))?;
     let template = unit_dir.join("abs-pgo@.service");
     // Note: no After=network-online.target — user units cannot order against that system
     // target, and git/network steps in the pipeline fail with clear errors on their own.
@@ -331,17 +337,22 @@ fn install_pgo_auto_resume_service(package: &str) -> Result<(), String> {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={abs_bin} --pgo-resume %i --pgo-auto\n\
+         ExecStart={} --pgo-resume %i --pgo-auto\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n"
+         WantedBy=default.target\n",
+        systemd_quote_exec(&abs_bin)
     );
     fs::write(&template, unit).map_err(|e| format!("write {}: {e}", template.display()))?;
     run_command("systemctl", &["--user", "daemon-reload"], None::<&str>)
         .map_err(|e| e.to_string())?;
     let instance = pgo_auto_systemd_unit(package);
-    run_command("systemctl", &["--user", "enable", instance.as_str()], None::<&str>)
-        .map_err(|e| format!("enable {instance}: {e}"))?;
+    run_command(
+        "systemctl",
+        &["--user", "enable", instance.as_str()],
+        None::<&str>,
+    )
+    .map_err(|e| format!("enable {instance}: {e}"))?;
     blog!("Installed user systemd unit {instance} for PGO auto-restart");
     Ok(())
 }
@@ -367,12 +378,18 @@ fn trigger_pgo_auto_resume_now(package: &str) -> Result<(), String> {
     install_pgo_auto_resume_service(package)?;
     let instance = pgo_auto_systemd_unit(package);
     blog!("PGO auto-restart: scheduling {instance} to continue pipeline…");
-    run_command("systemctl", &["--user", "start", instance.as_str()], None::<&str>)
-        .map_err(|e| format!("start {instance}: {e}"))
+    run_command(
+        "systemctl",
+        &["--user", "start", instance.as_str()],
+        None::<&str>,
+    )
+    .map_err(|e| format!("start {instance}: {e}"))
 }
 
 fn transition(state: &mut PgoState, stage: PgoStageId) {
-    state.stage_history.push(format!("{:?}", state.current_stage));
+    state
+        .stage_history
+        .push(format!("{:?}", state.current_stage));
     state.current_stage = stage;
     state.updated_at = EventLog::now();
 }
@@ -386,7 +403,10 @@ fn run_start(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
     blog!("Starting PGO pipeline for {}…", package);
     events.log_line("stdout", format!("Starting PGO pipeline for {package}…"));
     if let Some(existing) = load_state(&state_path)
-        && !matches!(existing.current_stage, PgoStageId::Done | PgoStageId::Aborted)
+        && !matches!(
+            existing.current_stage,
+            PgoStageId::Done | PgoStageId::Aborted
+        )
     {
         blog!(
             "Existing PGO pipeline at {} ({}); resuming…",
@@ -471,8 +491,12 @@ fn run_goto(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
     }
     let (pgo, _) = load_pgo_config(package, config);
     let state_path = pgo.resolved_state_file(package);
-    let mut state = load_state(&state_path)
-        .unwrap_or_else(|| die!("No PGO state at '{}'; run --pgo first", state_path.display()));
+    let mut state = load_state(&state_path).unwrap_or_else(|| {
+        die!(
+            "No PGO state at '{}'; run --pgo first",
+            state_path.display()
+        )
+    });
     if state.current_stage != target {
         blog!(
             "PGO stage for {}: {} → {}",
@@ -503,8 +527,12 @@ fn run_goto(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
 fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
     let (pgo, _) = load_pgo_config(package, config);
     let state_path = pgo.resolved_state_file(package);
-    let mut state = load_state(&state_path)
-        .unwrap_or_else(|| die!("No PGO state at '{}'; run --pgo first", state_path.display()));
+    let mut state = load_state(&state_path).unwrap_or_else(|| {
+        die!(
+            "No PGO state at '{}'; run --pgo first",
+            state_path.display()
+        )
+    });
 
     if let Some(stage_raw) = cli.pgo_stage.as_deref() {
         let target = parse_pgo_stage(stage_raw).unwrap_or_else(|e| die!("{e}"));
@@ -541,7 +569,10 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
                 die!("PGO pipeline was aborted; run --pgo to start a fresh pipeline");
             }
             _ => {
-                blog!("Resuming in-progress stage: {}", state.current_stage.label());
+                blog!(
+                    "Resuming in-progress stage: {}",
+                    state.current_stage.label()
+                );
             }
         }
     }
@@ -612,7 +643,11 @@ fn run_status(package: &str, config: &Config, json: bool, _events: &EventLog) {
         }
         blog!("  Stages:");
         for stage in PgoStageId::selectable_stages() {
-            let mark = if *stage == state.current_stage { " (current)" } else { "" };
+            let mark = if *stage == state.current_stage {
+                " (current)"
+            } else {
+                ""
+            };
             blog!("    {}{}", stage_id_name(*stage), mark);
         }
     }
@@ -755,9 +790,7 @@ fn print_empty_json_status(package: &str, pgo: &PgoConfig) {
         expected_kernel_uname: None,
         expected_package_base: None,
         state_file: pgo.resolved_state_file(package).display().to_string(),
-        archive_dir: pgo
-            .resolved_archive_dir()
-            .map(|p| p.display().to_string()),
+        archive_dir: pgo.resolved_archive_dir().map(|p| p.display().to_string()),
         reboot_required: false,
         next_action: format!("abs --pgo {package}"),
         stages: PgoStageId::selectable_stages()
@@ -796,20 +829,15 @@ fn print_json_status(state: &PgoState, pgo: &PgoConfig) {
         PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2
     ) && boot_matches_expected(state);
     let (reboot_required, next_action) = match state.current_stage {
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 if boot_ready => (
-            false,
-            format!("abs --pgo-resume {}", state.package),
-        ),
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 => (
-            true,
-            reboot_resume_message(state, &state.package),
-        ),
+        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 if boot_ready => {
+            (false, format!("abs --pgo-resume {}", state.package))
+        }
+        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 => {
+            (true, reboot_resume_message(state, &state.package))
+        }
         PgoStageId::Done => (false, "none".to_string()),
         PgoStageId::Aborted => (false, "run --pgo to start a fresh pipeline".to_string()),
-        _ => (
-            false,
-            format!("abs --pgo-resume {}", state.package),
-        ),
+        _ => (false, format!("abs --pgo-resume {}", state.package)),
     };
     let out = StatusOut {
         package: &state.package,
@@ -817,10 +845,11 @@ fn print_json_status(state: &PgoState, pgo: &PgoConfig) {
         stage_label: state.current_stage.label(),
         expected_kernel_uname: state.expected_kernel_uname.as_deref(),
         expected_package_base: state.expected_package_base.as_deref(),
-        state_file: pgo.resolved_state_file(&state.package).display().to_string(),
-        archive_dir: pgo
-            .resolved_archive_dir()
-            .map(|p| p.display().to_string()),
+        state_file: pgo
+            .resolved_state_file(&state.package)
+            .display()
+            .to_string(),
+        archive_dir: pgo.resolved_archive_dir().map(|p| p.display().to_string()),
         reboot_required,
         boot_ready,
         next_action,
@@ -854,12 +883,7 @@ fn preflight(pgo: &PgoConfig, package: &str, config: &Config) {
         die!("{e}");
     }
     if let Some(pc) = config.packages.get(package)
-        && let Ok(targets) = crate::ramdisk::resolve_ramdisk_targets(
-            config,
-            Some(pc),
-            None,
-            None,
-        )
+        && let Ok(targets) = crate::ramdisk::resolve_ramdisk_targets(config, Some(pc), None, None)
         && targets.packages
     {
         ewarn!(
@@ -892,7 +916,8 @@ fn resolve_repo_dir(
     )
     .unwrap_or_default();
     let packages_path = crate::ramdisk::download_packages_path(config, &ramdisk_targets);
-    let (repo_name, repo_url, base_pkg) = build::resolve_pkg_repo(package, cli, config, Some(&spec));
+    let (repo_name, repo_url, base_pkg) =
+        build::resolve_pkg_repo(package, cli, config, Some(&spec));
     crate::git::prepare_repo(
         package,
         base_pkg.as_str(),
@@ -1176,7 +1201,8 @@ fn record_installed_kernel(state: &mut PgoState, package_base: &str) {
     if let Ok(out) = run_command_with_output("pacman", &["-Q", package_base], None::<&str>) {
         let parts: Vec<&str> = out.split_whitespace().collect();
         if parts.len() >= 2 {
-            state.expected_kernel_uname = Some(format!("{}-{}", parts[1], infer_suffix(package_base)));
+            state.expected_kernel_uname =
+                Some(format!("{}-{}", parts[1], infer_suffix(package_base)));
         }
     }
     // No fallback to the running `uname -r` here: that is the kernel we booted *before* this
@@ -1276,10 +1302,7 @@ fn try_push_active_pgo_state(
     let Ok(state) = serde_json::from_str::<PgoState>(&text) else {
         return;
     };
-    if matches!(
-        state.current_stage,
-        PgoStageId::Done | PgoStageId::Aborted
-    ) {
+    if matches!(state.current_stage, PgoStageId::Done | PgoStageId::Aborted) {
         return;
     }
     let package = if state.package.is_empty() {
@@ -1410,8 +1433,8 @@ fn scratch_dir(state: &PgoState, pgo: &PgoConfig, cli: &Cli, config: &Config) ->
     )
     .unwrap_or_default();
 
-    let want_ramdisk = ramdisk_targets.profiles
-        || (pgo.perf_data_on_ram && ramdisk_targets.build_workdir);
+    let want_ramdisk =
+        ramdisk_targets.profiles || (pgo.perf_data_on_ram && ramdisk_targets.build_workdir);
 
     if want_ramdisk {
         match crate::ramdisk::ensure_pgo_scratch_dir(config, &state.package, &ramdisk_targets) {
@@ -1537,8 +1560,7 @@ fn run_stage2_profile(
     blog!("Converting AutoFDO profile using {}…", vmlinux.display());
     run_logged_shell(&repo, &convert_cmd, events).unwrap_or_else(|e| die!("{e}"));
 
-    let profile_bytes =
-        validate_afdo_profile(&profile_out).unwrap_or_else(|e| die!("{e}"));
+    let profile_bytes = validate_afdo_profile(&profile_out).unwrap_or_else(|e| die!("{e}"));
     blog!(
         "AutoFDO profile OK ({} bytes) — review before continuing to the AutoFDO build stage",
         profile_bytes
@@ -1608,21 +1630,14 @@ fn run_profile_collection(
     let preset = resolved_benchmark_preset(pgo);
     let benchmark = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command)?;
     let bench_cache = pgo.resolved_benchmark_workdir(package);
-    fs::create_dir_all(&bench_cache).map_err(|e| {
-        format!(
-            "create benchmark cache {}: {e}",
-            bench_cache.display()
-        )
-    })?;
+    fs::create_dir_all(&bench_cache)
+        .map_err(|e| format!("create benchmark cache {}: {e}", bench_cache.display()))?;
     blog!("PGO benchmark script: {}", benchmark.display());
     blog!(
         "PGO benchmark asset cache (persistent): {}",
         bench_cache.display()
     );
-    blog!(
-        "PGO perf scratch (may be tmpfs): {}",
-        scratch.display()
-    );
+    blog!("PGO perf scratch (may be tmpfs): {}", scratch.display());
     let build_user = pgo
         .build_user
         .clone()
@@ -1688,6 +1703,15 @@ fn run_profile_collection(
 
 fn sysctl_toggle(pgo: &PgoConfig, enable: bool) -> Result<(), String> {
     if let Some(cmd) = &pgo.sysctl_command {
+        let path = Path::new(cmd);
+        let allowed = path.is_absolute()
+            && (dirs::home_dir().is_some_and(|h| crate::utils::path_has_prefix(&h, path))
+                || crate::utils::path_has_prefix(Path::new("/usr/share/abs"), path));
+        if !allowed {
+            return Err(format!(
+                "pgo.sysctl_command must be an absolute path under $HOME or /usr/share/abs (got {cmd:?})"
+            ));
+        }
         let action = if enable { "enable" } else { "disable" };
         run_command("sudo", &[cmd, action], None::<&str>).map_err(|e| e.to_string())
     } else {
@@ -1700,7 +1724,11 @@ fn sysctl_toggle(pgo: &PgoConfig, enable: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         run_command(
             "sudo",
-            &["sysctl", "-w", &format!("kernel.perf_event_paranoid={paranoid}")],
+            &[
+                "sysctl",
+                "-w",
+                &format!("kernel.perf_event_paranoid={paranoid}"),
+            ],
             None::<&str>,
         )
         .map_err(|e| e.to_string())?;
@@ -1720,11 +1748,7 @@ fn resolved_benchmark_preset(pgo: &PgoConfig) -> &str {
         return "cachyos";
     }
     let preset = pgo.benchmark_preset.trim();
-    if preset.is_empty() {
-        "fast"
-    } else {
-        preset
-    }
+    if preset.is_empty() { "fast" } else { preset }
 }
 
 fn resolved_perf_extra_args(pgo: &PgoConfig) -> String {
@@ -1855,16 +1879,10 @@ fn validate_propeller_profile(path: &Path) -> Result<u64, String> {
 
 fn elf_has_section(path: &Path, section: &str) -> bool {
     for tool in ["llvm-readelf", "readelf"] {
-        let Ok(output) = Command::new(tool)
-            .arg("-S")
-            .arg(path)
-            .output()
-        else {
+        let Ok(output) = Command::new(tool).arg("-S").arg(path).output() else {
             continue;
         };
-        if output.status.success()
-            && String::from_utf8_lossy(&output.stdout).contains(section)
-        {
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(section) {
             return true;
         }
     }
@@ -2191,7 +2209,10 @@ mod tests {
     #[test]
     fn stage3_env_has_propeller_profiles() {
         let env = stage3_build_env(&KernelBuildConfig::default(), "kernel-compilation.afdo");
-        assert_eq!(env.get("_propeller_profiles").map(String::as_str), Some("yes"));
+        assert_eq!(
+            env.get("_propeller_profiles").map(String::as_str),
+            Some("yes")
+        );
         assert_eq!(env.get("_build_debug").map(String::as_str), Some("no"));
     }
 
@@ -2273,7 +2294,10 @@ mod tests {
             PgoStageId::Stage2Profile
         );
         assert_eq!(parse_pgo_stage("2p").unwrap(), PgoStageId::Stage2Profile);
-        assert_eq!(parse_pgo_stage("profile").unwrap(), PgoStageId::Stage2Profile);
+        assert_eq!(
+            parse_pgo_stage("profile").unwrap(),
+            PgoStageId::Stage2Profile
+        );
         assert_eq!(
             parse_pgo_stage("stage1_build").unwrap(),
             PgoStageId::Stage1Build
@@ -2399,11 +2423,7 @@ mod tests {
             expected_package_base: None,
             stage_history: Vec::new(),
         };
-        fs::write(
-            &state_path,
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
+        fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
         let mut config: Config = toml::from_str(
             r#"
@@ -2511,7 +2531,10 @@ default = "aur"
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("linux-cachyos.events.jsonl");
         let log = EventLog::new(Some(path.clone()), false);
-        assert!(path.is_file(), "event log file should exist after EventLog::new");
+        assert!(
+            path.is_file(),
+            "event log file should exist after EventLog::new"
+        );
         log.emit(&PgoEvent::Error {
             ts: 0,
             message: "test".into(),

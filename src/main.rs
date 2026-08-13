@@ -5,12 +5,13 @@ mod cli;
 mod compile_scheduler;
 mod config;
 mod config_edit;
+mod config_wizard;
 mod dep_graph;
 mod git;
 mod held;
 mod install;
-mod package_spec;
 mod package_pattern;
+mod package_spec;
 mod pgo;
 mod pgo_benchmark;
 mod pkgbuild;
@@ -227,15 +228,16 @@ fn run_deferred_install_phase(
 ) {
     vlog!("Install phase (compile-first: all scheduled builds finished)...");
     if sort_topologically
-        && let Ok(sorted) = dep_graph::sort_packages_topologically(specs, cli, config) {
-            for spec in &sorted {
-                if skipped_installs.contains(&spec.name) {
-                    continue;
-                }
-                build::install_package_phase(spec, cli, config);
+        && let Ok(sorted) = dep_graph::sort_packages_topologically(specs, cli, config)
+    {
+        for spec in &sorted {
+            if skipped_installs.contains(&spec.name) {
+                continue;
             }
-            return;
+            build::install_package_phase(spec, cli, config);
         }
+        return;
+    }
     for spec in specs {
         if skipped_installs.contains(&spec.name) {
             continue;
@@ -312,6 +314,15 @@ fn main() {
         return;
     }
 
+    if cli.config_wizard {
+        config_wizard::run();
+        return;
+    }
+
+    if !config::config_exists() {
+        config_wizard::offer_first_run(cli.yes);
+    }
+
     let config = config::Config::load_config();
 
     if cli.wizard.is_some() {
@@ -350,7 +361,10 @@ fn main() {
                 );
             }
             Ok((false, _)) => {
-                blog!("ABS is up-to-date (current version: {}).", env!("CARGO_PKG_VERSION").green());
+                blog!(
+                    "ABS is up-to-date (current version: {}).",
+                    env!("CARGO_PKG_VERSION").green()
+                );
             }
             Err(e) => {
                 die!("Update check failed: {}", e);
@@ -391,9 +405,10 @@ fn main() {
     if config.check_for_update_on_startup && !skip_background {
         std::thread::spawn(move || {
             if let Ok((true, latest)) = self_update::check_for_update(&raw_url)
-                && let Ok(mut guard) = update_notifier_clone.lock() {
-                    *guard = Some(latest);
-                }
+                && let Ok(mut guard) = update_notifier_clone.lock()
+            {
+                *guard = Some(latest);
+            }
         });
     }
 
@@ -448,7 +463,10 @@ fn main() {
                 if std::env::var_os("ABS_GUI").is_some() {
                     die!("{}", e);
                 }
-                ewarn!("sudo -v failed (build steps may prompt for a password again): {}", e);
+                ewarn!(
+                    "sudo -v failed (build steps may prompt for a password again): {}",
+                    e
+                );
             }
             spawn_sudo_keepalive();
         }
@@ -507,11 +525,11 @@ fn main() {
     }
 
     // `-R` without `-U`: sync all manual repos, report PKGBUILD vs installed, then `command` (not refresh).
-        if cli.force_repo_update && !cli.system_update && cli.packages.is_empty() {
-            blog!("Repository refresh (manual_update_packages) and system update...");
-            refresh_repositories(&config, &cli, true);
-            return;
-        }
+    if cli.force_repo_update && !cli.system_update && cli.packages.is_empty() {
+        blog!("Repository refresh (manual_update_packages) and system update...");
+        refresh_repositories(&config, &cli, true);
+        return;
+    }
 
     let defer_install_pass = config.build.compile_first_install_after
         && !cli.compile_only
@@ -603,7 +621,8 @@ fn main() {
             let post_held = held_specs_for_drifts(&config_after);
             if !post_held.is_empty() {
                 blog!("Recompiling held packages after system update (trigger drift)...");
-                let skipped = run_compilations(post_held.clone(), &cli, &config_after, defer_install_pass);
+                let skipped =
+                    run_compilations(post_held.clone(), &cli, &config_after, defer_install_pass);
                 if defer_install_pass {
                     run_deferred_install_phase(&post_held, &skipped, &cli, &config_after, false);
                 }
@@ -618,22 +637,30 @@ fn main() {
             die_no_packages(&cli);
         }
 
-        let skipped_install_after_compile_fail = run_compilations(package_specs.clone(), &cli, &config, defer_install_pass);
+        let skipped_install_after_compile_fail =
+            run_compilations(package_specs.clone(), &cli, &config, defer_install_pass);
 
         if defer_install_pass {
-            run_deferred_install_phase(&package_specs, &skipped_install_after_compile_fail, &cli, &config, true);
+            run_deferred_install_phase(
+                &package_specs,
+                &skipped_install_after_compile_fail,
+                &cli,
+                &config,
+                true,
+            );
         }
     }
 
     if let Ok(guard) = update_notifier.lock()
-        && let Some(latest) = &*guard {
-            println!(
-                "{} A new version of ABS is available: {} (current: {}). Run 'abs --self-update' to update!",
-                "==>".yellow(),
-                latest.green(),
-                env!("CARGO_PKG_VERSION").yellow()
-            );
-        }
+        && let Some(latest) = &*guard
+    {
+        println!(
+            "{} A new version of ABS is available: {} (current: {}). Run 'abs --self-update' to update!",
+            "==>".yellow(),
+            latest.green(),
+            env!("CARGO_PKG_VERSION").yellow()
+        );
+    }
 }
 
 /// True when abs will do real work without naming packages on the command line (`-U`, `-R`, `-k`, …).

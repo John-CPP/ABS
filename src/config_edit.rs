@@ -1,6 +1,6 @@
 //! Surgical edits to `abs.toml` via `toml_edit` (preserves comments/formatting).
 
-use crate::config::{ensure_config_file, user_config_path, HeldPackage};
+use crate::config::{HeldPackage, ensure_config_file, user_config_path};
 use crate::die;
 use crate::held::split_pkgver_pkgrel;
 use std::collections::HashMap;
@@ -81,9 +81,13 @@ fn save_document(path: &Path, doc: &DocumentMut) {
     if let Some(parent) = path.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
-        die!("Failed to create config directory '{}': {}", parent.display(), e);
+        die!(
+            "Failed to create config directory '{}': {}",
+            parent.display(),
+            e
+        );
     }
-    if let Err(e) = fs::write(path, doc.to_string()) {
+    if let Err(e) = crate::utils::write_file_mode(path, &doc.to_string(), 0o600) {
         die!("Failed to write config '{}': {}", path.display(), e);
     }
 }
@@ -294,7 +298,9 @@ fn table_to_held(t: &Table) -> Option<HeldPackage> {
     Some(HeldPackage {
         name,
         version,
-        auto_recompile_trigger: crate::config::AutoRecompileTrigger { on_packages_updated },
+        auto_recompile_trigger: crate::config::AutoRecompileTrigger {
+            on_packages_updated,
+        },
     })
 }
 
@@ -498,7 +504,11 @@ pub fn read_package_fields(pkg: &str) -> PackageEditFields {
         None
     };
     let ignore_already_made_packages = if entry.get("ignore_already_made_packages").is_some() {
-        Some(entry.get("ignore_already_made_packages").and_then(|v| v.as_bool()))
+        Some(
+            entry
+                .get("ignore_already_made_packages")
+                .and_then(|v| v.as_bool()),
+        )
     } else {
         None
     };
@@ -549,7 +559,11 @@ pub fn shell_join_packages(packages: &[String]) -> String {
 
 /// Test helper: mutate a document string without touching the live config.
 #[cfg(test)]
-pub fn list_add_in_doc(doc: &mut DocumentMut, kind: ConfigListKind, packages: &[&str]) -> Vec<String> {
+pub fn list_add_in_doc(
+    doc: &mut DocumentMut,
+    kind: ConfigListKind,
+    packages: &[&str],
+) -> Vec<String> {
     let arr = ensure_string_array(doc, kind);
     let mut added = Vec::new();
     for pkg in packages {
