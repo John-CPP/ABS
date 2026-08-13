@@ -1,5 +1,6 @@
 /target/
 **/*.rs.bk
+.harness/
 
 # Machine-local ABS config (use abs.toml.example + `abs --config-wizard`)
 /abs.toml
