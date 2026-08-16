@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::utils::{
-    is_package_artifact, run_command, run_command_quiet, run_command_with_output_silent,
-    sh_single_quote, vercmp_silent,
+    ABSGUI_ICON_SIZES, absgui_hicolor_icon_path, is_package_artifact, run_command,
+    run_command_quiet, run_command_with_output_silent, sh_single_quote, vercmp_silent,
 };
 use crate::{blog, vlog};
 use colored::Colorize;
@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/John-CPP/ABS.git";
 /// `HEAD` resolves to the remote's default branch, so updates keep working across branch renames.
 const OFFICIAL_REPOSITORY_BRANCH: &str = "HEAD";
+const OFFICIAL_CARGO_TOML_URL: &str =
+    "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml";
 
 /// Parse `version` for the workspace `abs` package from raw Cargo.toml text.
 fn parse_cargo_toml_version(text: &str) -> Option<String> {
@@ -47,16 +49,19 @@ fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String>
     None
 }
 
-/// Fetch the latest version from raw GitHub Cargo.toml
-fn fetch_latest_version(raw_url: &str) -> Result<String, String> {
-    vlog!("Checking upstream ABS release at {}...", raw_url);
+/// Fetch the latest version from the official raw GitHub Cargo.toml
+fn fetch_latest_version() -> Result<String, String> {
+    vlog!(
+        "Checking upstream ABS release at {}...",
+        OFFICIAL_CARGO_TOML_URL
+    );
     let start = std::time::Instant::now();
     let mut args = crate::utils::curl_base_args();
     args.extend([
         "--compressed".into(),
         "-m".into(),
         "5".into(),
-        raw_url.to_string(),
+        OFFICIAL_CARGO_TOML_URL.to_string(),
     ]);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = run_command_with_output_silent("curl", &arg_refs, None::<&str>)?;
@@ -69,8 +74,8 @@ fn fetch_latest_version(raw_url: &str) -> Result<String, String> {
 }
 
 /// Perform update check and return if a new version is available along with the version string
-pub fn check_for_update(raw_url: &str) -> Result<(bool, String), String> {
-    let latest = fetch_latest_version(raw_url)?;
+pub fn check_for_update() -> Result<(bool, String), String> {
+    let latest = fetch_latest_version()?;
     let current = env!("CARGO_PKG_VERSION");
     let is_newer = vercmp_silent(&latest, current)? > 0;
     Ok((is_newer, latest))
@@ -86,21 +91,20 @@ fn should_use_pacman_update(config: &Config) -> bool {
     !matches!(config.self_update_use_pacman, Some(false))
 }
 
-fn pacman_packages_to_upgrade() -> Vec<&'static str> {
-    if pacman_installed("abs-full") {
-        return vec!["abs", "absgui", "abs-full"];
+fn pacman_packages_to_upgrade(want_gui: bool) -> Vec<&'static str> {
+    if want_gui {
+        vec!["abs", "absgui", "abs-full"]
+    } else {
+        vec!["abs"]
     }
-    let mut pkgs = Vec::new();
-    if pacman_installed("abs") {
-        pkgs.push("abs");
-    }
-    if pacman_installed("absgui") {
-        pkgs.push("absgui");
-    }
-    if pkgs.is_empty() {
-        pkgs.extend(["abs", "absgui"]);
-    }
-    pkgs
+}
+
+pub(crate) fn wants_absgui(config: &Config) -> bool {
+    crate::config::resolve_install_absgui(
+        config.install_absgui,
+        crate::config::load_install_absgui_pref(),
+        pacman_installed("absgui") || pacman_installed("abs-full"),
+    )
 }
 
 /// True when `filename` is a non-debug package for `pkg` at `pkgver` (any pkgrel/arch).
@@ -255,7 +259,7 @@ fn run_pacman_self_update(
     }
 
     let pkgdest = config.paths.ready_made_packages_path.as_str();
-    let to_install = pacman_packages_to_upgrade();
+    let to_install = pacman_packages_to_upgrade(wants_absgui(config));
     let search_dirs = self_update_artifact_dirs(config, Some(repo_dir));
     let artifacts = if let Some((dir, ready)) =
         try_ready_pkg_artifacts_in_dirs(&search_dirs, &to_install, expected_version)
@@ -307,9 +311,14 @@ fn remote_is_official(repo_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Directory of the official ABS git checkout used by `--self-update`.
+pub fn abs_install_checkout_dir(config: &Config) -> PathBuf {
+    PathBuf::from(&config.paths.packages_path).join("abs")
+}
+
 fn sync_source_repo(config: &Config, expected_version: &str) -> Result<PathBuf, String> {
     let packages_path = config.paths.packages_path.clone();
-    let abs_dir = PathBuf::from(&packages_path).join("abs");
+    let abs_dir = abs_install_checkout_dir(config);
 
     let mut repo_ok = false;
     if abs_dir.exists() && abs_dir.join(".git").exists() && remote_is_official(&abs_dir) {
@@ -411,7 +420,7 @@ fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String
     install_file(&abs_binary, &abs_install, "755")?;
 
     let gui_binary = release_dir.join("absgui");
-    if gui_binary.exists() {
+    if wants_absgui(config) && gui_binary.exists() {
         let gui_install = absgui_install_path(&config.self_update_install_path);
         blog!("Installing executable to {}...", gui_install.display());
         install_file(&gui_binary, &gui_install, "755")?;
@@ -422,7 +431,7 @@ fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String
             .is_some_and(|p| p == Path::new("/usr/bin"))
         {
             let desktop = repo_dir.join("absgui").join("absgui.desktop");
-            let icon = repo_dir.join("absgui").join("assets").join("icon.png");
+            let icons_dir = repo_dir.join("absgui").join("assets").join("icons");
             if desktop.exists() {
                 install_file(
                     &desktop,
@@ -430,15 +439,14 @@ fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String
                     "644",
                 )?;
             }
-            if icon.exists() {
-                install_file(
-                    &icon,
-                    Path::new("/usr/share/icons/hicolor/256x256/apps/absgui.png"),
-                    "644",
-                )?;
+            for size in ABSGUI_ICON_SIZES {
+                let src = icons_dir.join(format!("icon_{size}.png"));
+                if src.exists() {
+                    install_file(&src, &absgui_hicolor_icon_path(*size), "644")?;
+                }
             }
         }
-    } else {
+    } else if wants_absgui(config) {
         eprintln!(
             "{} Compiled absgui not found in target/release; left existing GUI install unchanged.",
             "==> WARNING:".yellow()
@@ -454,7 +462,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         blog!("Checking for updates...");
     }
 
-    let (is_newer, latest) = match check_for_update(&config.self_update_raw_url) {
+    let (is_newer, latest) = match check_for_update() {
         Ok(res) => res,
         Err(e) => {
             if is_auto {
@@ -501,7 +509,7 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
     );
 
     if should_use_pacman_update(config) {
-        let to_install = pacman_packages_to_upgrade();
+        let to_install = pacman_packages_to_upgrade(wants_absgui(config));
         let search_dirs = self_update_artifact_dirs(config, None);
         if let Some((dir, ready)) =
             try_ready_pkg_artifacts_in_dirs(&search_dirs, &to_install, &latest)
@@ -534,6 +542,11 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
     run_binary_self_update(config, &repo_dir)?;
     blog!("ABS successfully updated to version {}!", latest.green());
     Ok(true)
+}
+
+/// True when a failed `--self-update` already found a newer version and then clone/build/install failed.
+pub fn is_retryable_self_update_error(err: &str) -> bool {
+    !err.starts_with("Update check failed:")
 }
 
 #[cfg(test)]
@@ -588,7 +601,7 @@ version = "1.3.4"
     fn missing_artifact_dir_is_empty_not_error() {
         let missing = PathBuf::from("/no/such/abs-self-update-dir");
         assert!(
-            find_pkg_artifacts_for_version(&missing, "abs", "1.5.0")
+            find_pkg_artifacts_for_version(&missing, "abs", "1.6.0")
                 .unwrap()
                 .is_empty()
         );
@@ -604,10 +617,10 @@ version = "1.3.4"
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("abs-1.5.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
-        assert!(try_ready_pkg_artifacts(&dir, &["abs", "absgui"], "1.5.0").is_none());
-        fs::write(dir.join("absgui-1.5.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
-        let found = try_ready_pkg_artifacts(&dir, &["abs", "absgui"], "1.5.0").unwrap();
+        fs::write(dir.join("abs-1.6.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
+        assert!(try_ready_pkg_artifacts(&dir, &["abs", "absgui"], "1.6.0").is_none());
+        fs::write(dir.join("absgui-1.6.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
+        let found = try_ready_pkg_artifacts(&dir, &["abs", "absgui"], "1.6.0").unwrap();
         assert_eq!(found.len(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -625,11 +638,11 @@ version = "1.3.4"
         let aur = root.join("aur");
         fs::create_dir_all(&pkgdest).unwrap();
         fs::create_dir_all(&aur).unwrap();
-        fs::write(pkgdest.join("abs-1.5.0-1-x86_64.pkg.tar.zst"), b"a").unwrap();
-        fs::write(pkgdest.join("absgui-1.5.0-1-x86_64.pkg.tar.zst"), b"b").unwrap();
-        fs::write(aur.join("abs-1.5.0-1-x86_64.pkg.tar.zst"), b"old").unwrap();
+        fs::write(pkgdest.join("abs-1.6.0-1-x86_64.pkg.tar.zst"), b"a").unwrap();
+        fs::write(pkgdest.join("absgui-1.6.0-1-x86_64.pkg.tar.zst"), b"b").unwrap();
+        fs::write(aur.join("abs-1.6.0-1-x86_64.pkg.tar.zst"), b"old").unwrap();
         let (dir, files) =
-            try_ready_pkg_artifacts_in_dirs(&[pkgdest.clone(), aur], &["abs", "absgui"], "1.5.0")
+            try_ready_pkg_artifacts_in_dirs(&[pkgdest.clone(), aur], &["abs", "absgui"], "1.6.0")
                 .unwrap();
         assert_eq!(dir, pkgdest);
         assert_eq!(files.len(), 2);
@@ -689,6 +702,48 @@ default = "arch"
     }
 
     #[test]
+    fn abs_install_checkout_is_packages_path_abs() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+manual_update_packages = []
+skip_install_packages = []
+[paths]
+packages_path = "/mnt/share/packages"
+chroot_base_path = "/mnt/share/chroot"
+ready_made_packages_path = "/mnt/share/ready"
+[build]
+default_environment = "local"
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+[repositories]
+default = "arch"
+[packages]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            abs_install_checkout_dir(&config),
+            PathBuf::from("/mnt/share/packages/abs")
+        );
+    }
+
+    #[test]
+    fn retryable_self_update_error_skips_update_check() {
+        assert!(!is_retryable_self_update_error(
+            "Update check failed: curl timed out"
+        ));
+        assert!(is_retryable_self_update_error(
+            "official repository source version does not match checked update version 1.6.0"
+        ));
+        assert!(is_retryable_self_update_error(
+            "Pacman self-update failed: makepkg"
+        ));
+    }
+
+    #[test]
     fn parse_remote_cargo_version_ignores_other_workspace_members() {
         let text = r#"[package]
 name = "absgui"
@@ -711,5 +766,14 @@ version = "1.3.4"
             absgui_install_path("/home/user/.local/bin/abs"),
             PathBuf::from("/home/user/.local/bin/absgui")
         );
+    }
+
+    #[test]
+    fn pacman_packages_follow_absgui_choice() {
+        assert_eq!(
+            pacman_packages_to_upgrade(true),
+            vec!["abs", "absgui", "abs-full"]
+        );
+        assert_eq!(pacman_packages_to_upgrade(false), vec!["abs"]);
     }
 }

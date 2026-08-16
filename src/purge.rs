@@ -1,10 +1,13 @@
 use crate::blog;
 use crate::config::{self, Config};
 use crate::ramdisk;
-use crate::utils::{check_sudo_removal, init_deletable_roots, run_command};
+use crate::utils::{
+    ABSGUI_ICON_SIZES, absgui_hicolor_icon_path, check_sudo_removal, init_deletable_roots,
+    run_command,
+};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +48,7 @@ pub fn run(yes: bool) {
         return;
     }
 
-    if !yes && !confirm_purge() {
+    if !yes && !confirm_yes_no("Proceed with removal? [y/N]: ") {
         blog!("Purge cancelled.");
         return;
     }
@@ -75,8 +78,74 @@ pub fn run(yes: bool) {
     }
 }
 
-fn confirm_purge() -> bool {
-    print!("Proceed with removal? [y/N]: ");
+/// Remove only `{packages_path}/abs` (the `--self-update` git checkout), not the rest of ABS.
+pub fn run_abs_install(config: &Config, yes: bool) {
+    let path = crate::self_update::abs_install_checkout_dir(config);
+    if !path.exists() {
+        blog!("No ABS git checkout at {}.", path.display());
+        return;
+    }
+
+    blog!("The ABS self-update git checkout will be removed:");
+    println!("  {} (ABS git checkout)", path.display());
+
+    if crate::is_dry_run_mode() {
+        blog!("Dry run — no files were removed.");
+        return;
+    }
+
+    if !yes && !confirm_yes_no("Proceed with removal? [y/N]: ") {
+        blog!("Purge cancelled.");
+        return;
+    }
+
+    match remove_abs_install_checkout(config) {
+        Ok(()) => blog!("Removed {}.", path.display()),
+        Err(e) => {
+            crate::ewarn!("{}: {e}", path.display());
+        }
+    }
+}
+
+/// Delete `{packages_path}/abs` so the next `--self-update` reclones.
+pub fn remove_abs_install_checkout(config: &Config) -> Result<(), String> {
+    let path = crate::self_update::abs_install_checkout_dir(config);
+    if !path.exists() {
+        return Ok(());
+    }
+    if init_deletable_roots(
+        &config.paths.packages_path,
+        &config.paths.chroot_base_path,
+        &config.paths.ready_made_packages_path,
+        &[],
+    )
+    .is_err()
+    {
+        crate::ewarn!(
+            "Some configured paths could not be registered for safe deletion; sudo removals may be skipped."
+        );
+    }
+    if remove_user_tree(&path).is_ok() {
+        return Ok(());
+    }
+    check_sudo_removal(&path)
+}
+
+/// Prompt used after a failed `--self-update`. `--yes` skips this.
+pub fn offer_self_update_retry(yes: bool) -> bool {
+    if yes {
+        return true;
+    }
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    confirm_yes_no(
+        "Self-update failed (the git checkout may be stale). Purge the ABS git repository and try compiling again? [y/N]: ",
+    )
+}
+
+fn confirm_yes_no(prompt: &str) -> bool {
+    print!("{prompt}");
     let _ = io::stdout().flush();
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
@@ -225,13 +294,19 @@ fn collect_targets(config: Option<&Config>) -> Vec<PurgeTarget> {
 }
 
 fn standard_install_files() -> Vec<PathBuf> {
-    vec![
+    let mut out = vec![
         PathBuf::from("/usr/bin/abs"),
         PathBuf::from("/usr/bin/absgui"),
         PathBuf::from("/usr/share/abs/pgo-benchmark.sh"),
         PathBuf::from("/usr/share/applications/absgui.desktop"),
-        PathBuf::from("/usr/share/icons/hicolor/256x256/apps/absgui.png"),
-    ]
+    ];
+    out.extend(
+        ABSGUI_ICON_SIZES
+            .iter()
+            .copied()
+            .map(absgui_hicolor_icon_path),
+    );
+    out
 }
 
 fn push_config_path(
@@ -349,9 +424,16 @@ fn is_safe_install_path(path: &Path) -> bool {
         "/usr/bin/absgui",
         "/usr/share/abs/pgo-benchmark.sh",
         "/usr/share/applications/absgui.desktop",
-        "/usr/share/icons/hicolor/256x256/apps/absgui.png",
     ];
     if WHITELIST.iter().any(|p| path == Path::new(p)) {
+        return true;
+    }
+    if ABSGUI_ICON_SIZES
+        .iter()
+        .copied()
+        .map(absgui_hicolor_icon_path)
+        .any(|p| path == p.as_path())
+    {
         return true;
     }
     path.parent() == Some(Path::new("/usr/bin"))
@@ -368,6 +450,12 @@ mod tests {
     fn standard_install_paths_are_whitelisted() {
         assert!(is_safe_install_path(Path::new("/usr/bin/abs")));
         assert!(is_safe_install_path(Path::new("/usr/bin/absgui")));
+        assert!(is_safe_install_path(Path::new(
+            "/usr/share/icons/hicolor/32x32/apps/absgui.png"
+        )));
+        assert!(is_safe_install_path(Path::new(
+            "/usr/share/icons/hicolor/512x512/apps/absgui.png"
+        )));
         assert!(!is_safe_install_path(Path::new("/usr/bin/pacman")));
     }
 
@@ -378,5 +466,31 @@ mod tests {
         if let Some(config_dir) = dirs::config_dir() {
             assert!(paths.contains(&config_dir.join("abs")));
         }
+    }
+
+    #[test]
+    fn remove_abs_install_checkout_ok_when_missing() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+manual_update_packages = []
+skip_install_packages = []
+[paths]
+packages_path = "/no/such/abs-purge-packages"
+chroot_base_path = "/no/such/abs-purge-chroot"
+ready_made_packages_path = "/no/such/abs-purge-ready"
+[build]
+default_environment = "local"
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+[repositories]
+default = "arch"
+[packages]
+"#,
+        )
+        .unwrap();
+        remove_abs_install_checkout(&config).expect("missing checkout is not an error");
     }
 }

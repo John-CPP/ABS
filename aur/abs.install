@@ -1,7 +1,7 @@
 post_install() {
-  echo "ABS installed. Copy the example config if needed:"
-  echo "  mkdir -p ~/.config/abs"
-  echo "  cp /usr/share/doc/abs/abs.toml.example ~/.config/abs/abs.toml"
+  echo "ABS installed. Run abs (it will offer the config wizard if you have no abs.toml)."
+  echo "The wizard asks whether to keep AbsGui; that choice is reused on --self-update."
+  echo "  abs --config-wizard"
   echo "  abs --configure"
 }
 

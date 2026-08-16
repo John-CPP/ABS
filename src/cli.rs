@@ -173,7 +173,7 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub ramdisk_shutdown: bool,
 
-    /// Emit machine-readable JSON (status/events)
+    /// Emit machine-readable JSON (status/events / pending updates)
     #[arg(long, action = ArgAction::SetTrue)]
     pub json: bool,
 
@@ -185,11 +185,16 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub purge: bool,
 
+    /// Remove only the ABS self-update git checkout (`packages_path/abs`) so the next `--self-update` reclones
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub purge_abs_install: bool,
+
     /// Skip the interactive “Press Enter to exit” prompt (for scripts and automation)
     #[arg(long, action = ArgAction::SetTrue)]
     pub no_wait: bool,
 
-    /// Skip confirmation prompts (used with --purge). On first run with no config, write example defaults.
+    /// Skip confirmation prompts (used with `--purge` and `--purge-abs-install`).
+    /// Also accepts a self-update retry after a failed compile. On first run with no config, write example defaults.
     #[arg(long, short = 'y', action = ArgAction::SetTrue)]
     pub yes: bool,
 
@@ -202,10 +207,22 @@ pub struct Cli {
     #[arg(long, value_name = "LIST")]
     pub list_remove: Option<String>,
 
-    /// Guided setup of abs.toml (paths, build, ramdisk, repositories, …).
+    /// Answer plain-language questions to create or update your ABS settings file.
     /// Re-run anytime; Enter keeps the current value. Green "(Suggested)" marks ABS defaults.
     #[arg(long, action = ArgAction::SetTrue)]
     pub config_wizard: bool,
+
+    /// Dump the config-wizard form as JSON (AbsGui client).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub config_wizard_form: bool,
+
+    /// Validate one wizard field from JSON on stdin (AbsGui client).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub config_wizard_check: bool,
+
+    /// Apply wizard answers from JSON on stdin and write abs.toml (AbsGui client).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub config_wizard_apply: bool,
 
     /// Interactive package-list wizard. Optional ACTION: `add`, `remove`, `edit`, `hold`.
     /// Prefill with `--pkg-list`, `--hold-version`, `--trigger`, and package args.
@@ -235,4 +252,22 @@ pub struct Cli {
     /// Trigger package(s) for hold `on_packages_updated` (comma-separated or repeatable)
     #[arg(long, value_name = "PKG", action = ArgAction::Append)]
     pub trigger: Vec<String>,
+
+    /// List pending official-repo and AUR package updates (use `--json` for the GUI)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub pending_updates: bool,
+
+    /// Install all pending official-repo updates in one transaction.
+    /// Optional package args limit the set; omitted means whatever is pending now.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub install_repo_updates: bool,
+
+    /// Install one AUR package with yay/paru/pikaur from abs.toml
+    #[arg(long, value_name = "PACKAGE")]
+    pub install_aur: Option<String>,
+
+    /// Set the default language for abs, and for AbsGui if AbsGui has no language of its own.
+    /// Codes: en, de, es, ar, ru, zh, ja.
+    #[arg(long, value_name = "LANG")]
+    pub set_default_lang: Option<String>,
 }

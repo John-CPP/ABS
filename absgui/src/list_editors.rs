@@ -1,12 +1,23 @@
 use crate::config::ConfigDocument;
 use iced::widget::text_editor::Content;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PackageListField {
     ManualUpdate,
     SkipInstall,
     SkipInstallAfter,
     SysUpdateIgnore,
+}
+
+impl PackageListField {
+    pub fn editor_id(self) -> &'static str {
+        match self {
+            Self::ManualUpdate => "pkg-list-manual-update",
+            Self::SkipInstall => "pkg-list-skip-install",
+            Self::SkipInstallAfter => "pkg-list-skip-install-after",
+            Self::SysUpdateIgnore => "pkg-list-sys-update-ignore",
+        }
+    }
 }
 
 pub struct ListEditors {

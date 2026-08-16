@@ -1887,11 +1887,15 @@ mod tests {
             json: false,
             event_log: None,
             purge: false,
+            purge_abs_install: false,
             yes: false,
             no_wait: false,
             list_add: None,
             list_remove: None,
             config_wizard: false,
+            config_wizard_form: false,
+            config_wizard_check: false,
+            config_wizard_apply: false,
             wizard: None,
             pkg_list: None,
             hold: None,
@@ -1899,6 +1903,10 @@ mod tests {
             unhold: vec![],
             hold_check: false,
             trigger: vec![],
+            pending_updates: false,
+            install_repo_updates: false,
+            install_aur: None,
+            set_default_lang: None,
         }
     }
 

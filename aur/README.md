@@ -12,8 +12,12 @@ Split packages built from this PKGBUILD:
 
 ```bash
 cd aur
-makepkg -si
+./install.sh
 ```
+
+`install.sh` runs `makepkg -s`, then `pacman -U`. On a first install (no `~/.config/abs/abs.toml` and no `install-prefs.toml`) it asks whether to install AbsGui. Later runs reuse `install_absgui` from `abs.toml` or `install-prefs.toml`. `ABS_INSTALL_GUI=0 ./install.sh` skips the GUI without asking.
+
+`makepkg -si` still installs all three packages without asking.
 
 ### Migrating from a manual `cargo install` / `sudo install` setup
 
@@ -22,7 +26,7 @@ If pacman reports **conflicting files** (`/usr/bin/abs exists in filesystem`), r
 ```bash
 cd aur
 makepkg -s
-sudo pacman -U --overwrite '/usr/bin/abs,/usr/bin/absgui,/usr/share/abs/*,/usr/share/applications/absgui.desktop,/usr/share/icons/hicolor/256x256/apps/absgui.png' \
+sudo pacman -U --overwrite '/usr/bin/abs,/usr/bin/absgui,/usr/share/abs/*,/usr/share/applications/absgui.desktop,/usr/share/icons/hicolor/*/apps/absgui.png' \
   abs-*.pkg.tar.zst absgui-*.pkg.tar.zst abs-full-*.pkg.tar.zst
 ```
 
@@ -31,7 +35,7 @@ Or remove the conflicting files first, then `makepkg -si`:
 ```bash
 sudo rm -f /usr/bin/abs /usr/bin/absgui \
   /usr/share/applications/absgui.desktop \
-  /usr/share/icons/hicolor/256x256/apps/absgui.png \
+  /usr/share/icons/hicolor/*/apps/absgui.png \
   /usr/share/abs/pgo-benchmark.sh
 cd aur && makepkg -si
 ```

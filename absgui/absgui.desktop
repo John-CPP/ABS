@@ -1,8 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=absgui
+Name=AbsGUI Package Manager
+GenericName=Package manager
 Comment=ABS kernel manager and configuration GUI
 Exec=absgui
 Icon=absgui
 Terminal=false
-Categories=System;Settings;
+Categories=Utility;System;
+Keywords=kernel;ABS;Arch;Linux;PGO;build;
+StartupWMClass=absgui

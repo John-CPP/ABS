@@ -8,11 +8,13 @@ config_version = 1
 # (tested editors: vim, nano, kate)
 
 # Self-Updates (Root-level configurations)
-# check_for_update_on_startup = true
-# auto_update_on_startup = false
-# self_update_at_updates = false
-# self_update_raw_url = "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml"
+check_for_update_on_startup = true
+auto_update_on_startup = false
+self_update_at_updates = false
 self_update_use_pacman = true
+install_absgui = true
+# UI language: en, de, es, ar, ru, zh, ja. First setup uses the system language when it is one of these.
+# lang = "en"
 # self_update_install_path = "/usr/bin/abs"  # used when self_update_use_pacman = false (absgui installed beside it)
 # If false, checks for newer versions of Arch Linux or CachyOS packages using stable pacman sync databases instead of git.
 # install_testing_phase_archlinux_packages = false
@@ -109,7 +111,7 @@ system_update_first = true
 # After each chroot (makechrootpkg) build, remove working copies and reset the devtools chroot when idle
 clean_chroot_after_compilation = true
 # CPU-aware scheduler: strict = hard cap on sum of active threads; flexible = soft cap + optional burst
-# global_cpu_threads_mode = "strict"
+global_cpu_threads_mode = "strict"
 # global_cpu_threads_cap = 10
 # maximum_cpu_threads_cap = 15   # flexible mode only
 # default_compilation_threads = 5

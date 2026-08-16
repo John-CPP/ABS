@@ -1,11 +1,11 @@
 [workspace]
-members = [".", "absgui"]
+members = [".", "absgui", "abs-i18n"]
 default-members = [".", "absgui"]
 resolver = "2"
 
 [package]
 name = "abs"
-version = "1.5.0"
+version = "2.0.0"
 edition = "2024"
 license = "CC-BY-4.0"
 
@@ -24,6 +24,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1.2"
 toml_edit = "0.25"
+abs-i18n = { path = "abs-i18n" }
 
 [profile.release]
 lto = "thin"

@@ -1,7 +1,8 @@
+use super::pretty::{humanize_in_place, render_human_toml};
 use super::ConfigDocument;
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Table};
+use toml_edit::{DocumentMut, Item, Table};
 
 pub fn config_path() -> PathBuf {
     dirs::config_dir()
@@ -18,20 +19,33 @@ pub fn save_config(path: &PathBuf, doc: &ConfigDocument) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
     }
-    let overlay: DocumentMut =
+    let mut overlay: DocumentMut =
         toml_edit::ser::to_document(doc).map_err(|e| format!("serialize TOML: {e}"))?;
+    humanize_in_place(&mut overlay);
     let text = if path.exists() {
         let existing =
             fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let mut orig: DocumentMut = existing
             .parse()
             .map_err(|e| format!("parse existing {}: {e}", path.display()))?;
+        humanize_in_place(&mut orig);
         merge_tables(orig.as_table_mut(), overlay.as_table());
-        orig.to_string()
+        if doc.lang.is_none() {
+            orig.as_table_mut().remove("lang");
+        }
+        render_human_toml(&mut orig)
     } else {
-        overlay.to_string()
+        render_human_toml(&mut overlay)
     };
-    write_mode_0600(path, &text)
+    write_mode_0600(path, &text)?;
+    if let Some(want) = doc.install_absgui {
+        let prefs = path
+            .parent()
+            .map(|p| p.join("install-prefs.toml"))
+            .unwrap_or_else(|| PathBuf::from("install-prefs.toml"));
+        write_mode_0600(&prefs, &format!("install_absgui = {want}\n"))?;
+    }
+    Ok(())
 }
 
 fn write_mode_0600(path: &Path, text: &str) -> Result<(), String> {
@@ -59,12 +73,21 @@ fn write_mode_0600(path: &Path, text: &str) -> Result<(), String> {
 
 fn merge_tables(dst: &mut Table, src: &Table) {
     for (key, src_item) in src.iter() {
-        match dst.get_mut(key) {
-            Some(dst_item) if dst_item.is_table() && src_item.is_table() => {
-                if let (Some(d), Some(s)) = (dst_item.as_table_mut(), src_item.as_table()) {
-                    merge_tables(d, s);
-                }
+        if src_item.is_table() || src_item.as_inline_table().is_some() {
+            ensure_std_table(dst, key);
+            let src_table = match src_item.as_table() {
+                Some(t) => t.clone(),
+                None => src_item
+                    .as_inline_table()
+                    .map(|t| t.clone().into_table())
+                    .expect("inline or table"),
+            };
+            if let Some(dst_table) = dst.get_mut(key).and_then(Item::as_table_mut) {
+                merge_tables(dst_table, &src_table);
+                continue;
             }
+        }
+        match dst.get_mut(key) {
             Some(dst_item) => {
                 *dst_item = src_item.clone();
             }
@@ -72,6 +95,13 @@ fn merge_tables(dst: &mut Table, src: &Table) {
                 dst.insert(key, src_item.clone());
             }
         }
+    }
+}
+
+fn ensure_std_table(dst: &mut Table, key: &str) {
+    let inline = dst.get(key).and_then(Item::as_inline_table).cloned();
+    if let Some(inline) = inline {
+        dst.insert(key, Item::Table(inline.into_table()));
     }
 }
 
@@ -124,6 +154,98 @@ default = "arch"
         assert!(text.contains("# keep this comment"));
         assert!(text.contains("mystery_key"));
         assert!(text.contains("chroot"));
+        assert!(text.contains("[paths]"));
+        assert!(!text.contains("paths = {"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_expands_inline_tables_and_spaces_sections() {
+        let dir = std::env::temp_dir().join(format!(
+            "absgui_inline_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abs.toml");
+        std::fs::write(
+            &path,
+            r#"config_version = 1
+manual_update_packages = ["curl", "wget"]
+skip_install_packages = []
+paths = { packages_path = "/tmp/abs-test/packages", chroot_base_path = "/tmp/abs-test/chroot", ready_made_packages_path = "/tmp/abs-test/ready" }
+build = { default_environment = "local" }
+system_update = { command_to_update_repositories = "pacman -Sy", command_to_perform_system_update = "pacman -Syu", ignore_flag = "--ignore", ignore_packages = [] }
+repositories = { default = "arch" }
+"#,
+        )
+        .unwrap();
+        let doc = load_config(&path).expect("load");
+        save_config(&path, &doc).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[paths]"), "{text}");
+        assert!(text.contains("[build]"), "{text}");
+        assert!(text.contains("[system_update]"), "{text}");
+        assert!(text.contains("[repositories]"), "{text}");
+        assert!(!text.contains("paths = {"), "{text}");
+        assert!(!text.contains("build = {"), "{text}");
+        assert!(text.contains("\n    \"curl\",\n    \"wget\",\n"), "{text}");
+        let paths_at = text.find("[paths]").expect("[paths]");
+        assert!(
+            text[..paths_at].ends_with("\n\n"),
+            "blank line before [paths]:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_removes_root_lang_when_unset() {
+        let dir = std::env::temp_dir().join(format!(
+            "absgui_lang_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abs.toml");
+        std::fs::write(
+            &path,
+            r#"config_version = 1
+lang = "de"
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/abs-test/packages"
+chroot_base_path = "/tmp/abs-test/chroot"
+ready_made_packages_path = "/tmp/abs-test/ready"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+"#,
+        )
+        .unwrap();
+        let mut doc = load_config(&path).expect("load");
+        assert_eq!(doc.lang.as_deref(), Some("de"));
+        doc.lang = None;
+        save_config(&path, &doc).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.lines().any(|l| l.trim().starts_with("lang")),
+            "lang key should be removed: {text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

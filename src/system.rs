@@ -10,7 +10,7 @@ pub enum SystemUpdateMode {
     PerformUpdateNoRefresh,
 }
 
-fn is_root() -> bool {
+pub(crate) fn is_root() -> bool {
     if let Ok(output) = std::process::Command::new("id").arg("-u").output()
         && let Ok(uid_str) = std::str::from_utf8(&output.stdout)
         && let Ok(uid) = uid_str.trim().parse::<u32>()
@@ -23,7 +23,10 @@ fn is_root() -> bool {
     false
 }
 
-fn transform_system_update_argv(mut argv: Vec<String>, is_root_user: bool) -> Vec<String> {
+pub(crate) fn transform_system_update_argv(
+    mut argv: Vec<String>,
+    is_root_user: bool,
+) -> Vec<String> {
     let cmd = argv.first().map(String::as_str).unwrap_or("");
     if (cmd == "pacman" || cmd.ends_with("/pacman")) && !is_root_user {
         argv.insert(0, "sudo".into());
@@ -31,7 +34,64 @@ fn transform_system_update_argv(mut argv: Vec<String>, is_root_user: bool) -> Ve
     argv
 }
 
-fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
+fn argv_has_flag(argv: &[String], flag: &str) -> bool {
+    let eq = format!("{flag}=");
+    argv.iter().any(|a| a == flag || a.starts_with(&eq))
+}
+
+fn push_flag(argv: &mut Vec<String>, flag: &str) {
+    if !argv_has_flag(argv, flag) {
+        argv.push(flag.into());
+    }
+}
+
+fn push_flag_value(argv: &mut Vec<String>, flag: &str, value: &str) {
+    if !argv_has_flag(argv, flag) {
+        argv.push(flag.into());
+        argv.push(value.into());
+    }
+}
+
+fn update_helper_bin(argv: &[String]) -> &str {
+    let mut i = 0;
+    if argv
+        .first()
+        .is_some_and(|c| c == "sudo" || c.ends_with("/sudo"))
+    {
+        i = 1;
+    }
+    argv.get(i)
+        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+        .unwrap_or("")
+}
+
+/// When launched from absgui, skip pacman/yay/paru/pikaur confirmation menus
+/// (e.g. yay's "Packages to exclude"). The GUI reply field is for abs's own
+/// prompts (install compiled artifacts), not the helper's upgrade TUI.
+pub(crate) fn apply_noninteractive_update_flags(argv: &mut Vec<String>, gui: bool) {
+    if !gui {
+        return;
+    }
+    push_flag(argv, "--noconfirm");
+    match update_helper_bin(argv) {
+        "yay" => {
+            // `--noconfirm` still leaves yay's numbered exclude/clean/diff/edit menus.
+            push_flag_value(argv, "--answerupgrade", "None");
+            push_flag_value(argv, "--answerclean", "None");
+            push_flag_value(argv, "--answerdiff", "None");
+            push_flag_value(argv, "--answeredit", "None");
+        }
+        "paru" => {
+            push_flag(argv, "--skipreview");
+        }
+        "pikaur" => {
+            push_flag(argv, "--noedit");
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
     let held = crate::held::held_names(config);
     let raw: Vec<String> = config
         .system_update
@@ -51,6 +111,7 @@ fn packages_ignored_during_system_update(config: &Config) -> Vec<String> {
 ///
 /// Returns `false` when a kernel PGO pipeline is in progress and the update was skipped.
 pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
+    crate::utils::apply_gui_nested_sudo_askpass();
     let active = crate::pgo::active_pipelines(config);
     if !active.is_empty() {
         warn_system_update_blocked_during_pgo(&active, mode);
@@ -75,6 +136,8 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
         Err(e) => die!("Invalid system update command: {e}"),
     };
 
+    apply_noninteractive_update_flags(&mut argv, std::env::var_os("ABS_GUI").is_some());
+
     for pkg in packages_ignored_during_system_update(config) {
         argv.push(config.system_update.ignore_flag.clone());
         argv.push(pkg);
@@ -97,7 +160,7 @@ fn system_update_mode_label(mode: SystemUpdateMode) -> &'static str {
     }
 }
 
-fn warn_system_update_blocked_during_pgo(
+pub(crate) fn warn_system_update_blocked_during_pgo(
     pipelines: &[crate::pgo::ActivePgoPipeline],
     mode: SystemUpdateMode,
 ) {
@@ -160,7 +223,6 @@ mod tests {
                 check_for_update_on_startup: None,
                 auto_update_on_startup: None,
                 self_update_at_updates: None,
-                self_update_raw_url: None,
                 self_update_install_path: None,
                 install_testing_phase_archlinux_packages: None,
             },
@@ -179,13 +241,14 @@ mod tests {
             packages: Default::default(),
             check_for_update_on_startup: false,
             auto_update_on_startup: false,
-            self_update_raw_url: String::new(),
             self_update_install_path: String::new(),
             self_update_use_pacman: None,
             self_update_at_updates: false,
+            install_absgui: None,
             install_testing_phase_archlinux_packages: false,
             compilers: Default::default(),
             ramdisk: Default::default(),
+            lang: None,
         }
     }
 
@@ -317,5 +380,68 @@ mod tests {
             transform_system_update_argv(vec!["yay".into(), "-Su".into()], false),
             vec!["yay", "-Su"]
         );
+    }
+
+    #[test]
+    fn gui_flags_skipped_when_not_gui() {
+        let mut argv = vec!["yay".into(), "-Syu".into()];
+        apply_noninteractive_update_flags(&mut argv, false);
+        assert_eq!(argv, vec!["yay", "-Syu"]);
+    }
+
+    #[test]
+    fn gui_yay_gets_noconfirm_and_answer_flags() {
+        let mut argv = vec!["yay".into(), "-Syu".into()];
+        apply_noninteractive_update_flags(&mut argv, true);
+        assert!(argv.iter().any(|a| a == "--noconfirm"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--answerupgrade" && w[1] == "None")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--answerclean" && w[1] == "None")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--answerdiff" && w[1] == "None")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--answeredit" && w[1] == "None")
+        );
+    }
+
+    #[test]
+    fn gui_does_not_duplicate_existing_flags() {
+        let mut argv = vec![
+            "yay".into(),
+            "-Syu".into(),
+            "--noconfirm".into(),
+            "--answerupgrade".into(),
+            "All".into(),
+        ];
+        apply_noninteractive_update_flags(&mut argv, true);
+        assert_eq!(argv.iter().filter(|a| *a == "--noconfirm").count(), 1);
+        assert_eq!(argv.iter().filter(|a| *a == "--answerupgrade").count(), 1);
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--answerupgrade" && w[1] == "All")
+        );
+    }
+
+    #[test]
+    fn gui_paru_gets_skipreview() {
+        let mut argv = vec!["paru".into(), "-Syu".into()];
+        apply_noninteractive_update_flags(&mut argv, true);
+        assert!(argv.contains(&"--noconfirm".into()));
+        assert!(argv.contains(&"--skipreview".into()));
+    }
+
+    #[test]
+    fn gui_pacman_gets_noconfirm_only() {
+        let mut argv = vec!["sudo".into(), "pacman".into(), "-Syu".into()];
+        apply_noninteractive_update_flags(&mut argv, true);
+        assert_eq!(argv, vec!["sudo", "pacman", "-Syu", "--noconfirm"]);
     }
 }

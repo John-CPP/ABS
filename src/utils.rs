@@ -8,6 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
+/// Installed hicolor sizes for AbsGui (keep in sync with Makefile and aur/PKGBUILD).
+pub const ABSGUI_ICON_SIZES: &[u32] = &[32, 48, 64, 128, 256, 512];
+
+pub fn absgui_hicolor_icon_path(size: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/usr/share/icons/hicolor/{size}x{size}/apps/absgui.png"
+    ))
+}
+
 static TRACKED_CHILDREN: OnceLock<Mutex<HashMap<u32, ()>>> = OnceLock::new();
 static EXIT_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SKIP_EXIT_PAUSE: AtomicBool = AtomicBool::new(false);
@@ -577,6 +586,7 @@ pub fn curl_base_args() -> Vec<String> {
 }
 
 /// Write `contents` with an explicit Unix mode (and chmod if the file already existed).
+/// Writes to a sibling temp file then renames so a crash cannot leave a truncated target.
 pub fn write_file_mode(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
     use std::fs::OpenOptions;
     use std::io::Write as _;
@@ -585,6 +595,11 @@ pub fn write_file_mode(path: &Path, contents: &str, mode: u32) -> Result<(), Str
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
     }
+    let tmp = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -592,17 +607,23 @@ pub fn write_file_mode(path: &Path, contents: &str, mode: u32) -> Result<(), Str
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(mode);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    let write_err = |e| format!("failed to write {}: {e}", tmp.display());
+    let result = (|| {
+        let mut file = options.open(&tmp).map_err(write_err)?;
+        file.write_all(contents.as_bytes()).map_err(write_err)?;
+        file.sync_all().map_err(write_err)?;
+        fs::rename(&tmp, path).map_err(|e| format!("failed to replace {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 fn format_command_error(
@@ -635,7 +656,12 @@ fn format_command_error(
 
 fn is_readonly_command(cmd: &str, args: &[&str]) -> bool {
     if cmd == "pacman" {
-        return args.first().is_some_and(|a| *a == "-Q" || *a == "--query");
+        return args
+            .first()
+            .is_some_and(|a| *a == "-Q" || *a == "-Qu" || *a == "--query");
+    }
+    if cmd == "checkupdates" {
+        return true;
     }
     if cmd == "vercmp" {
         return true;
@@ -1004,12 +1030,14 @@ pub fn render_command_line(cmd: &str, args: &[&str]) -> String {
     }
 }
 
-/// True when abs should print `$ command` lines before spawning (absgui log / `-v` only).
+/// True when abs should print `$ command` lines and dump captured stdout (CLI `-v` only).
+/// Not tied to `ABS_GUI`: that flag is for askpass / no exit-pause, not verbose tracing.
+/// Dumping curl/GitHub JSON into absgui froze the log widget.
 fn should_echo_commands() -> bool {
-    crate::is_verbose_mode() || std::env::var_os("ABS_GUI").is_some()
+    crate::is_verbose_mode()
 }
 
-/// Print a command to stdout before execution (absgui build logs and `-v` only).
+/// Print a command to stdout before execution (`-v` only).
 pub fn echo_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) {
     if !should_echo_commands() {
         return;
@@ -1063,6 +1091,43 @@ pub fn shell_sudo() -> &'static str {
         "sudo -A"
     } else {
         "sudo"
+    }
+}
+
+/// When launched from absgui, prepend a `sudo -A` wrapper to `PATH` so yay/paru/makepkg
+/// (which invoke bare `sudo`) open the graphical askpass dialog instead of a hidden TTY prompt.
+pub fn apply_gui_nested_sudo_askpass() {
+    if !use_sudo_askpass() {
+        return;
+    }
+    let real = ["/usr/bin/sudo", "/bin/sudo"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file());
+    let Some(real) = real else {
+        return;
+    };
+    let Some(cache) = dirs::cache_dir() else {
+        return;
+    };
+    let dir = cache.join("abs").join("sudo-a");
+    let wrapper = dir.join("sudo");
+    let script = format!("#!/bin/sh\nexec {real} -A \"$@\"\n");
+    if write_file_mode(&wrapper, &script, 0o700).is_err() {
+        return;
+    }
+    let dir_s = dir.to_string_lossy().into_owned();
+    let path = std::env::var("PATH").unwrap_or_default();
+    if path.split(':').next() == Some(dir_s.as_str()) {
+        return;
+    }
+    let new_path = if path.is_empty() {
+        dir_s
+    } else {
+        format!("{dir_s}:{path}")
+    };
+    // SAFETY: process-global PATH tweak for GUI children; abs is single-threaded here.
+    unsafe {
+        std::env::set_var("PATH", new_path);
     }
 }
 
@@ -1677,7 +1742,7 @@ fn run_shell_labeled(
     }
 }
 
-fn command_exists(name: &str) -> bool {
+pub(crate) fn command_exists(name: &str) -> bool {
     Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {name} >/dev/null 2>&1"))
@@ -1940,12 +2005,7 @@ pub fn prime_sudo_for_session() -> Result<(), String> {
         if std::env::var_os("SUDO_ASKPASS").is_some() {
             return run_command("sudo", &["-v"], None::<&str>);
         }
-        return Err(
-            "sudo needs a password but no graphical askpass program was found. Install one of \
-             ksshaskpass / lxqt-openssh-askpass / x11-ssh-askpass / zenity / kdialog, or enable \
-             passwordless sudo for the build commands."
-                .into(),
-        );
+        return Err(abs_i18n::t("gui.msg.require_askpass").into());
     }
     if !io::stdin().is_terminal() && std::env::var_os("SUDO_ASKPASS").is_some() {
         return run_command("sudo", &["-v"], None::<&str>);

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// declared before any table fields (sub-structs / maps) so the emitted TOML is
 /// always valid. Fields the CLI requires (no `#[serde(default)]` on its side) are
 /// always serialized; optional ones are skipped when empty to keep the file clean.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigDocument {
     #[serde(default = "default_config_version")]
     pub config_version: u32,
@@ -20,11 +20,13 @@ pub struct ConfigDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update_at_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub self_update_raw_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update_install_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update_use_pacman: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_absgui: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_testing_phase_archlinux_packages: Option<bool>,
 
@@ -62,7 +64,7 @@ fn default_config_version() -> u32 {
 }
 
 /// A package held at a fixed version with optional auto-recompile triggers.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct HeldPackage {
     pub name: String,
     /// `pkgver-pkgrel` (epoch may be embedded in pkgver).
@@ -71,7 +73,7 @@ pub struct HeldPackage {
     pub auto_recompile_trigger: AutoRecompileTrigger,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AutoRecompileTrigger {
     /// Trigger package name -> last recorded installed version.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -103,7 +105,7 @@ impl HeldPackage {
     /// Parse triggers from commas and/or newlines (`name` or `name=version`).
     pub fn set_triggers_from_text(&mut self, text: &str) {
         let mut map = HashMap::new();
-        for part in text.split(|c: char| c == ',' || c == '\n') {
+        for part in text.split([',', '\n']) {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -121,13 +123,13 @@ impl HeldPackage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompilerSection {
     pub cc: String,
     pub cxx: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathsSection {
     pub packages_path: String,
     pub chroot_base_path: String,
@@ -147,7 +149,7 @@ impl Default for PathsSection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildSection {
     #[serde(default = "default_local")]
     pub default_environment: String,
@@ -220,7 +222,7 @@ impl Default for BuildSection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SystemUpdateSection {
     #[serde(default = "default_pacman_sy", alias = "command")]
     pub command_to_update_repositories: String,
@@ -260,7 +262,7 @@ impl Default for SystemUpdateSection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RamdiskSection {
     #[serde(default)]
     pub enabled: bool,
@@ -332,7 +334,7 @@ fn is_default_priority(v: &usize) -> bool {
     *v == default_compilation_priority()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PackageSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -376,7 +378,7 @@ pub struct PackageSection {
     pub pgo: Option<PgoSection>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KernelSection {
     #[serde(default, rename = "_cpusched", skip_serializing_if = "Option::is_none")]
     pub cpusched: Option<String>,
@@ -422,7 +424,7 @@ pub struct KernelSection {
     pub cc_harder: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PgoSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -556,9 +558,10 @@ impl Default for ConfigDocument {
             check_for_update_on_startup: None,
             auto_update_on_startup: None,
             self_update_at_updates: None,
-            self_update_raw_url: None,
             self_update_install_path: None,
             self_update_use_pacman: None,
+            install_absgui: None,
+            lang: None,
             install_testing_phase_archlinux_packages: None,
             manual_update_packages: Vec::new(),
             skip_install_packages: Vec::new(),

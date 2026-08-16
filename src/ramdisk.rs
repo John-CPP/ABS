@@ -284,22 +284,85 @@ fn is_mount_point(path: &Path) -> bool {
         })
 }
 
-pub fn mem_available_mb() -> Result<u64, String> {
+fn meminfo_kb(key: &str) -> Result<u64, String> {
     let content = fs::read_to_string("/proc/meminfo")
         .map_err(|e| format!("failed to read /proc/meminfo: {}", e))?;
+    let prefix = format!("{key}:");
     for line in content.lines() {
-        if let Some(kb) = line.strip_prefix("MemAvailable:") {
-            let kb = kb
-                .trim()
-                .strip_suffix(" kB")
-                .unwrap_or(kb.trim())
-                .trim()
-                .parse::<u64>()
-                .map_err(|e| format!("failed to parse MemAvailable: {}", e))?;
-            return Ok(kb / 1024);
-        }
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let kb = rest
+            .trim()
+            .strip_suffix(" kB")
+            .unwrap_or(rest.trim())
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("failed to parse {key}: {e}"))?;
+        return Ok(kb);
     }
-    Err("MemAvailable not found in /proc/meminfo".into())
+    Err(format!("{key} not found in /proc/meminfo"))
+}
+
+pub fn mem_available_mb() -> Result<u64, String> {
+    Ok(meminfo_kb("MemAvailable")? / 1024)
+}
+
+pub fn mem_total_bytes() -> Result<u64, String> {
+    Ok(meminfo_kb("MemTotal")?.saturating_mul(1024))
+}
+
+/// Convert a tmpfs `size=` value (e.g. `16G`, `50%`) to bytes.
+pub fn ramdisk_size_bytes(size: &str, mem_total_bytes: u64) -> Result<u64, String> {
+    validate_ramdisk_size(size)?;
+    let s = size.trim();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let n: u64 = s[..i]
+        .parse()
+        .map_err(|e| format!("invalid ramdisk.size {s:?}: {e}"))?;
+    match &s[i..] {
+        "" => Ok(n),
+        "%" => {
+            if n > 100 {
+                return Err(format!("ramdisk.size {s:?} cannot exceed 100% of RAM"));
+            }
+            Ok(mem_total_bytes.saturating_mul(n) / 100)
+        }
+        "k" | "K" | "ki" | "Ki" => n
+            .checked_mul(1024)
+            .ok_or_else(|| format!("ramdisk.size {s:?} is too large")),
+        "m" | "M" | "mi" | "Mi" => n
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| format!("ramdisk.size {s:?} is too large")),
+        "g" | "G" | "gi" | "Gi" => n
+            .checked_mul(1024 * 1024 * 1024)
+            .ok_or_else(|| format!("ramdisk.size {s:?} is too large")),
+        "t" | "T" | "ti" | "Ti" => n
+            .checked_mul(1024u64.pow(4))
+            .ok_or_else(|| format!("ramdisk.size {s:?} is too large")),
+        other => Err(format!(
+            "invalid ramdisk.size suffix {other:?} (use k/m/g/t or %)"
+        )),
+    }
+}
+
+/// Absolute sizes must not exceed installed RAM. `50%` is always within RAM.
+pub fn ensure_ramdisk_size_fits_ram(size: &str, mem_total_bytes: u64) -> Result<(), String> {
+    if mem_total_bytes == 0 {
+        return Ok(());
+    }
+    let bytes = ramdisk_size_bytes(size, mem_total_bytes)?;
+    if bytes > mem_total_bytes {
+        let ram_g = mem_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        return Err(format!(
+            "ramdisk.size {size:?} is larger than system RAM ({ram_g:.1}G)"
+        ));
+    }
+    Ok(())
 }
 
 pub fn workdir_key(repo_dir: &Path, packages_path: &str) -> String {
@@ -812,6 +875,11 @@ fn mount_session(config: &Config) -> Result<RamdiskSession, String> {
             available,
             config.ramdisk.min_free_ram_mb
         );
+    }
+    if let Ok(total) = mem_total_bytes()
+        && let Err(e) = ensure_ramdisk_size_fits_ram(&config.ramdisk.size, total)
+    {
+        ewarn!("[ramdisk] {e}");
     }
 
     let mount_point = PathBuf::from(&config.ramdisk.mount_point);
@@ -1380,5 +1448,11 @@ packages = false
         assert!(validate_ramdisk_size("16G,uid=0").is_err());
         assert!(validate_ramdisk_mode("0755").is_ok());
         assert!(validate_ramdisk_mode("0777,noexec").is_err());
+        let ram_32g = 32 * 1024 * 1024 * 1024;
+        assert_eq!(ramdisk_size_bytes("16G", ram_32g).unwrap(), ram_32g / 2);
+        assert_eq!(ramdisk_size_bytes("50%", ram_32g).unwrap(), ram_32g / 2);
+        assert!(ensure_ramdisk_size_fits_ram("16G", ram_32g).is_ok());
+        assert!(ensure_ramdisk_size_fits_ram("169G", ram_32g).is_err());
+        assert!(ensure_ramdisk_size_fits_ram("150%", ram_32g).is_err());
     }
 }

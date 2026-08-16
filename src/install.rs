@@ -395,6 +395,20 @@ fn install_package_files_auto(files: &[PathBuf]) {
     }
 }
 
+fn read_stdin_line() -> Option<String> {
+    let mut input = String::new();
+    stdin_read_to_line(io::stdin().read_line(&mut input), input)
+}
+
+/// `None` on EOF or I/O error so a closed GUI pipe is never treated as "accept defaults".
+fn stdin_read_to_line(result: io::Result<usize>, buf: String) -> Option<String> {
+    match result {
+        Ok(0) => None,
+        Ok(_) => Some(buf),
+        Err(_) => None,
+    }
+}
+
 fn prompt_for_selection(files: &[PathBuf]) -> Option<Vec<PathBuf>> {
     if files.is_empty() {
         return Some(Vec::new());
@@ -405,10 +419,10 @@ fn prompt_for_selection(files: &[PathBuf]) -> Option<Vec<PathBuf>> {
         loop {
             print!("Install it? [Y/n] ");
             let _ = io::stdout().flush();
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_err() {
-                return None;
-            }
+            let input = match read_stdin_line() {
+                Some(v) => v,
+                None => return None,
+            };
             let v = input.trim().to_lowercase();
             if v.is_empty() || v == "y" || v == "yes" {
                 return Some(vec![files[0].clone()]);
@@ -427,10 +441,10 @@ fn prompt_for_selection(files: &[PathBuf]) -> Option<Vec<PathBuf>> {
     loop {
         print!("Enter numbers to install (e.g. 1,2 or 1-3), empty=all, n=skip: ");
         let _ = io::stdout().flush();
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            return None;
-        }
+        let input = match read_stdin_line() {
+            Some(v) => v,
+            None => return None,
+        };
         let v = input.trim().replace(' ', "");
         if v.is_empty() {
             return Some(files.to_vec());
@@ -619,6 +633,26 @@ fn install_artifacts_inner(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn eof_is_not_empty_yes() {
+        assert_eq!(stdin_read_to_line(Ok(0), String::new()), None);
+        assert_eq!(
+            stdin_read_to_line(Ok(1), "\n".into()).as_deref(),
+            Some("\n")
+        );
+        assert_eq!(
+            stdin_read_to_line(Ok(2), "n\n".into()).as_deref(),
+            Some("n\n")
+        );
+        assert_eq!(
+            stdin_read_to_line(
+                Err(io::Error::new(io::ErrorKind::Other, "closed")),
+                String::new()
+            ),
+            None
+        );
+    }
 
     #[test]
     fn test_parse_pkgname_and_version() {

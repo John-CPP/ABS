@@ -1,0 +1,15 @@
+[package]
+name = "abs-i18n"
+version = "2.0.0"
+edition = "2021"
+license = "CC-BY-4.0"
+description = "Compiled translation catalogs for abs and absgui"
+publish = false
+build = "build.rs"
+
+[dependencies]
+phf = { version = "0.14", default-features = false }
+
+[build-dependencies]
+phf_codegen = "0.14"
+toml = "1.1.2"

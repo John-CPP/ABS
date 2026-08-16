@@ -87,7 +87,9 @@ fn save_document(path: &Path, doc: &DocumentMut) {
             e
         );
     }
-    if let Err(e) = crate::utils::write_file_mode(path, &doc.to_string(), 0o600) {
+    let mut doc = doc.clone();
+    let text = crate::toml_pretty::render_human_toml(&mut doc);
+    if let Err(e) = crate::utils::write_file_mode(path, &text, 0o600) {
         die!("Failed to write config '{}': {}", path.display(), e);
     }
 }

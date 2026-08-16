@@ -12,6 +12,7 @@ mod held;
 mod install;
 mod package_pattern;
 mod package_spec;
+mod pending_updates;
 mod pgo;
 mod pgo_benchmark;
 mod pkgbuild;
@@ -19,6 +20,7 @@ mod purge;
 mod ramdisk;
 mod self_update;
 mod system;
+mod toml_pretty;
 mod upstream;
 mod utils;
 mod wizard;
@@ -304,13 +306,33 @@ fn main() {
         die!("Invalid --ramdisk {:?}: {}", code, e);
     }
 
+    config::apply_saved_lang();
+
     if cli.configure.is_some() {
         config::Config::open_in_editor(cli.configure.as_deref().filter(|s| !s.is_empty()));
         return;
     }
 
+    if let Some(code) = &cli.set_default_lang {
+        config::run_set_default_lang(code);
+        return;
+    }
+
     if cli.purge {
         purge::run(cli.yes);
+        return;
+    }
+
+    if cli.config_wizard_form {
+        config_wizard::run_form();
+        return;
+    }
+    if cli.config_wizard_check {
+        config_wizard::run_check();
+        return;
+    }
+    if cli.config_wizard_apply {
+        config_wizard::run_apply();
         return;
     }
 
@@ -323,7 +345,16 @@ fn main() {
         config_wizard::offer_first_run(cli.yes);
     }
 
+    if config::config_exists() {
+        config_wizard::offer_config_gap_fill(cli.yes);
+    }
+
     let config = config::Config::load_config();
+
+    if cli.purge_abs_install {
+        purge::run_abs_install(&config, cli.yes);
+        return;
+    }
 
     if cli.wizard.is_some() {
         wizard::run_wizard(&cli, &config);
@@ -350,8 +381,25 @@ fn main() {
         return;
     }
 
+    if cli.pending_updates {
+        pending_updates::print_pending(&config, cli.json);
+        return;
+    }
+    if cli.install_repo_updates {
+        if let Err(e) = pending_updates::install_repo_updates(&config, &cli.packages) {
+            die!("{}", e);
+        }
+        return;
+    }
+    if let Some(pkg) = &cli.install_aur {
+        if let Err(e) = pending_updates::install_aur(&config, pkg) {
+            die!("{}", e);
+        }
+        return;
+    }
+
     if cli.check_update {
-        match self_update::check_for_update(&config.self_update_raw_url) {
+        match self_update::check_for_update() {
             Ok((true, latest)) => {
                 println!(
                     "{} A new version of ABS is available: {} (current: {}). Run 'abs --self-update' to update!",
@@ -374,8 +422,24 @@ fn main() {
     }
 
     if cli.self_update {
-        if let Err(e) = self_update::run_self_update(&config, false) {
-            die!("{}", e);
+        match self_update::run_self_update(&config, false) {
+            Ok(_) => {}
+            Err(e) => {
+                if self_update::is_retryable_self_update_error(&e) {
+                    ewarn!("{}", e);
+                    if purge::offer_self_update_retry(cli.yes) {
+                        blog!("Purging ABS git checkout and retrying...");
+                        if let Err(pe) = purge::remove_abs_install_checkout(&config) {
+                            die!("{pe} (self-update also failed: {e})");
+                        }
+                        if let Err(e2) = self_update::run_self_update(&config, false) {
+                            die!("{}", e2);
+                        }
+                        return;
+                    }
+                }
+                die!("{}", e);
+            }
         }
         return;
     }
@@ -388,7 +452,6 @@ fn main() {
     // Handle background update check on startup
     let update_notifier = Arc::new(Mutex::new(None));
     let update_notifier_clone = Arc::clone(&update_notifier);
-    let raw_url = config.self_update_raw_url.clone();
     // Skip redundant background update checks if we are running synchronous auto-updates,
     // or about to start an interactive build (PGO / kernel) where curl output would race with
     // `sudo -v` on the same terminal, or when the invocation will exit immediately (e.g. `abs -v`).
@@ -404,7 +467,7 @@ fn main() {
         || (!will_run_without_packages(&cli) && cli.packages.is_empty());
     if config.check_for_update_on_startup && !skip_background {
         std::thread::spawn(move || {
-            if let Ok((true, latest)) = self_update::check_for_update(&raw_url)
+            if let Ok((true, latest)) = self_update::check_for_update()
                 && let Ok(mut guard) = update_notifier_clone.lock()
             {
                 *guard = Some(latest);

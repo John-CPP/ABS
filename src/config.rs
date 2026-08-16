@@ -1,10 +1,12 @@
 use crate::die;
 use crate::utils::run_command;
+use crate::{blog, ewarn};
 use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, value};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -29,8 +31,6 @@ pub struct Config {
     pub check_for_update_on_startup: bool,
     #[serde(default = "default_auto_update_on_startup")]
     pub auto_update_on_startup: bool,
-    #[serde(default = "default_self_update_raw_url")]
-    pub self_update_raw_url: String,
     #[serde(default = "default_self_update_install_path")]
     pub self_update_install_path: String,
     /// When `true` (default), `--self-update` builds `aur/PKGBUILD` into
@@ -42,6 +42,14 @@ pub struct Config {
     pub self_update_use_pacman: Option<bool>,
     #[serde(default = "default_self_update_at_updates")]
     pub self_update_at_updates: bool,
+    /// When true, self-update/reinstall includes AbsGui (`absgui` + `abs-full`).
+    /// Unset falls back to `install-prefs.toml`, then to whether `absgui` is already installed.
+    #[serde(default)]
+    pub install_absgui: Option<bool>,
+    /// UI language for abs (`en`, `de`, `es`, `ar`, `ru`, `zh`, `ja`).
+    /// Missing uses the system locale when it is one of those, otherwise English.
+    #[serde(default)]
+    pub lang: Option<String>,
     #[serde(default = "default_install_testing_phase_archlinux_packages")]
     pub install_testing_phase_archlinux_packages: bool,
     #[serde(default)]
@@ -82,10 +90,6 @@ fn default_self_update_install_path() -> String {
 
 fn default_self_update_use_pacman() -> Option<bool> {
     Some(true)
-}
-
-fn default_self_update_raw_url() -> String {
-    "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml".to_string()
 }
 
 fn default_ramdisk_enabled() -> bool {
@@ -262,7 +266,6 @@ pub struct BuildConfig {
     pub check_for_update_on_startup: Option<bool>,
     pub auto_update_on_startup: Option<bool>,
     pub self_update_at_updates: Option<bool>,
-    pub self_update_raw_url: Option<String>,
     pub self_update_install_path: Option<String>,
     pub install_testing_phase_archlinux_packages: Option<bool>,
 }
@@ -574,10 +577,176 @@ pub fn example_config_text() -> &'static str {
     CONFIG_TEMPLATE
 }
 
+fn example_text_with_lang(code: &str) -> String {
+    upsert_lang_in_toml(CONFIG_TEMPLATE, code).expect("abs.toml.example is valid TOML")
+}
+
+fn upsert_lang_in_toml(text: &str, code: &str) -> Result<String, String> {
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e| format!("invalid TOML, lang not written: {e}"))?;
+    doc["lang"] = value(code);
+    Ok(crate::toml_pretty::render_human_toml(&mut doc))
+}
+
+fn write_toml_text(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+    crate::utils::write_file_mode(path, text, 0o600)
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Apply `lang` from the user abs.toml if present; otherwise the system locale.
+pub fn apply_saved_lang() {
+    let path = user_config_path();
+    if path.exists()
+        && let Ok(text) = fs::read_to_string(&path)
+        && let Some(lang) = abs_i18n::peek_lang_toml(&text)
+    {
+        abs_i18n::set_lang(lang);
+        return;
+    }
+    abs_i18n::init_from_system();
+}
+
+fn absgui_settings_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("abs").join("absgui-settings.toml"))
+        .unwrap_or_else(|| PathBuf::from("absgui-settings.toml"))
+}
+
+/// `abs --set-default-lang=`: write abs.toml always; write AbsGui only if it has no lang yet.
+pub fn run_set_default_lang(code: &str) {
+    let Some(lang) = abs_i18n::Lang::parse(code) else {
+        let list = abs_i18n::Lang::ALL
+            .iter()
+            .map(|l| l.code())
+            .collect::<Vec<_>>()
+            .join(", ");
+        die!(
+            "{}",
+            abs_i18n::tf("cli.set_lang.unknown", &[("code", code), ("list", &list)])
+        );
+    };
+    let path = user_config_path();
+    let text = if path.exists() {
+        fs::read_to_string(&path).unwrap_or_else(|e| die!("Failed to read {}: {e}", path.display()))
+    } else {
+        CONFIG_TEMPLATE.to_string()
+    };
+    let rendered = match upsert_lang_in_toml(&text, lang.code()) {
+        Ok(s) => s,
+        Err(e) => die!("{}: {e}", path.display()),
+    };
+    if let Err(e) = write_toml_text(&path, &rendered) {
+        die!("{e}");
+    }
+    abs_i18n::set_lang(lang);
+    blog!(
+        "{}",
+        abs_i18n::tf(
+            "cli.set_lang.saved",
+            &[
+                ("lang", lang.native_name()),
+                ("path", &path.display().to_string())
+            ]
+        )
+    );
+
+    let gui_path = absgui_settings_path();
+    if gui_path.exists() {
+        let gui_text = match fs::read_to_string(&gui_path) {
+            Ok(t) => t,
+            Err(e) => {
+                ewarn!("Failed to read {}: {e}", gui_path.display());
+                return;
+            }
+        };
+        if let Some(existing) = abs_i18n::peek_lang_toml(&gui_text) {
+            blog!(
+                "{}",
+                abs_i18n::tf(
+                    "cli.set_lang.skipped_gui",
+                    &[("lang", existing.native_name())]
+                )
+            );
+            return;
+        }
+        let rendered = match upsert_lang_in_toml(&gui_text, lang.code()) {
+            Ok(s) => s,
+            Err(e) => {
+                ewarn!("{}: {e}", gui_path.display());
+                return;
+            }
+        };
+        if let Err(e) = write_toml_text(&gui_path, &rendered) {
+            ewarn!("{e}");
+            return;
+        }
+    } else if let Err(e) = write_toml_text(&gui_path, &format!("lang = \"{}\"\n", lang.code())) {
+        ewarn!("{e}");
+        return;
+    }
+    blog!(
+        "{}",
+        abs_i18n::tf("cli.set_lang.saved_gui", &[("lang", lang.native_name())])
+    );
+}
+
 pub fn user_config_path() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("abs").join("abs.toml"))
         .unwrap_or_else(|| die!("Could not determine config directory ($XDG_CONFIG_HOME)"))
+}
+
+/// Sidecar next to abs.toml so the installer can remember AbsGui before a config exists.
+pub fn install_prefs_path() -> PathBuf {
+    user_config_path()
+        .parent()
+        .map(|p| p.join("install-prefs.toml"))
+        .unwrap_or_else(|| PathBuf::from("install-prefs.toml"))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct InstallPrefsFile {
+    #[serde(default)]
+    install_absgui: Option<bool>,
+}
+
+pub fn load_install_absgui_pref() -> Option<bool> {
+    let text = fs::read_to_string(install_prefs_path()).ok()?;
+    toml::from_str::<InstallPrefsFile>(&text)
+        .ok()
+        .and_then(|p| p.install_absgui)
+}
+
+pub fn save_install_absgui_pref(want: bool) -> Result<(), String> {
+    let path = install_prefs_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    crate::utils::write_file_mode(&path, &format!("install_absgui = {want}\n"), 0o600)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+pub fn sync_install_absgui_pref_from_toml(text: &str) {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return;
+    };
+    if let Some(v) = value.get("install_absgui").and_then(|v| v.as_bool()) {
+        let _ = save_install_absgui_pref(v);
+    }
+}
+
+/// Config key, then installer sidecar, then whether AbsGui is already installed.
+pub fn resolve_install_absgui(
+    config_value: Option<bool>,
+    sidecar: Option<bool>,
+    gui_installed: bool,
+) -> bool {
+    config_value.or(sidecar).unwrap_or(gui_installed)
 }
 
 pub fn etc_config_path() -> PathBuf {
@@ -619,11 +788,29 @@ pub fn write_example_user_config() -> PathBuf {
         );
     }
 
-    if let Err(e) = crate::utils::write_file_mode(&path, CONFIG_TEMPLATE, 0o600) {
+    let text = example_text_with_lang(abs_i18n::current_lang().code());
+
+    if let Err(e) = crate::utils::write_file_mode(&path, &text, 0o600) {
         die!("Failed to write config file '{}': {}", path.display(), e);
     }
+    sync_install_absgui_pref_from_toml(&text);
 
     path
+}
+
+/// Convert compact inline tables (`paths = { ... }`) to `[paths]` before the editor opens.
+fn rewrite_human_readable_if_needed(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut doc: DocumentMut = text.parse().ok()?;
+    let rendered = crate::toml_pretty::render_human_toml(&mut doc);
+    if rendered == text {
+        return None;
+    }
+    write_toml_text(path, &rendered).ok()?;
+    Some(format!(
+        "Rewrote {} as standard [section] tables with blank lines between sections.",
+        path.display()
+    ))
 }
 
 fn resolve_editor(explicit: Option<&str>) -> String {
@@ -710,6 +897,9 @@ impl Config {
             );
         }
         let editor_str = resolve_editor(editor);
+        if let Some(note) = rewrite_human_readable_if_needed(&path) {
+            println!("{note}");
+        }
         loop {
             run_editor(&editor_str, &path);
 
@@ -846,9 +1036,6 @@ impl Config {
         }
         if let Some(val) = config.build.self_update_at_updates {
             config.self_update_at_updates = val;
-        }
-        if let Some(val) = &config.build.self_update_raw_url {
-            config.self_update_raw_url = val.clone();
         }
         if let Some(val) = &config.build.self_update_install_path {
             config.self_update_install_path = val.clone();
@@ -1185,7 +1372,15 @@ impl Config {
         );
         println!("  auto_update_on_startup: {}", self.auto_update_on_startup);
         println!("  self_update_at_updates: {}", self.self_update_at_updates);
-        println!("  self_update_raw_url: {}", self.self_update_raw_url);
+        println!("  lang: {}", self.lang.as_deref().unwrap_or("(unset)"));
+        println!(
+            "  install_absgui: {}",
+            match self.install_absgui {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "(unset)",
+            }
+        );
         println!(
             "  self_update_install_path: {}",
             self.self_update_install_path
@@ -1645,5 +1840,88 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
 "#;
         let config: Config = toml::from_str(toml_content).unwrap();
         assert!(config.build.clean_chroot_after_compilation);
+    }
+
+    #[test]
+    fn upsert_lang_sets_and_replaces_root_key() {
+        let first = super::upsert_lang_in_toml("config_version = 1\n", "de").unwrap();
+        assert_eq!(abs_i18n::peek_lang_toml(&first), Some(abs_i18n::Lang::De));
+        let second = super::upsert_lang_in_toml(&first, "ja").unwrap();
+        assert_eq!(abs_i18n::peek_lang_toml(&second), Some(abs_i18n::Lang::Ja));
+        assert!(super::upsert_lang_in_toml("[[[not toml", "de").is_err());
+        let nested = "[packages.foo]\nlang = \"ja\"\n";
+        let with_root = super::upsert_lang_in_toml(nested, "de").unwrap();
+        assert!(with_root.contains("lang = \"de\""), "{with_root}");
+        assert_eq!(
+            abs_i18n::peek_lang_toml(nested),
+            None,
+            "nested lang must not count as document language"
+        );
+    }
+
+    #[test]
+    fn example_config_parses_with_injected_lang() {
+        let text = super::example_text_with_lang("es");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.lang.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn set_default_lang_skips_gui_when_lang_already_set() {
+        let gui = "theme = \"dark\"\nlang = \"ja\"\n";
+        assert_eq!(abs_i18n::peek_lang_toml(gui), Some(abs_i18n::Lang::Ja));
+        let without = "theme = \"dark\"\n";
+        assert!(abs_i18n::peek_lang_toml(without).is_none());
+    }
+
+    #[test]
+    fn leftover_self_update_raw_url_is_ignored() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+self_update_raw_url = "https://example.invalid/Cargo.toml"
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+self_update_raw_url = "https://example.invalid/build/Cargo.toml"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.build.default_environment, "local");
+    }
+
+    #[test]
+    fn resolve_install_absgui_prefers_config_then_sidecar_then_installed() {
+        assert!(super::resolve_install_absgui(
+            Some(true),
+            Some(false),
+            false
+        ));
+        assert!(!super::resolve_install_absgui(
+            Some(false),
+            Some(true),
+            true
+        ));
+        assert!(super::resolve_install_absgui(None, Some(true), false));
+        assert!(!super::resolve_install_absgui(None, Some(false), true));
+        assert!(super::resolve_install_absgui(None, None, true));
+        assert!(!super::resolve_install_absgui(None, None, false));
     }
 }

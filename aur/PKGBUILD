@@ -1,13 +1,14 @@
 # ABS — split packages: abs, absgui, abs-full (metapackage)
 #
 # Local build from a git checkout:
-#   cd aur && makepkg -si
+#   cd aur && ./install.sh
+#   (or: make aur from the repo root)
 #
 # Upload to AUR: copy this directory to abs/, set ABS_GIT_URL or use the git source() below.
 
 pkgbase=abs
 pkgname=(abs absgui abs-full)
-pkgver=1.5.0
+pkgver=2.0.0
 pkgrel=1
 pkgdesc='Arch/CachyOS package builder with kernel PGO support'
 arch=('x86_64' 'aarch64')
@@ -15,7 +16,6 @@ url='https://github.com/John-CPP/ABS'
 license=('CC-BY-4.0')
 makedepends=('cargo' 'git' 'gcc' 'llvm' 'clang' 'make' 'pkgconf')
 options=('!debug')
-install_abs=abs.install
 
 if [[ -f "$startdir/../Cargo.toml" ]]; then
   source=()
@@ -46,6 +46,13 @@ depends_absgui=(
 optdepends_absgui=(
   'noto-fonts: recommended font for the iced UI'
   'vulkan-driver: GPU rendering backend for iced'
+  'xdg-desktop-portal: native file and folder dialogs'
+  'xdg-desktop-portal-gtk: file dialogs on Hyprland, Sway, niri, and other compositors without FileChooser'
+  'kdialog: KDE/LXQt file picker when the portal is missing'
+  'zenity: GTK file picker when the portal is missing'
+  'yad: alternative GTK file picker'
+  'qarma: Qt zenity-compatible file picker'
+  'mate-utils: MATE file picker (matedialog) when the portal is missing'
 )
 
 pkgver() {
@@ -74,6 +81,9 @@ build() {
 }
 
 package_abs() {
+  depends=("${depends_abs[@]}")
+  optdepends=("${optdepends_abs[@]}")
+  install=abs.install
   cd "$srcdir/abs"
   install -Dm755 "$srcdir/cargo-target/release/abs" "$pkgdir/usr/bin/abs"
   install -Dm755 assets/pgo-benchmark.sh "$pkgdir/usr/share/abs/pgo-benchmark.sh"
@@ -83,10 +93,16 @@ package_abs() {
 }
 
 package_absgui() {
+  depends=("${depends_absgui[@]}")
+  optdepends=("${optdepends_absgui[@]}")
+  install=absgui.install
   cd "$srcdir/abs"
   install -Dm755 "$srcdir/cargo-target/release/absgui" "$pkgdir/usr/bin/absgui"
   install -Dm644 absgui/absgui.desktop "$pkgdir/usr/share/applications/absgui.desktop"
-  install -Dm644 absgui/assets/icon.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/absgui.png"
+  for s in 32 48 64 128 256 512; do
+    install -Dm644 "absgui/assets/icons/icon_${s}.png" \
+      "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/absgui.png"
+  done
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/absgui/LICENSE"
 }
 

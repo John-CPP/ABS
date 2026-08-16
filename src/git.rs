@@ -328,8 +328,11 @@ pub fn prepare_repo(
             io::stdout().flush().unwrap();
 
             let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_err() {
-                die!("Failed to read from terminal");
+            match io::stdin().read_line(&mut input) {
+                Ok(0) | Err(_) => {
+                    die!("Failed to read from terminal");
+                }
+                Ok(_) => {}
             }
 
             match input.trim().to_lowercase().as_str() {
