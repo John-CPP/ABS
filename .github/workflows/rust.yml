@@ -46,6 +46,10 @@ jobs:
           [[ ${#names[@]} -eq 3 ]] || { echo "expected abs, absgui, and abs-full packages, got: ${names[*]}"; exit 1; }
           notes="$(printf 'Built from %s (pkgver %s).\n\n```\nsudo pacman -U %s %s %s\n```\n' '${{ github.sha }}' "$ver" "${names[0]}" "${names[1]}" "${names[2]}")"
           if gh release view latest >/dev/null 2>&1; then
+            mapfile -t old_assets < <(gh release view latest --json assets --jq '.assets[].name')
+            for asset in "${old_assets[@]}"; do
+              [[ -n "$asset" ]] && gh release delete-asset latest "$asset" -y
+            done
             gh release upload latest --clobber "${pkgs[@]}"
             gh release edit latest --title "ABS ${ver}" --notes "$notes"
           else
