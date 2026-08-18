@@ -3,8 +3,8 @@ use crate::abs_runner::{
     stream_abs_pgo, AbsPgoStreamItem, PendingUpdates, PgoAction, PgoRunHandle, PgoStatus,
 };
 use crate::app_settings::{
-    clamp_terminal_lines_limit, clamp_window_geometry, load_rgba_png, load_window_icon,
-    AppTheme, GuiSettings, ThemePref, TERMINAL_LINES_STEP,
+    clamp_terminal_lines_limit, clamp_window_geometry, load_rgba_png, load_window_icon, AppTheme,
+    GuiSettings, ThemePref, TERMINAL_LINES_STEP,
 };
 use crate::config::{config_path, load_config, save_config, ConfigDocument, PackageSection};
 use crate::dialog;
@@ -31,6 +31,7 @@ use crate::widgets::{
     optional_bool_field, parse_ramdisk_flags, pgo_round_pipeline, pkgbuild_preview_dialog,
     preview_pkgbuild_button, ramdisk_targets_field, scroll_viewport, stepper_number,
     terminal_theme_picker, unsaved_changes_dialog, PathField as WPathField, PathKind as WPathKind,
+    COMMAND_LOG_PAGE_HEIGHT,
 };
 use iced::event;
 use iced::futures::{Stream, StreamExt};
@@ -2817,21 +2818,13 @@ impl App {
             bottom: 16.0,
             left: pad_x,
         };
-        let main: Element<Message> = if self.page == Page::SystemUpdate {
-            container(content)
-                .padding(page_pad)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            scroll_viewport(
-                container(content).padding(page_pad).width(Length::Fill),
-                style::page_scroll(theme),
-                Length::Fill,
-                Length::Fill,
-                page_scroll_id(self.page),
-            )
-        };
+        let main: Element<Message> = scroll_viewport(
+            container(content).padding(page_pad).width(Length::Fill),
+            style::page_scroll(theme),
+            Length::Fill,
+            Length::Fill,
+            page_scroll_id(self.page),
+        );
         let ui: Element<Message> =
             column![self.view_top_nav(theme), main, self.view_status_bar(theme)]
                 .height(Length::Fill)
@@ -4244,7 +4237,7 @@ impl App {
             ViewportId::BuildLog,
             theme,
             self.log_palette(),
-            Length::Fixed(360.0),
+            COMMAND_LOG_PAGE_HEIGHT,
             &self.abs_stdin_draft,
             self.pgo_run.stdin_open(),
         )

@@ -389,6 +389,9 @@ fn terminal_preview_panel<'a>(
         .into()
 }
 
+/// Height of a command log when the surrounding page scrolls (kernel config, system update).
+pub const COMMAND_LOG_PAGE_HEIGHT: Length = Length::Fixed(360.0);
+
 /// Monospace live-output panel used by PGO builds and `abs -RU`.
 #[allow(clippy::too_many_arguments)]
 pub fn command_log<'a>(

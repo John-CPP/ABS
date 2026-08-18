@@ -8,7 +8,7 @@
 
 pkgbase=abs
 pkgname=(abs absgui abs-full)
-pkgver=2.0.0
+pkgver=2.0.1
 pkgrel=1
 pkgdesc='Arch/CachyOS package builder with kernel PGO support'
 arch=('x86_64' 'aarch64')

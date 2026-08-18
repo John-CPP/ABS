@@ -655,7 +655,7 @@ mod tests {
             home: "/home/john".into(),
             kernel: "6.15.0-cachyos".into(),
             pid: 4242,
-            version: "2.0.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
         }
     }
 

@@ -3,7 +3,9 @@ use crate::app_settings::AppTheme;
 use crate::messages::Message;
 use crate::style;
 use crate::terminal_themes::LogPalette;
-use crate::widgets::{command_log, dense_header_cell, dense_table, dense_table_row};
+use crate::widgets::{
+    command_log, dense_header_cell, dense_table, dense_table_row, COMMAND_LOG_PAGE_HEIGHT,
+};
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Alignment, Color, Element, Font, Length, Padding};
 use std::collections::VecDeque;
@@ -131,11 +133,11 @@ pub fn view<'a>(
         crate::messages::ViewportId::UpdateLog,
         theme,
         palette,
-        Length::Fill,
+        COMMAND_LOG_PAGE_HEIGHT,
         stdin_value,
         stdin_enabled,
     ));
-    col.spacing(12).height(Length::Fill).into()
+    col.spacing(12).into()
 }
 
 fn pending_dense_table<'a>(
