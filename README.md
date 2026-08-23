@@ -2,7 +2,7 @@
 
 ABS is a package builder for Arch Linux and CachyOS (and likely other Arch-based distros). The idea is Gentoo-emerge-like: you choose packages, ABS fetches the PKGBUILD, compiles, and can install.
 
-The git `HEAD` of this repository is the working version. There are no GitHub Releases.
+The git `HEAD` of this repository is the working version. GitHub Releases (`v<version>`) publish Arch packages (`abs`, `absgui`, `abs-full`) built from that version.
 
 ---
 
@@ -32,6 +32,8 @@ Config file (first match wins): `$XDG_CONFIG_HOME/abs/abs.toml` (usually `~/.con
 ---
 
 ## Install options
+
+Prebuilt packages: [GitHub Releases](https://github.com/John-CPP/ABS/releases) (`v<version>`). Download the `abs`, `absgui`, and `abs-full` `.pkg.tar.zst` files and install with `sudo pacman -U …`.
 
 `make aur` (or `cd aur && ./install.sh`) builds with `makepkg -s`, then installs **abs**. On a first install (no `~/.config/abs/abs.toml` and no remembered pref) it asks whether to install AbsGui. After that it installs `absgui` and `abs-full` only when that choice is yes.
 
@@ -80,7 +82,7 @@ sudo update-desktop-database /usr/share/applications
 
 ## Update ABS
 
-ABS does not use GitHub Releases. `abs --self-update` compares `Cargo.toml` versions at git **HEAD** of the official repository (`https://github.com/John-CPP/ABS.git`). With `self_update_use_pacman = true` (the default), it looks in `ready_made_packages_path` for already-built packages of that version and installs `abs`, plus `absgui` / `abs-full` when `install_absgui` is true (or unset and AbsGui is already installed). If they are missing, it clones this repo, builds `aur/` with `makepkg` (`PKGDEST` = `ready_made_packages_path`), then upgrades with pacman.
+GitHub Releases (`v<version>`) ship those same Arch packages for `pacman -U`. `abs --self-update` does **not** download Release assets: it compares `Cargo.toml` versions at git **HEAD** of the official repository (`https://github.com/John-CPP/ABS.git`). With `self_update_use_pacman = true` (the default), it looks in `ready_made_packages_path` for already-built packages of that version and installs `abs`, plus `absgui` / `abs-full` when `install_absgui` is true (or unset and AbsGui is already installed). If they are missing, it clones this repo, builds `aur/` with `makepkg` (`PKGDEST` = `ready_made_packages_path`), then upgrades with pacman.
 
 ```bash
 abs --check-update    # print whether HEAD is newer
@@ -247,6 +249,10 @@ Graphical editor for the same `abs.toml`, plus kernel PGO controls:
 absgui
 ```
 
+![AbsGui Kernels page with linux-cachyos](docs/screenshots/absgui-kernels-linux-cachyos.png)
+
+**Kernels** is the catalog (linux-cachyos and variants). **Manage** on a configured kernel (or **Configure** on a new one) opens that kernel’s PGO pipeline, one-shot build, log, and options.
+
 Set `ABS_BINARY` if `abs` is not on `PATH`. Window theme/size: `~/.config/abs/absgui-settings.toml`. Save the config before **Start PGO**. Kernel PGO details are in [Kernel PGO](#kernel-pgo-linux-cachyos) below.
 
 Works on COSMIC as well as other desktops. External commands (system update, PGO in a TTY) use `cosmic-term` or `xdg-terminal-exec` when available; override with `ABSGUI_TERMINAL`. File and folder pickers use the XDG FileChooser portal when the desktop provides it; otherwise AbsGui tries `kdialog`, `zenity`, `matedialog`, `yad`, then `qarma`. Override with `ABS_FILE_DIALOG=portal|kdialog|zenity|matedialog|yad|qarma`. On Hyprland/Sway/niri, install `xdg-desktop-portal-gtk` (or `zenity`/`kdialog`) if Browse does nothing.
@@ -298,7 +304,6 @@ The **System update** page lists pending pacman and AUR upgrades (`abs --pending
 | `--pkg-list=LIST` | Prefill list name for `--wizard` |
 | `--hold` / `--hold-version=` / `--trigger=` / `--unhold` / `--hold-check` | Held packages |
 | `--check-update` / `--self-update` | Compare / install newer ABS from git HEAD. On a failed compile, offers to purge the git checkout and retry |
-| `--kernel-build=PKG` | One-shot kernel build from `[packages.PKG.kernel]` (no PGO) |
 | `--kernel-build=PKG` | One-shot kernel build from `[packages.PKG.kernel]` (no PGO) |
 | `--pgo` / `--pgo-resume` / `--pgo-status` / `--pgo-abort` / `--pgo-restart` | Kernel PGO pipeline |
 | `--pgo-stage` / `--pgo-once` / `--pgo-goto` / `--pgo-keep-stage` / `--pgo-auto` | PGO stage control |
@@ -431,7 +436,7 @@ abs --pgo-status linux-cachyos --json
 
 Profiling uses the bundled `assets/pgo-benchmark.sh` (installed to `/usr/share/abs/pgo-benchmark.sh`) unless you set `benchmark_command`. From a `cargo build` without that file, ABS writes the same script to `~/.local/share/abs/pgo-benchmark.sh`. It expects `cachyos-benchmarker`, `sysbench`, and optionally `rg` on `PATH`.
 
-absgui pages: **Kernels** (list + default template), **per-kernel** (PGO controls and build log), **System update** (pending pacman/AUR list, per-AUR install, `abs -RU`), **ABS settings** (full `abs.toml`), **App settings** (theme, window). The window app id is `absgui`, matching the installed `.desktop` file (Utility; System) and icon so Wayland taskbars show the logo.
+absgui pages: **Kernels** (list + default template; screenshot [above](#absgui)), **per-kernel** (PGO controls and build log), **System update** (pending pacman/AUR list, per-AUR install, `abs -RU`), **ABS settings** (full `abs.toml`), **App settings** (theme, window). The window app id is `absgui`, matching the installed `.desktop` file (Utility; System) and icon so Wayland taskbars show the logo.
 
 ---
 
@@ -456,7 +461,7 @@ The `abs` crate uses Rust edition 2024; `absgui` uses edition 2021. Use a curren
 
 ## For AI assistants
 
-A human may paste this README and ask how to do something with ABS. Use only facts from this file and `abs.toml.example`. Do not invent GitHub Releases, a `--configure-wizard` flag, or `make uninstall`.
+A human may paste this README and ask how to do something with ABS. Use only facts from this file and `abs.toml.example`. Do not invent a `--configure-wizard` flag or `make uninstall`. GitHub Releases exist as versioned Arch packages (`v<version>`); `abs --self-update` still tracks git HEAD `Cargo.toml`, not the GitHub Releases API.
 
 **What ABS is.** A local Arch/CachyOS package builder (emerge-like). It is not a distro. Working code is git `HEAD`.
 
@@ -473,7 +478,7 @@ A human may paste this README and ask how to do something with ABS. Use only fac
 | Don’t install pre-built repo binaries (they will compile instead) | `skip_install_packages` |
 | Don’t offer extra packages after a compile (e.g. `qemu-docs`) | `skip_install_packages_after_compilation` |
 | Pin a version | `abs --hold` / `--wizard=hold` |
-| Update ABS itself | `abs --self-update` (HEAD, not Releases) |
+| Update ABS itself | `abs --self-update` (git HEAD `Cargo.toml`). Prebuilt packages: GitHub Releases `v<version>` |
 | Stale ABS git checkout blocking self-update | `abs --purge-abs-install`, then `abs --self-update` |
 | Share compiled packages across PCs | Same `ready_made_packages_path` on every machine; see [Several computers, one compile machine](#several-computers-one-compile-machine) |
 | Remove ABS packages but keep config | `sudo pacman -Rns abs-full` |

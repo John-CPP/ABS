@@ -8,7 +8,7 @@
 
 pkgbase=abs
 pkgname=(abs absgui abs-full)
-pkgver=2.0.1
+pkgver=2.0.2
 pkgrel=1
 pkgdesc='Arch/CachyOS package builder with kernel PGO support'
 arch=('x86_64' 'aarch64')
@@ -56,12 +56,13 @@ optdepends_absgui=(
 )
 
 pkgver() {
+  local toml
   if [[ -f "$startdir/../Cargo.toml" ]]; then
-    grep '^version' "$startdir/../Cargo.toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
+    toml="$startdir/../Cargo.toml"
   else
-    cd "$srcdir/ABS"
-    grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
+    toml="$srcdir/ABS/Cargo.toml"
   fi
+  grep -E '^version = "' "$toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 prepare() {

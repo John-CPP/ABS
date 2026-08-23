@@ -3,9 +3,12 @@ members = [".", "absgui", "abs-i18n"]
 default-members = [".", "absgui"]
 resolver = "2"
 
+[workspace.package]
+version = "2.0.2"
+
 [package]
 name = "abs"
-version = "2.0.1"
+version.workspace = true
 edition = "2024"
 license = "CC-BY-4.0"
 

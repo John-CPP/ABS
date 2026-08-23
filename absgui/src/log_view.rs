@@ -529,6 +529,14 @@ fn heuristic_spans(line: &str, palette: LogPalette) -> Vec<(String, Color)> {
     vec![(line.to_string(), palette.fg)]
 }
 
+/// iced's `fill_text` cache path drops `Wrapping::None` and wraps against `bounds.width`.
+/// Keep that width at least as wide as the unwrapped line so compile commands cannot
+/// wrap into the next log row and paint over it.
+fn log_line_draw_width(content: &str, pane_width: f32) -> f32 {
+    let unwrapped = content.chars().count() as f32 * FONT_SIZE;
+    unwrapped.max(pane_width).max(1.0)
+}
+
 fn fill_line<Renderer: text::Renderer<Font = Font>>(
     renderer: &mut Renderer,
     content: &str,
@@ -541,7 +549,7 @@ fn fill_line<Renderer: text::Renderer<Font = Font>>(
     renderer.fill_text(
         Text {
             content: content.to_string(),
-            bounds: Size::new(width, LINE_HEIGHT),
+            bounds: Size::new(log_line_draw_width(content, width), LINE_HEIGHT),
             size: Pixels(FONT_SIZE),
             line_height: text::LineHeight::Absolute(Pixels(LINE_HEIGHT)),
             font: Font::MONOSPACE,
@@ -637,5 +645,20 @@ mod tests {
         assert_eq!(spans[0].1, palette.ansi[2]);
         assert_eq!(spans[1].0, " rest");
         assert_eq!(spans[1].1, palette.fg);
+    }
+
+    #[test]
+    fn log_line_draw_width_does_not_wrap_long_compile_lines() {
+        let content = format!(
+            "[filezilla] /bin/sh ../../libtool --tag=CXX --mode=compile g++ {}",
+            "-O3 ".repeat(80)
+        );
+        let pane_width = 640.0;
+        let w = log_line_draw_width(&content, pane_width);
+        let unwrapped = content.chars().count() as f32 * CHAR_W;
+        assert!(
+            w + f32::EPSILON >= unwrapped,
+            "draw width {w} wraps a {unwrapped}px compile line into the pane ({pane_width})"
+        );
     }
 }

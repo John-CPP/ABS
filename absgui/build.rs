@@ -19,4 +19,5 @@ fn main() {
         });
     println!("cargo:rustc-env=ABSGUI_BUILD_ID={build_id}");
     println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../Cargo.toml");
 }

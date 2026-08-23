@@ -19,34 +19,84 @@ fn parse_cargo_toml_version(text: &str) -> Option<String> {
     parse_cargo_toml_package_version(text, "abs")
 }
 
-fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String> {
-    let mut in_package = false;
-    let mut matches_name = false;
+fn toml_quoted_value(rest: &str) -> Option<String> {
+    let v = rest.trim().trim_matches('"');
+    if v.is_empty() || v == "true" || v == "false" {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+fn parse_toml_section_key(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let prefix = format!("{key} = ");
+    let mut in_section = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed == "[package]" {
-            in_package = true;
-            matches_name = false;
+        if trimmed == header {
+            in_section = true;
             continue;
         }
         if trimmed.starts_with('[') {
-            in_package = false;
+            in_section = false;
+            continue;
+        }
+        if in_section && let Some(rest) = trimmed.strip_prefix(&prefix) {
+            return toml_quoted_value(rest);
+        }
+    }
+    None
+}
+
+fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String> {
+    let workspace_version = parse_toml_section_key(text, "workspace.package", "version");
+    let mut in_package = false;
+    let mut matches_name = false;
+    let mut version = None;
+    let mut inherit = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[package]" {
+            if matches_name {
+                break;
+            }
+            in_package = true;
             matches_name = false;
+            version = None;
+            inherit = false;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            if matches_name {
+                break;
+            }
+            in_package = false;
             continue;
         }
         if !in_package {
             continue;
         }
         if let Some(name) = trimmed.strip_prefix("name = ") {
-            let name = name.trim().trim_matches('"');
-            matches_name = name == package;
+            matches_name = name.trim().trim_matches('"') == package;
             continue;
         }
-        if matches_name && let Some(version) = trimmed.strip_prefix("version = ") {
-            return Some(version.trim().trim_matches('"').to_string());
+        if trimmed.starts_with("version.workspace") {
+            inherit = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("version = ") {
+            version = toml_quoted_value(rest);
         }
     }
-    None
+    if !matches_name {
+        return None;
+    }
+    if inherit {
+        workspace_version
+    } else {
+        version
+    }
 }
 
 /// Fetch the latest version from the official raw GitHub Cargo.toml
@@ -563,6 +613,18 @@ version = "1.3.4"
     }
 
     #[test]
+    fn parse_workspace_inherited_package_version() {
+        let text = r#"[workspace.package]
+version = "2.0.1"
+
+[package]
+name = "abs"
+version.workspace = true
+"#;
+        assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("2.0.1"));
+    }
+
+    #[test]
     fn detects_ready_pkg_artifact_for_version() {
         assert!(is_pkg_artifact_for_version(
             "abs-1.3.7-1-x86_64.pkg.tar.zst",
@@ -691,14 +753,23 @@ default = "arch"
         );
     }
 
-    /// A stale absgui version breaks `cargo build --locked` in the AUR PKGBUILD after a
-    /// release bump, which makes pacman self-updates fail for every user.
+    /// A stale member version breaks `cargo build --locked` after a release bump.
+    /// Members inherit `[workspace.package] version` from the root Cargo.toml.
     #[test]
     fn workspace_member_versions_stay_in_sync() {
-        let gui_manifest = include_str!("../absgui/Cargo.toml");
-        let gui_version = parse_cargo_toml_package_version(gui_manifest, "absgui")
-            .expect("absgui Cargo.toml has a version");
-        assert_eq!(gui_version, env!("CARGO_PKG_VERSION"));
+        let root = include_str!("../Cargo.toml");
+        let gui = include_str!("../absgui/Cargo.toml");
+        let i18n = include_str!("../abs-i18n/Cargo.toml");
+        let version = parse_cargo_toml_version(root).expect("root Cargo.toml has a version");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            gui.contains("version.workspace = true"),
+            "absgui must inherit workspace.package.version"
+        );
+        assert!(
+            i18n.contains("version.workspace = true"),
+            "abs-i18n must inherit workspace.package.version"
+        );
     }
 
     #[test]

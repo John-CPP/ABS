@@ -5301,6 +5301,19 @@ mod pgo_validation_tests {
 }
 
 #[cfg(test)]
+mod chrome_version_tests {
+    #[test]
+    fn corners_follow_workspace_cargo_toml() {
+        let root = include_str!("../../Cargo.toml");
+        let quoted = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(
+            root.contains("[workspace.package]") && root.contains(&quoted),
+            "top-left and bottom-right chrome use CARGO_PKG_VERSION; it must match [workspace.package] in Cargo.toml"
+        );
+    }
+}
+
+#[cfg(test)]
 mod package_list_sort_tests {
     use super::sort_package_names;
     use crate::config::PackageSection;
