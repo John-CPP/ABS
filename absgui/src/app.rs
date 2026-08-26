@@ -38,7 +38,7 @@ use iced::futures::{Stream, StreamExt};
 use iced::keyboard;
 use iced::widget::operation;
 use iced::widget::{
-    button, center, column, container, image, opaque, row, stack, text, text_input, Space,
+    button, center, column, container, image, opaque, row, stack, text, text_input, tooltip, Space,
 };
 use iced::{clipboard, time, window, Point, Size};
 use iced::{Alignment, Element, Font, Length, Padding, Subscription, Task, Theme};
@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 const PGO_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LOG_SCROLL_IGNORE: Duration = Duration::from_millis(120);
+const FETCH_OVERLAY_TICK: Duration = Duration::from_millis(16);
 
 const PGO_STEPS: [(&str, &str); 7] = [
     ("Debug build", "stage1_build"),
@@ -302,6 +303,7 @@ pub struct App {
     pending_updates: Option<PendingUpdates>,
     pending_updates_error: Option<String>,
     pending_updates_loading: bool,
+    fetch_overlay_started: Option<Instant>,
     wizard: config_wizard::WizardSession,
     pgo_run: PgoRunHandle,
     last_log_target: LogSaveTarget,
@@ -372,6 +374,9 @@ impl App {
         }
         if state.page == Page::ConfigWizard && state.wizard.needs_timer() {
             subs.push(time::every(Duration::from_millis(33)).map(|_| Message::WizardTimer));
+        }
+        if state.page == Page::SystemUpdate && state.pending_updates_loading {
+            subs.push(time::every(FETCH_OVERLAY_TICK).map(|_| Message::FetchOverlayTick));
         }
         Subscription::batch(subs)
     }
@@ -494,6 +499,7 @@ impl App {
                 pending_updates: None,
                 pending_updates_error: None,
                 pending_updates_loading: false,
+                fetch_overlay_started: None,
                 wizard: {
                     let mut w = config_wizard::WizardSession::default();
                     w.step = initial_wizard_step;
@@ -664,6 +670,7 @@ impl App {
                 | Message::RefreshPgoStatus
                 | Message::PgoStatusLoaded(_)
                 | Message::WizardTimer
+                | Message::FetchOverlayTick
                 | Message::WizardCheckResult(_, _, _)
                 | Message::WizardFormLoaded(_)
                 | Message::WizardApplyDone(_)
@@ -2140,6 +2147,7 @@ impl App {
                     return Task::none();
                 }
                 self.pending_updates_loading = true;
+                self.fetch_overlay_started = Some(Instant::now());
                 self.pending_updates_error = None;
                 return Task::perform(
                     async { fetch_pending_updates() },
@@ -2148,6 +2156,7 @@ impl App {
             }
             Message::PendingUpdatesLoaded(result) => {
                 self.pending_updates_loading = false;
+                self.fetch_overlay_started = None;
                 match result {
                     Ok(data) => {
                         self.pending_updates_error = None;
@@ -2677,6 +2686,7 @@ impl App {
             Message::WizardTimer => {
                 return self.wizard.on_timer();
             }
+            Message::FetchOverlayTick => {}
             Message::WindowResized(size) => {
                 self.viewport_width = size.width;
                 return Self::query_size_placement(size);
@@ -2818,13 +2828,35 @@ impl App {
             bottom: 16.0,
             left: pad_x,
         };
-        let main: Element<Message> = scroll_viewport(
+        let mut main: Element<Message> = scroll_viewport(
             container(content).padding(page_pad).width(Length::Fill),
             style::page_scroll(theme),
             Length::Fill,
             Length::Fill,
             page_scroll_id(self.page),
         );
+        if self.page == Page::SystemUpdate && system_update::show_fetch_overlay(self.pending_updates_loading)
+        {
+            let elapsed = self
+                .fetch_overlay_started
+                .map(|t| t.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            main = stack![
+                main,
+                opaque(
+                    container(center(system_update::fetching_overlay(
+                        theme,
+                        system_update::gear_angle(elapsed),
+                    )))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(style::page_scrim(theme)),
+                ),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
         let ui: Element<Message> =
             column![self.view_top_nav(theme), main, self.view_status_bar(theme)]
                 .height(Length::Fill)
@@ -2898,6 +2930,7 @@ impl App {
     }
 
     fn view_top_nav(&self, theme: AppTheme) -> Element<'_, Message> {
+        let chrome = widgets::nav_chrome(widgets::nav_inner_width(self.viewport_width));
         let kernels_active = matches!(
             self.page,
             Page::Kernels | Page::KernelConfig | Page::DefaultKernelConfig
@@ -2909,23 +2942,39 @@ impl App {
         let logo_img = image(logo_handle)
             .width(Length::Fixed(28.0))
             .height(Length::Fixed(28.0));
-        let brand = row![
-            logo_img,
-            column![
-                text(abs_i18n::t("gui.chrome.app_name"))
-                    .size(15)
-                    .font(Font {
-                        weight: iced::font::Weight::Bold,
-                        ..Font::DEFAULT
-                    })
-                    .color(style::primary(theme)),
-                text(concat!("v", env!("CARGO_PKG_VERSION")))
-                    .size(style::TEXT_CHIP)
-                    .color(style::muted(theme)),
-            ],
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+        let app_name = abs_i18n::t("gui.chrome.app_name");
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let brand: Element<'_, Message> = if chrome.brand_text {
+            row![
+                logo_img,
+                column![
+                    text(app_name)
+                        .size(15)
+                        .font(Font {
+                            weight: iced::font::Weight::Bold,
+                            ..Font::DEFAULT
+                        })
+                        .color(style::primary(theme)),
+                    text(version)
+                        .size(style::TEXT_CHIP)
+                        .color(style::muted(theme)),
+                ],
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            tooltip(
+                logo_img,
+                container(text(format!("{app_name} {version}")).size(style::TEXT_HELP))
+                    .padding(Padding::from([4.0, 8.0]))
+                    .style(style::tooltip_box(theme)),
+                tooltip::Position::Bottom,
+            )
+            .gap(6)
+            .delay(Duration::from_millis(350))
+            .into()
+        };
 
         let kernel_n = style::KERNEL_CATALOG.len().to_string();
         let pkg_n = self.config.packages.len().to_string();
@@ -2933,6 +2982,7 @@ impl App {
             .pending_updates
             .as_ref()
             .map(|p| (p.repo.len() + p.aur.len() + p.manual.len()).to_string());
+        let show_label = chrome.labels;
 
         let tabs = row![
             widgets::top_nav_tab(
@@ -2940,6 +2990,7 @@ impl App {
                 abs_i18n::t("gui.nav.kernels"),
                 Some(kernel_n),
                 kernels_active,
+                show_label,
                 theme,
                 Message::OpenKernels,
             ),
@@ -2948,6 +2999,7 @@ impl App {
                 abs_i18n::t("gui.nav.packages"),
                 Some(pkg_n),
                 matches!(self.page, Page::Packages | Page::PackageConfig),
+                show_label,
                 theme,
                 Message::OpenPackages,
             ),
@@ -2956,6 +3008,7 @@ impl App {
                 abs_i18n::t("gui.nav.system_update"),
                 update_badge,
                 self.page == Page::SystemUpdate,
+                show_label,
                 theme,
                 Message::OpenSystemUpdate,
             ),
@@ -2964,6 +3017,7 @@ impl App {
                 abs_i18n::t("gui.nav.abs_settings"),
                 None,
                 self.page == Page::AbsSettings,
+                show_label,
                 theme,
                 Message::OpenAbsSettings,
             ),
@@ -2972,6 +3026,7 @@ impl App {
                 abs_i18n::t("gui.nav.config_wizard"),
                 None,
                 self.page == Page::ConfigWizard,
+                show_label,
                 theme,
                 Message::OpenConfigWizard,
             ),
@@ -2980,29 +3035,44 @@ impl App {
                 abs_i18n::t("gui.nav.app_settings"),
                 None,
                 self.page == Page::AppSettings,
+                show_label,
                 theme,
                 Message::OpenAppSettings,
             ),
         ]
         .spacing(4)
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .wrap()
+        .vertical_spacing(4);
 
-        container(
-            row![
-                brand,
-                tabs,
-                Space::new().width(Length::Fill),
-                crate::metrics::hardware_pill_widget(&self.metrics_sampler.current, theme),
-            ]
+        let mut bar = row![brand, tabs]
             .spacing(16)
             .align_y(Alignment::Center)
+            .width(Length::Fill);
+        match chrome.metrics {
+            widgets::NavMetrics::Full => {
+                bar = bar.push(crate::metrics::hardware_pill_widget(
+                    &self.metrics_sampler.current,
+                    theme,
+                    false,
+                ));
+            }
+            widgets::NavMetrics::Compact => {
+                bar = bar.push(crate::metrics::hardware_pill_widget(
+                    &self.metrics_sampler.current,
+                    theme,
+                    true,
+                ));
+            }
+            widgets::NavMetrics::Hidden => {}
+        }
+
+        container(bar)
+            .padding(Padding::from([6.0, self.chrome_pad_x()]))
             .width(Length::Fill)
-            .height(Length::Fixed(48.0)),
-        )
-        .padding(Padding::from([6.0, self.chrome_pad_x()]))
-        .width(Length::Fill)
-        .style(style::top_nav(theme))
-        .into()
+            .style(style::top_nav(theme))
+            .into()
     }
 
     fn view_status_bar(&self, theme: AppTheme) -> Element<'_, Message> {

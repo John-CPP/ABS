@@ -485,6 +485,7 @@ update_all_help = "يشغّل `abs -RU`: يحدّث الحزم المراقبة�
 pending_help = "حزم المستودعات الرسمية تُثبَّت معاً في معاملة واحدة. حزم AUR واحدة تلو الأخرى بـ yay أو paru أو pikaur من abs.toml. الحزم المراقبة (manual_update_packages) تُصرَّف عبر تحديث الكل."
 checking = "جارٍ البحث عن تحديثات…"
 checking_short = "جارٍ الفحص…"
+fetching = "جارٍ جلب التحديثات…"
 not_checked = "لم يُفحص بعد"
 status = "المساعد {helper} · {repo} مستودع · {aur} AUR · {manual} ABS"
 updating = "تحديث"

@@ -6,9 +6,128 @@ use crate::terminal_themes::LogPalette;
 use crate::widgets::{
     command_log, dense_header_cell, dense_table, dense_table_row, COMMAND_LOG_PAGE_HEIGHT,
 };
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::renderer::{self, Quad};
+use iced::advanced::widget::Tree;
+use iced::advanced::{Renderer as _, Widget};
 use iced::widget::{button, column, container, row, text, Space};
-use iced::{Alignment, Color, Element, Font, Length, Padding};
+use iced::{
+    Alignment, Background, Border, Color, Element, Font, Length, Padding, Rectangle, Size, Theme,
+};
 use std::collections::VecDeque;
+use std::f32::consts::TAU;
+
+/// One full gear turn, in seconds.
+pub const GEAR_TURN_SECS: f32 = 1.2;
+const GEAR_SIZE: f32 = 56.0;
+
+pub fn show_fetch_overlay(pending_loading: bool) -> bool {
+    pending_loading
+}
+
+pub fn gear_angle(elapsed_secs: f32) -> f32 {
+    elapsed_secs * TAU / GEAR_TURN_SECS
+}
+
+struct SpinningGear {
+    angle: f32,
+    color: Color,
+    hole: Color,
+}
+
+impl<Message> Widget<Message, Theme, iced::Renderer> for SpinningGear {
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fixed(GEAR_SIZE), Length::Fixed(GEAR_SIZE))
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &iced::Renderer,
+        _limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::Node::new(Size::new(GEAR_SIZE, GEAR_SIZE))
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        renderer: &mut iced::Renderer,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: iced::mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let cx = bounds.center_x();
+        let cy = bounds.center_y();
+        let outer = GEAR_SIZE * 0.42;
+        let hub = GEAR_SIZE * 0.22;
+        let hole = GEAR_SIZE * 0.10;
+        let tooth = GEAR_SIZE * 0.16;
+        let ring = outer - tooth * 0.45;
+        const TEETH: u32 = 8;
+
+        let mut circle = |x: f32, y: f32, r: f32, color: Color| {
+            renderer.fill_quad(
+                Quad {
+                    bounds: Rectangle {
+                        x: x - r,
+                        y: y - r,
+                        width: r * 2.0,
+                        height: r * 2.0,
+                    },
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: r.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                    snap: true,
+                },
+                Background::Color(color),
+            );
+        };
+
+        circle(cx, cy, hub, self.color);
+        for i in 0..TEETH {
+            let a = self.angle + i as f32 * TAU / TEETH as f32;
+            circle(cx + a.cos() * ring, cy + a.sin() * ring, tooth * 0.55, self.color);
+        }
+        circle(cx, cy, hole, self.hole);
+    }
+}
+
+impl<'a, Message: 'a> From<SpinningGear> for Element<'a, Message> {
+    fn from(gear: SpinningGear) -> Self {
+        Element::new(gear)
+    }
+}
+
+pub fn fetching_overlay<'a>(theme: AppTheme, angle: f32) -> Element<'a, Message> {
+    let gear = SpinningGear {
+        angle,
+        color: style::primary(theme),
+        hole: style::surface(theme),
+    };
+    container(
+        column![
+            gear,
+            text(abs_i18n::t("gui.system_update.fetching"))
+                .size(16)
+                .font(Font {
+                    weight: iced::font::Weight::Semibold,
+                    ..Font::DEFAULT
+                }),
+        ]
+        .spacing(14)
+        .align_x(Alignment::Center),
+    )
+    .padding(Padding::from([28.0, 36.0]))
+    .style(style::card(theme))
+    .into()
+}
 
 #[derive(Clone, Copy)]
 enum PendingSource {
@@ -110,13 +229,7 @@ pub fn view<'a>(
         col = col.push(text(err).size(13).color(Color::from_rgb8(0xf8, 0x71, 0x71)));
     }
 
-    if pending_loading && pending.is_none() {
-        col = col.push(
-            text(abs_i18n::t("gui.system_update.checking"))
-                .size(13)
-                .color(style::muted(theme)),
-        );
-    } else if let Some(data) = pending {
+    if let Some(data) = pending {
         col = col.push(pending_dense_table(data, can_act, theme));
         if !data.skipped.is_empty() {
             col = col.push(skipped_table(data, theme));
@@ -340,4 +453,22 @@ fn skipped_table<'a>(data: &'a PendingUpdates, theme: AppTheme) -> Element<'a, M
         ));
     }
     dense_table(header, body, theme)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fetch_overlay_follows_loading_flag() {
+        assert!(super::show_fetch_overlay(true));
+        assert!(!super::show_fetch_overlay(false));
+    }
+
+    #[test]
+    fn gear_angle_completes_a_turn_each_period() {
+        assert!(super::gear_angle(0.0).abs() < 1e-5);
+        assert!(
+            (super::gear_angle(super::GEAR_TURN_SECS) - std::f32::consts::TAU).abs() < 1e-4
+        );
+        assert!(super::gear_angle(super::GEAR_TURN_SECS / 2.0) > 0.0);
+    }
 }

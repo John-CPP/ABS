@@ -485,6 +485,7 @@ update_all_help = "Ejecuta `abs -RU`: actualiza los paquetes vigilados, compila 
 pending_help = "Los paquetes de repos oficiales se instalan juntos en una transacción. Los de AUR, uno a uno con yay, paru o pikaur de abs.toml. Los paquetes vigilados (manual_update_packages) se compilan con Actualizar todo."
 checking = "Buscando actualizaciones…"
 checking_short = "Comprobando…"
+fetching = "Obteniendo actualizaciones…"
 not_checked = "Aún no comprobado"
 status = "ayudante {helper} · {repo} repo · {aur} AUR · {manual} ABS"
 updating = "Actualizando"

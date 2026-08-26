@@ -342,6 +342,8 @@ pub enum Message {
     SystemUpdateAbort,
     PendingUpdatesRefresh,
     PendingUpdatesLoaded(Result<crate::abs_runner::PendingUpdates, String>),
+    /// Redraw the system-update fetch overlay (spinning gear).
+    FetchOverlayTick,
     InstallRepoUpdates,
     InstallAur(String),
     LogFlush,

@@ -1065,7 +1065,10 @@ pub fn settings_tab_bar<'a>(
         (SettingsTab::HeldPackages, abs_i18n::t("gui.abs.tab_held")),
         (SettingsTab::Repositories, abs_i18n::t("gui.abs.tab_repos")),
     ];
-    let mut bar = row![].spacing(3).align_y(iced::Alignment::Center);
+    let mut bar = row![]
+        .spacing(3)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill);
     for (tab, label) in tabs {
         let is_active = active_tab == tab;
         bar = bar.push(
@@ -1082,8 +1085,9 @@ pub fn settings_tab_bar<'a>(
             .on_press(Message::SettingsTabSelected(tab)),
         );
     }
-    container(bar)
+    container(bar.wrap().vertical_spacing(3))
         .padding(3)
+        .width(Length::Fill)
         .style(style::tab_bar_strip(app_theme))
         .into()
 }
@@ -1716,27 +1720,68 @@ pub fn pgo_round_pipeline<'a>(
 pub const SEARCH_KERNELS: &str = "search-kernels";
 pub const SEARCH_PACKAGES: &str = "search-packages";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavChrome {
+    pub labels: bool,
+    pub brand_text: bool,
+    pub metrics: NavMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMetrics {
+    Full,
+    Compact,
+    Hidden,
+}
+
+/// Inner width of the top nav after left/right chrome padding.
+pub fn nav_inner_width(window_width: f32) -> f32 {
+    (window_width - 2.0 * style::shell_pad_x(window_width)).max(0.0)
+}
+
+/// Inner width needed for labeled tabs + brand + metrics to fit on one row.
+const NAV_LABELS_MIN: f32 = 1400.0;
+const NAV_BRAND_TEXT_MIN: f32 = 900.0;
+const NAV_METRICS_FULL_MIN: f32 = 1280.0;
+const NAV_METRICS_COMPACT_MIN: f32 = 640.0;
+
+/// Density of the top nav so every page stays reachable on small displays.
+pub fn nav_chrome(inner_width: f32) -> NavChrome {
+    NavChrome {
+        labels: inner_width >= NAV_LABELS_MIN,
+        brand_text: inner_width >= NAV_BRAND_TEXT_MIN,
+        metrics: if inner_width >= NAV_METRICS_FULL_MIN {
+            NavMetrics::Full
+        } else if inner_width >= NAV_METRICS_COMPACT_MIN {
+            NavMetrics::Compact
+        } else {
+            NavMetrics::Hidden
+        },
+    }
+}
+
 pub fn top_nav_tab<'a>(
     icon: &'static str,
     label: &'static str,
     badge: Option<String>,
     active: bool,
+    show_label: bool,
     theme: AppTheme,
     msg: Message,
 ) -> Element<'a, Message> {
-    let mut content = row![
-        text(icon).size(15),
-        text(label).size(13).font(Font {
+    let mut content = row![text(icon).size(15)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if show_label {
+        content = content.push(text(label).size(13).font(Font {
             weight: if active {
                 iced::font::Weight::Bold
             } else {
                 iced::font::Weight::Semibold
             },
             ..Font::DEFAULT
-        }),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+        }));
+    }
     if let Some(badge) = badge {
         content = content.push(
             container(text(badge).size(10.5).font(Font {
@@ -1747,11 +1792,29 @@ pub fn top_nav_tab<'a>(
             .style(style::nav_badge(theme, active)),
         );
     }
-    button(content)
-        .padding(Padding::from([7.0, 14.0]))
+    let pad = if show_label {
+        Padding::from([7.0, 14.0])
+    } else {
+        Padding::from([7.0, 10.0])
+    };
+    let tab = button(content)
+        .padding(pad)
         .style(style::tab_button(theme, active))
-        .on_press(msg)
+        .on_press(msg);
+    if show_label {
+        tab.into()
+    } else {
+        tooltip(
+            tab,
+            container(text(label).size(style::TEXT_HELP))
+                .padding(Padding::from([4.0, 8.0]))
+                .style(style::tooltip_box(theme)),
+            tooltip::Position::Bottom,
+        )
+        .gap(6)
+        .delay(Duration::from_millis(350))
         .into()
+    }
 }
 
 pub fn breadcrumb_row<'a>(
@@ -1874,5 +1937,37 @@ mod tests {
         assert!(!super::round_rect_hit(0.5, 0.5, 0.0, 0.0, 20.0, 20.0, 4.0));
         let _ = super::raster_path_icon(super::PathKind::Folder, iced::Color::WHITE);
         let _ = super::raster_path_icon(super::PathKind::File, iced::Color::BLACK);
+    }
+
+    #[test]
+    fn nav_inner_width_subtracts_horizontal_chrome_padding() {
+        let w = 1920.0;
+        let pad = crate::style::shell_pad_x(w);
+        assert!((super::nav_inner_width(w) - (w - 2.0 * pad)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn nav_chrome_full_on_1080p() {
+        let chrome = super::nav_chrome(super::nav_inner_width(1920.0));
+        assert!(chrome.labels);
+        assert!(chrome.brand_text);
+        assert_eq!(chrome.metrics, super::NavMetrics::Full);
+    }
+
+    #[test]
+    fn nav_chrome_drops_labels_on_1366_laptop() {
+        // Brand + 6 labeled tabs + metrics pill is ~1500px; a 1366×768 screen clips pages.
+        let chrome = super::nav_chrome(super::nav_inner_width(1366.0));
+        assert!(!chrome.labels);
+    }
+
+    #[test]
+    fn nav_chrome_compacts_at_minimum_window() {
+        let chrome = super::nav_chrome(super::nav_inner_width(
+            crate::app_settings::WINDOW_MIN_WIDTH,
+        ));
+        assert!(!chrome.labels);
+        assert!(!chrome.brand_text);
+        assert_ne!(chrome.metrics, super::NavMetrics::Full);
     }
 }

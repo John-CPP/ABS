@@ -271,6 +271,7 @@ fn cpu_value_text(metrics: &SystemMetrics) -> String {
 pub fn hardware_pill_widget<'a, Message: 'a>(
     metrics: &SystemMetrics,
     app_theme: AppTheme,
+    compact: bool,
 ) -> Element<'a, Message> {
     let cyan = style::primary(app_theme);
     let emerald = match app_theme {
@@ -279,43 +280,69 @@ pub fn hardware_pill_widget<'a, Message: 'a>(
     };
     let mono = Font::MONOSPACE;
 
-    let cpu = row![
-        text("⚡").size(13).color(cyan),
-        text("CPU:")
-            .size(style::TEXT_CHIP)
-            .color(style::muted(app_theme)),
-        text(cpu_value_text(metrics))
-            .size(style::TEXT_CHIP)
-            .font(Font {
-                weight: iced::font::Weight::Bold,
-                ..mono
-            })
-            .color(cyan),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+    let cpu_value = if compact {
+        format!("{:.0}%", metrics.cpu_percent)
+    } else {
+        cpu_value_text(metrics)
+    };
+    let mut cpu = row![text("⚡").size(13).color(cyan)];
+    if !compact {
+        cpu = cpu.push(
+            text("CPU:")
+                .size(style::TEXT_CHIP)
+                .color(style::muted(app_theme)),
+        );
+    }
+    let cpu = cpu
+        .push(
+            text(cpu_value)
+                .size(style::TEXT_CHIP)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..mono
+                })
+                .color(cyan),
+        )
+        .spacing(6)
+        .align_y(Alignment::Center);
 
-    let ram = row![
-        text("▭").size(13).color(emerald),
-        text("RAM:")
-            .size(style::TEXT_CHIP)
-            .color(style::muted(app_theme)),
-        text(format!(
+    let ram_value = if compact {
+        format!("{:.0}%", metrics.ram_percent)
+    } else {
+        format!(
             "{:.1} / {:.0} GB ({:.0}%)",
             metrics.ram_used_gb, metrics.ram_total_gb, metrics.ram_percent
-        ))
-        .size(style::TEXT_CHIP)
-        .font(Font {
-            weight: iced::font::Weight::Bold,
-            ..mono
-        })
-        .color(emerald),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+        )
+    };
+    let mut ram = row![text("▭").size(13).color(emerald)];
+    if !compact {
+        ram = ram.push(
+            text("RAM:")
+                .size(style::TEXT_CHIP)
+                .color(style::muted(app_theme)),
+        );
+    }
+    let ram = ram
+        .push(
+            text(ram_value)
+                .size(style::TEXT_CHIP)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..mono
+                })
+                .color(emerald),
+        )
+        .spacing(6)
+        .align_y(Alignment::Center);
 
-    container(row![cpu, ram].spacing(16).align_y(Alignment::Center))
-        .padding(Padding::from([5.0, 14.0]))
+    let gap = if compact { 10 } else { 16 };
+    let pad = if compact {
+        Padding::from([5.0, 10.0])
+    } else {
+        Padding::from([5.0, 14.0])
+    };
+    container(row![cpu, ram].spacing(gap).align_y(Alignment::Center))
+        .padding(pad)
         .style(style::hardware_pill(app_theme))
         .into()
 }

@@ -485,6 +485,7 @@ update_all_help = "Führt `abs -RU` aus: beobachtete Pakete aktualisieren, Neuer
 pending_help = "Pakete aus offiziellen Repos werden in einer Transaktion installiert. AUR-Pakete einzeln mit yay, paru oder pikaur aus abs.toml. Beobachtete Pakete (manual_update_packages) werden über Alles aktualisieren kompiliert."
 checking = "Suche nach Updates…"
 checking_short = "Prüfe…"
+fetching = "Updates werden abgerufen…"
 not_checked = "Noch nicht geprüft"
 status = "Helper {helper} · {repo} Repo · {aur} AUR · {manual} ABS"
 updating = "Aktualisieren"

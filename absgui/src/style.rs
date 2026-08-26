@@ -1305,6 +1305,17 @@ pub fn modal_scrim(_app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style 
     }
 }
 
+/// Dims page content under a blocking overlay (system-update fetch).
+pub fn page_scrim(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(match app_theme {
+            AppTheme::Dark => Color::from_rgba(0.04, 0.06, 0.09, 0.72),
+            AppTheme::Light => Color::from_rgba(0.96, 0.97, 0.98, 0.78),
+        })),
+        ..container::Style::default()
+    }
+}
+
 pub fn code_well(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(match app_theme {

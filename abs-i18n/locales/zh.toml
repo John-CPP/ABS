@@ -485,6 +485,7 @@ update_all_help = "运行 `abs -RU`：刷新监视的软件包、编译较新版
 pending_help = "官方仓库软件包在一次事务中一起安装。AUR 软件包按 abs.toml 中的 yay、paru 或 pikaur 逐个安装。监视的软件包（manual_update_packages）通过「全部更新」编译。"
 checking = "正在检查更新…"
 checking_short = "正在检查…"
+fetching = "正在获取更新…"
 not_checked = "尚未检查"
 status = "助手 {helper} · {repo} 仓库 · {aur} AUR · {manual} ABS"
 updating = "正在更新"

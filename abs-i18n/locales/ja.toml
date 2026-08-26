@@ -485,6 +485,7 @@ update_all_help = "`abs -RU` を実行します。監視パッケージを更新
 pending_help = "公式リポジトリのパッケージは 1 つのトランザクションでまとめてインストールします。AUR は abs.toml の yay / paru / pikaur で 1 つずつです。監視パッケージ（manual_update_packages）は「すべて更新」でコンパイルします。"
 checking = "更新を確認しています…"
 checking_short = "確認中…"
+fetching = "更新を取得しています…"
 not_checked = "未確認"
 status = "ヘルパー {helper} · {repo} リポジトリ · {aur} AUR · {manual} ABS"
 updating = "更新中"

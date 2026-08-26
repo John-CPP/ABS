@@ -485,6 +485,7 @@ update_all_help = "Runs `abs -RU`: refresh watched packages, compile what is new
 pending_help = "Official-repo packages install together in one transaction. AUR packages install one at a time with yay, paru, or pikaur from abs.toml. Watched packages (manual_update_packages) compile when you click Update all."
 checking = "Checking for updates…"
 checking_short = "Checking…"
+fetching = "Fetching updates…"
 not_checked = "Not checked yet"
 status = "helper {helper} · {repo} repo · {aur} AUR · {manual} ABS"
 updating = "Updating"

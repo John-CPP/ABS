@@ -485,6 +485,7 @@ update_all_help = "Запускает `abs -RU`: обновляет отслеж
 pending_help = "Пакеты официальных репозиториев ставятся одной транзакцией. Пакеты AUR — по одному через yay, paru или pikaur из abs.toml. Отслеживаемые пакеты (manual_update_packages) собираются через «Обновить всё»."
 checking = "Поиск обновлений…"
 checking_short = "Проверка…"
+fetching = "Получение обновлений…"
 not_checked = "Ещё не проверено"
 status = "помощник {helper} · {repo} репо · {aur} AUR · {manual} ABS"
 updating = "Обновление"
