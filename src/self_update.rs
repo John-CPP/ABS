@@ -5,6 +5,7 @@ use crate::utils::{
 };
 use crate::{blog, vlog};
 use colored::Colorize;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +14,7 @@ const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/John-CPP/ABS.git";
 const OFFICIAL_REPOSITORY_BRANCH: &str = "HEAD";
 const OFFICIAL_CARGO_TOML_URL: &str =
     "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml";
-const OFFICIAL_SOURCE_ARCHIVE_URL: &str =
-    "https://github.com/John-CPP/ABS/archive/HEAD.tar.gz";
+const OFFICIAL_SOURCE_ARCHIVE_URL: &str = "https://github.com/John-CPP/ABS/archive/HEAD.tar.gz";
 // Root `[package]` must keep a literal `version = "x.y.z"`. Installs from
 // before 2.0.2 cannot parse `version.workspace = true`.
 const SOURCE_SYNC_ATTEMPTS: u32 = 4;
@@ -136,12 +136,7 @@ fn git_fetch_official(repo_dir: &Path) -> Result<(), String> {
         }
         run_command(
             "git",
-            &[
-                "fetch",
-                "--depth=1",
-                "origin",
-                OFFICIAL_REPOSITORY_BRANCH,
-            ],
+            &["fetch", "--depth=1", "origin", OFFICIAL_REPOSITORY_BRANCH],
             Some(repo_dir),
         )?;
         run_command("git", &["reset", "--hard", "FETCH_HEAD"], Some(repo_dir))
@@ -194,7 +189,7 @@ fn parse_toml_section_key(text: &str, section: &str, key: &str) -> Option<String
             in_section = false;
             continue;
         }
-        
+
         if in_section && let Some(rest) = trimmed.strip_prefix(&prefix) {
             return toml_quoted_value(rest);
         }
@@ -245,11 +240,7 @@ fn parse_cargo_toml_package_version(text: &str, package: &str) -> Option<String>
     if !matches_name {
         return None;
     }
-    if inherit {
-        workspace_version
-    } else {
-        version
-    }
+    if inherit { workspace_version } else { version }
 }
 
 /// Fetch the latest version from the official raw GitHub Cargo.toml
@@ -605,6 +596,147 @@ fn absgui_install_path(abs_install_path: &str) -> PathBuf {
     Path::new(abs_install_path).with_file_name("absgui")
 }
 
+fn parse_abs_cli_version(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next()?.trim();
+    line.strip_prefix("abs ")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn abs_binaries_from_path_env(path_env: &OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path_env)
+        .map(|dir| dir.join("abs"))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn unique_shadowing_abs_paths(installed: &Path, candidates: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in candidates {
+        if !p.is_file() {
+            continue;
+        }
+        if paths_refer_to_same_file(p, installed) {
+            continue;
+        }
+        if out.iter().any(|e| paths_refer_to_same_file(e, p)) {
+            continue;
+        }
+        out.push(p.clone());
+    }
+    out
+}
+
+fn authoritative_abs_path(config: &Config) -> PathBuf {
+    if should_use_pacman_update(config) {
+        PathBuf::from("/usr/bin/abs")
+    } else {
+        PathBuf::from(&config.self_update_install_path)
+    }
+}
+
+fn read_abs_binary_version(path: &Path) -> Option<String> {
+    let path_s = path.to_str()?;
+    let out = run_command_with_output_silent(path_s, &["--version"], None::<&str>).ok()?;
+    parse_abs_cli_version(&out)
+}
+
+fn version_covers_latest(installed: &str, latest: &str) -> bool {
+    vercmp_silent(installed, latest)
+        .map(|c| c >= 0)
+        .unwrap_or(false)
+}
+
+fn shadowing_abs_candidates(installed: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        candidates.push(exe);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(abs_binaries_from_path_env(&path));
+    }
+    unique_shadowing_abs_paths(installed, &candidates)
+}
+
+/// Replace `dest` even if it is the currently running binary (unlink + rename).
+fn replace_file(src: &Path, dest: &Path, mode: &str) -> Result<(), String> {
+    let dest_name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dest.with_file_name(format!(".{}.abs-new-{}", dest_name, std::process::id()));
+    install_file(src, &tmp, mode)?;
+    if fs::rename(&tmp, dest).is_ok() {
+        return Ok(());
+    }
+    vlog!(
+        "Rename to {} failed; retrying with sudo mv...",
+        dest.display()
+    );
+    let tmp_s = tmp.to_string_lossy().into_owned();
+    let dest_s = dest.to_string_lossy().into_owned();
+    if run_command(
+        "sudo",
+        &["mv", "-f", tmp_s.as_str(), dest_s.as_str()],
+        None::<&str>,
+    )
+    .is_err()
+    {
+        let _ = fs::remove_file(&tmp);
+        let _ = run_command_quiet("sudo", &["rm", "-f", tmp_s.as_str()], None::<&str>);
+        return Err(format!("failed to replace {}", dest.display()));
+    }
+    Ok(())
+}
+
+fn refresh_shadowing_abs_installs(installed: &Path, want_gui: bool) -> Result<(), String> {
+    let shadows = shadowing_abs_candidates(installed);
+    if shadows.is_empty() {
+        return Ok(());
+    }
+    if !installed.is_file() {
+        return Err(format!(
+            "updated abs was not found at {}",
+            installed.display()
+        ));
+    }
+    for dest in shadows {
+        blog!(
+            "Replacing leftover abs at {} with {}...",
+            dest.display(),
+            installed.display()
+        );
+        replace_file(installed, &dest, "755")?;
+        if want_gui {
+            let src_gui = installed.with_file_name("absgui");
+            let dest_gui = dest.with_file_name("absgui");
+            if src_gui.is_file() && dest_gui.is_file() {
+                blog!("Replacing leftover absgui at {}...", dest_gui.display());
+                replace_file(&src_gui, &dest_gui, "755")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn warn_if_refresh_failed(result: Result<(), String>, installed: &Path) {
+    if let Err(e) = result {
+        eprintln!(
+            "{} Updated {} but could not replace leftover abs on PATH: {e}",
+            "==> WARNING:".yellow(),
+            installed.display()
+        );
+    }
+}
+
 fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String> {
     blog!("Compiling latest release...");
     run_command("cargo", &["build", "--release"], Some(repo_dir))?;
@@ -708,8 +840,21 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         env!("CARGO_PKG_VERSION").yellow()
     );
 
+    let install_path = authoritative_abs_path(config);
+    let want_gui = wants_absgui(config);
+    if read_abs_binary_version(&install_path).is_some_and(|v| version_covers_latest(&v, &latest)) {
+        blog!(
+            "Newer abs {} is already installed at {}; updating leftover copies on PATH...",
+            latest,
+            install_path.display()
+        );
+        refresh_shadowing_abs_installs(&install_path, want_gui)?;
+        blog!("ABS successfully updated to version {}!", latest.green());
+        return Ok(true);
+    }
+
     if should_use_pacman_update(config) {
-        let to_install = pacman_packages_to_upgrade(wants_absgui(config));
+        let to_install = pacman_packages_to_upgrade(want_gui);
         let search_dirs = self_update_artifact_dirs(config, None);
         if let Some((dir, ready)) =
             try_ready_pkg_artifacts_in_dirs(&search_dirs, &to_install, &latest)
@@ -721,6 +866,10 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
             );
             install_pacman_artifacts(&ready, &to_install)
                 .map_err(|e| format!("Pacman self-update failed: {e}"))?;
+            warn_if_refresh_failed(
+                refresh_shadowing_abs_installs(&install_path, want_gui),
+                &install_path,
+            );
             blog!(
                 "ABS successfully updated to version {} via pacman!",
                 latest.green()
@@ -731,6 +880,10 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
         let repo_dir = sync_source_repo(config, &latest)?;
         run_pacman_self_update(config, &repo_dir, &latest)
             .map_err(|e| format!("Pacman self-update failed: {e}"))?;
+        warn_if_refresh_failed(
+            refresh_shadowing_abs_installs(&install_path, want_gui),
+            &install_path,
+        );
         blog!(
             "ABS successfully updated to version {} via pacman!",
             latest.green()
@@ -740,6 +893,10 @@ pub fn run_self_update(config: &Config, is_auto: bool) -> Result<bool, String> {
 
     let repo_dir = sync_source_repo(config, &latest)?;
     run_binary_self_update(config, &repo_dir)?;
+    warn_if_refresh_failed(
+        refresh_shadowing_abs_installs(&install_path, want_gui),
+        &install_path,
+    );
     blog!("ABS successfully updated to version {}!", latest.green());
     Ok(true)
 }
@@ -1107,5 +1264,68 @@ version = "1.3.4"
             vec!["abs", "absgui", "abs-full"]
         );
         assert_eq!(pacman_packages_to_upgrade(false), vec!["abs"]);
+    }
+
+    #[test]
+    fn parse_abs_cli_version_from_clap() {
+        assert_eq!(
+            parse_abs_cli_version("abs 1.5.0\n").as_deref(),
+            Some("1.5.0")
+        );
+        assert_eq!(parse_abs_cli_version("abs 2.0.3").as_deref(), Some("2.0.3"));
+        assert_eq!(parse_abs_cli_version("not-abs"), None);
+    }
+
+    #[test]
+    fn abs_binaries_from_path_env_lists_existing_files() {
+        let root = std::env::temp_dir().join(format!(
+            "abs_path_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let empty = root.join("empty");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(first.join("abs"), "old").unwrap();
+        fs::write(second.join("abs"), "new").unwrap();
+        let path = std::env::join_paths([&first, &empty, &second]).unwrap();
+        let found = abs_binaries_from_path_env(&path);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(found, vec![first.join("abs"), second.join("abs")]);
+    }
+
+    #[test]
+    fn shadowing_abs_paths_skip_the_install_target_and_dedupe() {
+        let root = std::env::temp_dir().join(format!(
+            "abs_shadow_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let usr = root.join("usr");
+        let local = root.join("local");
+        fs::create_dir_all(&usr).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        let installed = usr.join("abs");
+        let leftover = local.join("abs");
+        fs::write(&installed, "new").unwrap();
+        fs::write(&leftover, "old").unwrap();
+        let got = unique_shadowing_abs_paths(
+            &installed,
+            &[
+                leftover.clone(),
+                installed.clone(),
+                leftover.clone(),
+                local.join("missing"),
+            ],
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(got, vec![leftover]);
     }
 }
