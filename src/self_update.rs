@@ -13,8 +13,158 @@ const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/John-CPP/ABS.git";
 const OFFICIAL_REPOSITORY_BRANCH: &str = "HEAD";
 const OFFICIAL_CARGO_TOML_URL: &str =
     "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml";
+const OFFICIAL_SOURCE_ARCHIVE_URL: &str =
+    "https://github.com/John-CPP/ABS/archive/HEAD.tar.gz";
 // Root `[package]` must keep a literal `version = "x.y.z"`. Installs from
 // before 2.0.2 cannot parse `version.workspace = true`.
+const SOURCE_SYNC_ATTEMPTS: u32 = 4;
+
+fn retry<T>(attempts: u32, op: impl FnMut(u32) -> Result<T, String>) -> Result<T, String> {
+    retry_with_delay(attempts, std::time::Duration::from_millis(400), op)
+}
+
+fn retry_with_delay<T>(
+    attempts: u32,
+    delay: std::time::Duration,
+    mut op: impl FnMut(u32) -> Result<T, String>,
+) -> Result<T, String> {
+    let attempts = attempts.max(1);
+    let mut last = String::from("retry: no attempts");
+    for i in 1..=attempts {
+        match op(i) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = e;
+                if i < attempts && !delay.is_zero() {
+                    std::thread::sleep(delay.saturating_mul(i));
+                }
+            }
+        }
+    }
+    Err(last)
+}
+
+fn extract_github_tarball(archive: &Path, dest: &Path) -> Result<(), String> {
+    let Some(parent) = dest.parent() else {
+        return Err(format!("cannot extract archive to {}", dest.display()));
+    };
+    let staging = parent.join(format!(
+        ".{}.new",
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("abs-src")
+    ));
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|e| format!("remove {}: {e}", staging.display()))?;
+    }
+    fs::create_dir_all(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+    let archive_s = archive.to_string_lossy().into_owned();
+    let staging_s = staging.to_string_lossy().into_owned();
+    let extract = run_command(
+        "tar",
+        &[
+            "-xzf",
+            archive_s.as_str(),
+            "-C",
+            staging_s.as_str(),
+            "--strip-components=1",
+        ],
+        None::<&str>,
+    );
+    if extract.is_err() || !staging.join("Cargo.toml").is_file() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(extract.err().unwrap_or_else(|| {
+            format!(
+                "source archive did not contain Cargo.toml after extract into {}",
+                staging.display()
+            )
+        }));
+    }
+    if dest.exists() {
+        fs::remove_dir_all(dest).map_err(|e| format!("remove {}: {e}", dest.display()))?;
+    }
+    fs::rename(&staging, dest).map_err(|e| {
+        let _ = fs::remove_dir_all(&staging);
+        format!("move extracted source to {}: {e}", dest.display())
+    })
+}
+
+fn download_url_to_file(url: &str, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let dest_s = dest.to_string_lossy().into_owned();
+    let mut args = crate::utils::curl_base_args();
+    args.extend([
+        "-m".into(),
+        "60".into(),
+        "-o".into(),
+        dest_s,
+        url.to_string(),
+    ]);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_command("curl", &arg_refs, None::<&str>)
+}
+
+fn install_official_archive(dest: &Path) -> Result<(), String> {
+    blog!(
+        "Downloading ABS source archive from {}...",
+        OFFICIAL_SOURCE_ARCHIVE_URL
+    );
+    let tmp_dir = dest.with_file_name(format!(".abs-archive-{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("create {}: {e}", tmp_dir.display()))?;
+    let archive = tmp_dir.join("HEAD.tar.gz");
+    let result = (|| {
+        retry(SOURCE_SYNC_ATTEMPTS, |i| {
+            if i > 1 {
+                blog!(
+                    "Source archive download failed (attempt {i}/{SOURCE_SYNC_ATTEMPTS}); retrying..."
+                );
+            }
+            download_url_to_file(OFFICIAL_SOURCE_ARCHIVE_URL, &archive)
+        })?;
+        extract_github_tarball(&archive, dest)
+    })();
+    let _ = fs::remove_dir_all(&tmp_dir);
+    result
+}
+
+fn git_fetch_official(repo_dir: &Path) -> Result<(), String> {
+    retry(SOURCE_SYNC_ATTEMPTS, |i| {
+        if i > 1 {
+            blog!("Git fetch failed (attempt {i}/{SOURCE_SYNC_ATTEMPTS}); retrying...");
+        }
+        run_command(
+            "git",
+            &[
+                "fetch",
+                "--depth=1",
+                "origin",
+                OFFICIAL_REPOSITORY_BRANCH,
+            ],
+            Some(repo_dir),
+        )?;
+        run_command("git", &["reset", "--hard", "FETCH_HEAD"], Some(repo_dir))
+    })
+}
+
+fn git_clone_official(abs_dir: &Path) -> Result<(), String> {
+    let dest = abs_dir
+        .to_str()
+        .ok_or_else(|| "ABS checkout path is not valid UTF-8".to_string())?
+        .to_string();
+    retry(SOURCE_SYNC_ATTEMPTS, |i| {
+        if i > 1 {
+            blog!("Git clone failed (attempt {i}/{SOURCE_SYNC_ATTEMPTS}); retrying...");
+            let _ = fs::remove_dir_all(abs_dir);
+        }
+        run_command(
+            "git",
+            &["clone", "--depth=1", OFFICIAL_REPOSITORY_URL, dest.as_str()],
+            None::<&str>,
+        )
+    })
+}
 
 /// Parse `version` for the workspace `abs` package from raw Cargo.toml text.
 fn parse_cargo_toml_version(text: &str) -> Option<String> {
@@ -44,6 +194,7 @@ fn parse_toml_section_key(text: &str, section: &str, key: &str) -> Option<String
             in_section = false;
             continue;
         }
+        
         if in_section && let Some(rest) = trimmed.strip_prefix(&prefix) {
             return toml_quoted_value(rest);
         }
@@ -372,46 +523,43 @@ fn sync_source_repo(config: &Config, expected_version: &str) -> Result<PathBuf, 
     let packages_path = config.paths.packages_path.clone();
     let abs_dir = abs_install_checkout_dir(config);
 
-    let mut repo_ok = false;
-    if abs_dir.exists() && abs_dir.join(".git").exists() && remote_is_official(&abs_dir) {
+    let official_checkout =
+        abs_dir.exists() && abs_dir.join(".git").exists() && remote_is_official(&abs_dir);
+
+    if official_checkout {
         blog!("Updating ABS repository in {}...", abs_dir.display());
-        if run_command(
-            "git",
-            &["fetch", "--depth=1", "origin", OFFICIAL_REPOSITORY_BRANCH],
-            Some(&abs_dir),
-        )
-        .is_ok()
-            && run_command("git", &["reset", "--hard", "FETCH_HEAD"], Some(&abs_dir)).is_ok()
-        {
-            repo_ok = true;
-        } else {
-            vlog!("Failed to update existing repository. Cleaning up for a fresh clone...");
+        if git_fetch_official(&abs_dir).is_err() {
+            blog!(
+                "Git fetch failed; downloading source archive instead of deleting the existing checkout..."
+            );
+            if let Err(e) = install_official_archive(&abs_dir) {
+                return Err(format!(
+                    "Failed to update existing ABS checkout (kept at {}): {e}",
+                    abs_dir.display()
+                ));
+            }
+        }
+    } else {
+        if abs_dir.exists() {
+            vlog!(
+                "Existing self-update checkout has an unexpected origin. Re-cloning the official repository..."
+            );
             let _ = fs::remove_dir_all(&abs_dir);
         }
-    } else if abs_dir.exists() {
-        vlog!(
-            "Existing self-update checkout has an unexpected origin. Re-cloning the official repository..."
-        );
-        let _ = fs::remove_dir_all(&abs_dir);
-    }
-
-    if !repo_ok {
         blog!(
             "Cloning latest repository source from {}...",
             OFFICIAL_REPOSITORY_URL
         );
         fs::create_dir_all(&packages_path)
             .map_err(|e| format!("Failed to create packages directory: {}", e))?;
-        run_command(
-            "git",
-            &[
-                "clone",
-                "--depth=1",
-                OFFICIAL_REPOSITORY_URL,
-                abs_dir.to_str().unwrap(),
-            ],
-            None::<&str>,
-        )?;
+        if let Err(clone_err) = git_clone_official(&abs_dir) {
+            blog!("Git clone failed; downloading source archive...");
+            if let Err(archive_err) = install_official_archive(&abs_dir) {
+                return Err(format!(
+                    "{clone_err}; archive fallback also failed: {archive_err}"
+                ));
+            }
+        }
     }
 
     if !source_version_matches(&abs_dir, expected_version)? {
@@ -604,6 +752,64 @@ pub fn is_retryable_self_update_error(err: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_succeeds_on_a_later_attempt() {
+        let mut n = 0;
+        let result = retry_with_delay(3, std::time::Duration::ZERO, |_| {
+            n += 1;
+            if n < 3 {
+                Err(format!("fail {n}"))
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(result, Ok(3));
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn retry_returns_the_last_error() {
+        let result: Result<(), String> =
+            retry_with_delay(3, std::time::Duration::ZERO, |i| Err(format!("fail {i}")));
+        assert_eq!(result, Err("fail 3".into()));
+    }
+
+    #[test]
+    fn extract_github_tarball_strips_top_level_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "abs_tarball_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let packed = root.join("packed");
+        let inner = packed.join("ABS-HEAD");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("Cargo.toml"), "[package]\nname = \"abs\"\n").unwrap();
+        fs::write(inner.join("README.md"), "ok").unwrap();
+        let archive = root.join("HEAD.tar.gz");
+        std::process::Command::new("tar")
+            .args([
+                "-czf",
+                archive.to_str().unwrap(),
+                "-C",
+                packed.to_str().unwrap(),
+                "ABS-HEAD",
+            ])
+            .status()
+            .unwrap();
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("stale"), "old").unwrap();
+        extract_github_tarball(&archive, &dest).unwrap();
+        assert!(dest.join("Cargo.toml").is_file());
+        assert!(dest.join("README.md").is_file());
+        assert!(!dest.join("ABS-HEAD").exists());
+        assert!(!dest.join("stale").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parse_remote_cargo_version() {
