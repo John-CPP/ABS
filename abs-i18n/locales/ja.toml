@@ -753,7 +753,7 @@ pgo_perf_event_args = "perf record のイベント引数。auto は gcc -march=n
 pgo_perf_extra_args = "イベント後の perf record フラグ（mmap-pages、-a、-N、-b、-c）。ここに独自の値を書かない限り、profiling_quality が -c を上書きします。"
 pgo_vmlinux = "llvm-profgen 用 DWARF vmlinux のパス。auto = 導入済み -dbg パッケージの /usr/src/debug/<pkgbase>/vmlinux。"
 pgo_afdo_tool = "ステージ 2 のプロファイル変換ツール（既定は llvm-profgen）。"
-pgo_propeller_tool = "ステージ 3 のプロファイル変換ツール（既定は create_llvm_prof）。"
+pgo_propeller_tool = "ステージ 3 のプロファイル変換ツール。auto（既定）は PATH にあれば generate_propeller_profiles を使い、なければ create_llvm_prof。LLVM 22 以降のカーネルには generate_propeller_profiles（google/llvm-propeller）が必要です。create_llvm_prof 0.30 は BB_ADDR_MAP v5 を読めません。"
 pgo_afdo_profile_name = "カーネルソースツリーへコピーする AutoFDO プロファイルのファイル名（既定は kernel-compilation.afdo）。"
 pgo_state_file = "PGO パイプライン JSON 状態の任意上書き。既定: ~/.config/abs/pgo/<package>.json"
 path_packages = "ABS が clone したソース（git ツリー）を置くディレクトリ。マシン間での共有は任意です。"

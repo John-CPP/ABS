@@ -477,7 +477,7 @@ fn default_afdo_tool() -> String {
 }
 
 fn default_propeller_tool() -> String {
-    "create_llvm_prof".into()
+    "auto".into()
 }
 
 fn default_afdo_profile_name() -> String {

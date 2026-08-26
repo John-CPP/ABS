@@ -753,7 +753,7 @@ pgo_perf_event_args = "وسائط أحداث perf record. auto = اكتشاف أ
 pgo_perf_extra_args = "أعلام perf record بعد الأحداث (mmap-pages و-a و-N و-b و-c). يتجاوز profiling_quality القيمة ‎-c ما لم تضع قيمة مخصصة هنا."
 pgo_vmlinux = "مسار vmlinux بـ DWARF لـ llvm-profgen. auto = ‎/usr/src/debug/<pkgbase>/vmlinux من حزمة ‎-dbg المثبتة."
 pgo_afdo_tool = "أداة تحويل الملفات التعريفية للمرحلة 2 (الافتراضي llvm-profgen)."
-pgo_propeller_tool = "أداة تحويل الملفات التعريفية للمرحلة 3 (الافتراضي create_llvm_prof)."
+pgo_propeller_tool = "أداة تحويل الملفات التعريفية للمرحلة 3. auto (الافتراضي) يستخدم generate_propeller_profiles إن وُجد في PATH، وإلا create_llvm_prof. نواة LLVM 22+ تحتاج generate_propeller_profiles (google/llvm-propeller)؛ create_llvm_prof 0.30 لا يقرأ BB_ADDR_MAP v5."
 pgo_afdo_profile_name = "اسم ملف تعريف AutoFDO المنسوخ إلى شجرة مصدر النواة (الافتراضي kernel-compilation.afdo)."
 pgo_state_file = "تجاوز اختياري لحالة JSON لمسار PGO. الافتراضي: ~/.config/abs/pgo/<package>.json"
 path_packages = "المجلد الذي يخزّن فيه ABS المصادر المستنسخة (أشجار git). المشاركة بين الأجهزة اختيارية."

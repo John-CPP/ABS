@@ -753,7 +753,7 @@ pgo_perf_event_args = "Ereignisargumente für perf record. auto = Zen (--pfm-eve
 pgo_perf_extra_args = "perf-record-Flags nach den Ereignissen (mmap-pages, -a, -N, -b, -c). profiling_quality überschreibt -c, sofern du hier keinen eigenen Wert setzt."
 pgo_vmlinux = "Pfad zur DWARF-vmlinux für llvm-profgen. auto = /usr/src/debug/<pkgbase>/vmlinux aus dem installierten -dbg-Paket."
 pgo_afdo_tool = "Profil-Umwandlungswerkzeug für Stufe 2 (Vorgabe llvm-profgen)."
-pgo_propeller_tool = "Profil-Umwandlungswerkzeug für Stufe 3 (Vorgabe create_llvm_prof)."
+pgo_propeller_tool = "Profil-Umwandlungswerkzeug für Stufe 3. auto (Vorgabe) nimmt generate_propeller_profiles, falls im PATH, sonst create_llvm_prof. Kernel mit LLVM 22+ brauchen generate_propeller_profiles (google/llvm-propeller); create_llvm_prof 0.30 kann BB_ADDR_MAP v5 nicht lesen."
 pgo_afdo_profile_name = "Dateiname des AutoFDO-Profils, das in den Kernel-Quellbaum kopiert wird (Vorgabe kernel-compilation.afdo)."
 pgo_state_file = "Optionale Überschreibung der JSON-Pipeline-Zustandsdatei. Vorgabe: ~/.config/abs/pgo/<package>.json"
 path_packages = "Verzeichnis, in dem ABS geklonte Quellen (Git-Bäume) ablegt. Das Teilen zwischen Rechnern ist optional."

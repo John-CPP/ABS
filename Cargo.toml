@@ -8,7 +8,9 @@ version = "2.0.2"
 
 [package]
 name = "abs"
-version.workspace = true
+# Literal `version =` (not `version.workspace`) so installed abs --self-update
+# clients that only parse `[package]` can still read this file from GitHub.
+version = "2.0.2"
 edition = "2024"
 license = "CC-BY-4.0"
 

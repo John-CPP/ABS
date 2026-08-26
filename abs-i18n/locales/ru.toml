@@ -753,7 +753,7 @@ pgo_perf_event_args = "Аргументы событий perf record. auto = о�
 pgo_perf_extra_args = "Флаги perf record после событий (mmap-pages, -a, -N, -b, -c). profiling_quality переопределяет -c, если здесь не задано своё значение."
 pgo_vmlinux = "Путь к DWARF vmlinux для llvm-profgen. auto = /usr/src/debug/<pkgbase>/vmlinux из установленного пакета -dbg."
 pgo_afdo_tool = "Средство преобразования профиля для этапа 2 (по умолчанию llvm-profgen)."
-pgo_propeller_tool = "Средство преобразования профиля для этапа 3 (по умолчанию create_llvm_prof)."
+pgo_propeller_tool = "Средство преобразования профиля для этапа 3. auto (по умолчанию) берёт generate_propeller_profiles, если он в PATH, иначе create_llvm_prof. Ядра LLVM 22+ требуют generate_propeller_profiles (google/llvm-propeller); create_llvm_prof 0.30 не читает BB_ADDR_MAP v5."
 pgo_afdo_profile_name = "Имя файла AutoFDO-профиля, копируемого в дерево исходников ядра (по умолчанию kernel-compilation.afdo)."
 pgo_state_file = "Необязательная подмена JSON-состояния конвейера PGO. По умолчанию: ~/.config/abs/pgo/<package>.json"
 path_packages = "Каталог, где ABS хранит клонированные исходники (git-деревья). Общий доступ между машинами необязателен."

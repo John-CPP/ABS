@@ -13,6 +13,8 @@ const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/John-CPP/ABS.git";
 const OFFICIAL_REPOSITORY_BRANCH: &str = "HEAD";
 const OFFICIAL_CARGO_TOML_URL: &str =
     "https://raw.githubusercontent.com/John-CPP/ABS/HEAD/Cargo.toml";
+// Root `[package]` must keep a literal `version = "x.y.z"`. Installs from
+// before 2.0.2 cannot parse `version.workspace = true`.
 
 /// Parse `version` for the workspace `abs` package from raw Cargo.toml text.
 fn parse_cargo_toml_version(text: &str) -> Option<String> {
@@ -751,6 +753,59 @@ default = "arch"
                 PathBuf::from("/mnt/share/packages/abs/aur"),
             ]
         );
+    }
+
+    /// Parser shipped in abs <= 2.0.1: only `version = "..."` under `[package]`.
+    /// Installed `--self-update` fetches GitHub `Cargo.toml`; that format must stay parseable.
+    fn parse_legacy_package_version(text: &str) -> Option<String> {
+        let mut in_package = false;
+        let mut matches_name = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[package]" {
+                in_package = true;
+                matches_name = false;
+                continue;
+            }
+            if trimmed.starts_with('[') {
+                in_package = false;
+                matches_name = false;
+                continue;
+            }
+            if !in_package {
+                continue;
+            }
+            if let Some(name) = trimmed.strip_prefix("name = ") {
+                matches_name = name.trim().trim_matches('"') == "abs";
+                continue;
+            }
+            if matches_name && let Some(version) = trimmed.strip_prefix("version = ") {
+                return Some(version.trim().trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn legacy_self_update_parser_cannot_read_workspace_inherited_version() {
+        let text = r#"[workspace.package]
+version = "2.0.2"
+
+[package]
+name = "abs"
+version.workspace = true
+"#;
+        assert_eq!(parse_legacy_package_version(text), None);
+        assert_eq!(parse_cargo_toml_version(text).as_deref(), Some("2.0.2"));
+    }
+
+    #[test]
+    fn root_cargo_toml_stays_parseable_by_pre_workspace_self_update_clients() {
+        let root = include_str!("../Cargo.toml");
+        let version = parse_legacy_package_version(root).expect(
+            "root [package] must keep version = \"x.y.z\" so installed abs --self-update can parse GitHub Cargo.toml",
+        );
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
     }
 
     /// A stale member version breaks `cargo build --locked` after a release bump.

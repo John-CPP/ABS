@@ -12,7 +12,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const PROPELLER_TOOL_GENERATE: &str = "generate_propeller_profiles";
+const PROPELLER_TOOL_CREATE_LLVM_PROF: &str = "create_llvm_prof";
 
 /// Pipeline stage identifiers persisted in state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +29,7 @@ pub enum PgoStageId {
     WaitReboot2,
     Stage3Profile,
     Stage3Build,
+    WaitReboot3,
     Done,
     Aborted,
 }
@@ -39,6 +44,7 @@ impl PgoStageId {
             Self::WaitReboot2 => "Waiting for reboot (boot stage-2 kernel)",
             Self::Stage3Profile => "Stage 3: profile Propeller",
             Self::Stage3Build => "Stage 3: final build",
+            Self::WaitReboot3 => "Waiting for reboot (boot final PGO kernel)",
             Self::Done => "Done",
             Self::Aborted => "Aborted",
         }
@@ -54,6 +60,7 @@ impl PgoStageId {
             Self::WaitReboot2,
             Self::Stage3Profile,
             Self::Stage3Build,
+            Self::WaitReboot3,
         ]
     }
 }
@@ -73,6 +80,7 @@ pub fn parse_pgo_stage(raw: &str) -> Result<PgoStageId, String> {
             PgoStageId::Stage3Profile
         }
         "3" | "stage3" | "stage3_build" | "final" | "final_build" => PgoStageId::Stage3Build,
+        "wait3" | "reboot3" | "wait_reboot3" => PgoStageId::WaitReboot3,
         "done" => PgoStageId::Done,
         "aborted" => PgoStageId::Aborted,
         other => {
@@ -558,6 +566,20 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
                 }
                 transition(&mut state, PgoStageId::Stage3Profile);
             }
+            PgoStageId::WaitReboot3 => {
+                if pgo.verify_boot {
+                    verify_boot_kernel(&state, &pgo);
+                }
+                transition(&mut state, PgoStageId::Done);
+                crate::pkgbuild::restore_pkgbuild(Path::new(&state.repo_dir));
+                remove_pgo_auto_resume_service(package);
+                save_state(&state_path, &state);
+                blog!("PGO pipeline complete for {}", package);
+                if cli.json {
+                    print_json_status(&state, &pgo);
+                }
+                return;
+            }
             PgoStageId::Done => {
                 blog!("PGO pipeline already complete for {}", package);
                 if cli.json {
@@ -625,7 +647,7 @@ fn run_status(package: &str, config: &Config, json: bool, _events: &EventLog) {
         }
         blog!("  State file: {}", state_path.display());
         match state.current_stage {
-            PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 => {
+            PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3 => {
                 blog!("  Action: reboot, then run: abs --pgo-resume {}", package);
             }
             PgoStageId::Done => blog!("  Action: none (complete)"),
@@ -826,13 +848,15 @@ fn print_json_status(state: &PgoState, pgo: &PgoConfig) {
     }
     let boot_ready = matches!(
         state.current_stage,
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2
+        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3
     ) && boot_matches_expected(state);
     let (reboot_required, next_action) = match state.current_stage {
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 if boot_ready => {
+        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3
+            if boot_ready =>
+        {
             (false, format!("abs --pgo-resume {}", state.package))
         }
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 => {
+        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3 => {
             (true, reboot_resume_message(state, &state.package))
         }
         PgoStageId::Done => (false, "none".to_string()),
@@ -873,11 +897,8 @@ fn preflight(pgo: &PgoConfig, package: &str, config: &Config) {
     if which(&pgo.afdo_tool).is_none() {
         die!("PGO requires '{}' in PATH (afdo_tool)", pgo.afdo_tool);
     }
-    if which(&pgo.propeller_tool).is_none() {
-        die!(
-            "PGO requires '{}' in PATH (propeller_tool)",
-            pgo.propeller_tool
-        );
+    if let Err(e) = resolve_propeller_tool(&pgo.propeller_tool) {
+        die!("{e}");
     }
     if let Err(e) = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command) {
         die!("{e}");
@@ -895,9 +916,33 @@ fn preflight(pgo: &PgoConfig, package: &str, config: &Config) {
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
-    run_command_with_output("which", &[cmd], None::<&str>)
-        .ok()
-        .map(|s| PathBuf::from(s.trim()))
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let given = Path::new(cmd);
+    if given.components().count() > 1 {
+        return given.is_file().then(|| given.to_path_buf());
+    }
+    if let Ok(s) = run_command_with_output("which", &[cmd], None::<&str>) {
+        let p = PathBuf::from(s.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // systemd --user often has a slim PATH; still look in the usual bins.
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for extra in ["/usr/local/bin", "/usr/bin", "/bin"] {
+        let extra = PathBuf::from(extra);
+        if !dirs.iter().any(|d| d == &extra) {
+            dirs.push(extra);
+        }
+    }
+    dirs.into_iter()
+        .map(|d| d.join(cmd))
+        .find(|p| p.is_file())
 }
 
 fn resolve_repo_dir(
@@ -1052,25 +1097,20 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 let kernel = kernel_cfg();
                 let mut env = stage3_build_env(&kernel, &pgo.afdo_profile_name);
                 merge_user_kernel_overrides(&mut env, &kernel);
-                run_pgo_build(
-                    package,
-                    cli,
-                    config,
-                    &PgoBuildContext {
-                        env_vars: env,
-                        makepkg_flags: "-f --skipinteg".to_string(),
-                        clean_src: true,
-                        clean_pkg: true,
-                        defer_pkgbuild_restore: false,
-                        skip_abs_install: false,
-                    },
-                    events,
-                );
-                transition(state, PgoStageId::Done);
-                crate::pkgbuild::restore_pkgbuild(Path::new(&state.repo_dir));
-                remove_pgo_auto_resume_service(package);
+                let build_ctx = PgoBuildContext {
+                    env_vars: env,
+                    makepkg_flags: "-f --skipinteg".to_string(),
+                    clean_src: true,
+                    clean_pkg: true,
+                    defer_pkgbuild_restore: false,
+                    skip_abs_install: false,
+                };
+                run_pgo_build(package, cli, config, &build_ctx, events);
+                let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
+                record_installed_kernel(state, &pkgbase);
+                transition(state, PgoStageId::WaitReboot3);
             }
-            PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 => {
+            PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3 => {
                 let msg = if pgo_auto_enabled(pgo, cli) && !run_once {
                     format!(
                         "PGO auto-restart: rebooting to continue pipeline for {package}. {}",
@@ -1119,7 +1159,7 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
 fn emit_reboot_hint_if_waiting(state: &PgoState, package: &str, events: &EventLog) {
     if !matches!(
         state.current_stage,
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2
+        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3
     ) {
         return;
     }
@@ -1487,6 +1527,40 @@ fn perf_data_usable(path: &Path) -> Option<u64> {
     }
 }
 
+/// Prefer scratch, then the repo copy left after a previous capture (convert can
+/// fail after collection; resume must not throw away a gigabyte of LBR data).
+fn existing_perf_data(scratch_file: &Path, repo: &Path) -> Option<(PathBuf, u64)> {
+    if let Some(n) = perf_data_usable(scratch_file) {
+        return Some((scratch_file.to_path_buf(), n));
+    }
+    let name = scratch_file.file_name()?;
+    let repo_file = repo.join(name);
+    if repo_file == *scratch_file {
+        return None;
+    }
+    perf_data_usable(&repo_file).map(|n| (repo_file, n))
+}
+
+fn collect_or_reuse_perf_data(
+    pgo: &PgoConfig,
+    package: &str,
+    repo: &Path,
+    scratch: &Path,
+    perf_data: &Path,
+    events: &EventLog,
+) -> Result<PathBuf, String> {
+    if let Some((path, bytes)) = existing_perf_data(perf_data, repo) {
+        blog!(
+            "Reusing existing perf data {} ({bytes} bytes) — skipping collection",
+            path.display()
+        );
+        return Ok(path);
+    }
+    run_profile_collection(pgo, package, repo, scratch, perf_data, events)?;
+    sync_perf_data_to_repo(perf_data, repo)?;
+    Ok(perf_data.to_path_buf())
+}
+
 fn finish_profile_collection(
     pgo: &PgoConfig,
     repo: &Path,
@@ -1531,9 +1605,10 @@ fn run_stage2_profile(
         remove_undersized_profile(&archive.join(&pgo.afdo_profile_name));
     }
 
-    run_profile_collection(pgo, package, &repo, &scratch, &perf_data, events)
-        .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
-    sync_perf_data_to_repo(&perf_data, &repo).unwrap_or_else(|e| die!("{e}"));
+    let perf_data = collect_or_reuse_perf_data(
+        pgo, package, &repo, &scratch, &perf_data, events,
+    )
+    .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -1570,6 +1645,144 @@ fn run_stage2_profile(
     copy_to_repo(&profile_out, &repo_profile).unwrap_or_else(|e| die!("{e}"));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropellerToolKind {
+    CreateLlvmProf,
+    GeneratePropellerProfiles,
+}
+
+fn propeller_tool_is_auto(tool: &str) -> bool {
+    let t = tool.trim();
+    t.is_empty() || t.eq_ignore_ascii_case("auto")
+}
+
+fn propeller_tool_kind(tool: &str) -> PropellerToolKind {
+    let name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    if name == PROPELLER_TOOL_GENERATE || name.contains("generate_propeller") {
+        PropellerToolKind::GeneratePropellerProfiles
+    } else {
+        PropellerToolKind::CreateLlvmProf
+    }
+}
+
+fn propeller_tool_exists(tool: &str) -> bool {
+    let path = Path::new(tool);
+    if path.is_absolute() || tool.contains('/') {
+        path.is_file()
+    } else {
+        which(tool).is_some()
+    }
+}
+
+fn resolve_propeller_tool(configured: &str) -> Result<String, String> {
+    if propeller_tool_is_auto(configured) {
+        for name in [PROPELLER_TOOL_GENERATE, PROPELLER_TOOL_CREATE_LLVM_PROF] {
+            if propeller_tool_exists(name) {
+                return Ok(name.to_string());
+            }
+        }
+        return Err(format!(
+            "PGO requires a Propeller converter in PATH (tried {PROPELLER_TOOL_GENERATE}, \
+             {PROPELLER_TOOL_CREATE_LLVM_PROF}). LLVM 22+ kernels need {PROPELLER_TOOL_GENERATE} \
+             from https://github.com/google/llvm-propeller; {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x \
+             cannot read SHT_LLVM_BB_ADDR_MAP version 5."
+        ));
+    }
+    let configured = configured.trim();
+    if propeller_tool_exists(configured) {
+        return Ok(configured.to_string());
+    }
+    Err(format!(
+        "PGO requires '{configured}' in PATH (propeller_tool)"
+    ))
+}
+
+fn propeller_convert_command(
+    tool: &str,
+    vmlinux: &Path,
+    perf_data: &Path,
+    cc_out: &Path,
+    ld_out: &Path,
+) -> String {
+    let tool_q = sh_single_quote(tool);
+    let binary = sh_single_quote(&vmlinux.to_string_lossy());
+    let profile = sh_single_quote(&perf_data.to_string_lossy());
+    let cc = sh_single_quote(&cc_out.to_string_lossy());
+    let ld = sh_single_quote(&ld_out.to_string_lossy());
+    match propeller_tool_kind(tool) {
+        PropellerToolKind::GeneratePropellerProfiles => format!(
+            "{tool_q} --binary={binary} --profile={profile} --cc_profile={cc} --ld_profile={ld} \
+             --propeller_options={}",
+            sh_single_quote("output_module_name: true"),
+        ),
+        PropellerToolKind::CreateLlvmProf => format!(
+            "{tool_q} --binary={binary} --profile={profile} --format=propeller \
+             --propeller_output_module_name --out={cc} --propeller_symorder={ld}",
+        ),
+    }
+}
+
+fn is_unsupported_bb_addr_map(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("bb_addr_map") || e.contains("bb-addr-map")
+}
+
+fn propeller_bb_addr_map_hint(tried: &str) -> String {
+    format!(
+        "{tried} cannot read this vmlinux (unsupported SHT_LLVM_BB_ADDR_MAP, typical of LLVM 22+). \
+         Install {PROPELLER_TOOL_GENERATE} from https://github.com/google/llvm-propeller, put it on \
+         PATH, and set propeller_tool = \"{PROPELLER_TOOL_GENERATE}\" or \"auto\". \
+         {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x cannot convert LLVM 22 kernels."
+    )
+}
+
+fn convert_propeller_profiles(
+    repo: &Path,
+    tool: &str,
+    vmlinux: &Path,
+    perf_data: &Path,
+    cc_out: &Path,
+    ld_out: &Path,
+    events: &EventLog,
+) -> Result<(), String> {
+    let cmd = propeller_convert_command(tool, vmlinux, perf_data, cc_out, ld_out);
+    blog!(
+        "Converting Propeller profile with {tool} using {}…",
+        vmlinux.display()
+    );
+    match run_logged_shell(repo, &cmd, events) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if is_unsupported_bb_addr_map(&err)
+                && propeller_tool_kind(tool) != PropellerToolKind::GeneratePropellerProfiles
+                && propeller_tool_exists(PROPELLER_TOOL_GENERATE) =>
+        {
+            ewarn!(
+                "{tool} cannot read SHT_LLVM_BB_ADDR_MAP on this vmlinux; retrying with {PROPELLER_TOOL_GENERATE}"
+            );
+            let retry = propeller_convert_command(
+                PROPELLER_TOOL_GENERATE,
+                vmlinux,
+                perf_data,
+                cc_out,
+                ld_out,
+            );
+            run_logged_shell(repo, &retry, events).map_err(|err2| {
+                if is_unsupported_bb_addr_map(&err2) {
+                    propeller_bb_addr_map_hint(PROPELLER_TOOL_GENERATE)
+                } else {
+                    err2
+                }
+            })
+        }
+        Err(err) if is_unsupported_bb_addr_map(&err) => Err(propeller_bb_addr_map_hint(tool)),
+        Err(err) => Err(err),
+    }
+}
+
 fn run_stage3_profile(
     state: &PgoState,
     pgo: &PgoConfig,
@@ -1582,10 +1795,10 @@ fn run_stage3_profile(
     let scratch = scratch_dir(state, pgo, cli, config);
     let _ = fs::create_dir_all(&scratch);
     let perf_data = scratch.join("propeller.data");
-
-    run_profile_collection(pgo, package, &repo, &scratch, &perf_data, events)
-        .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
-    sync_perf_data_to_repo(&perf_data, &repo).unwrap_or_else(|e| die!("{e}"));
+    let perf_data = collect_or_reuse_perf_data(
+        pgo, package, &repo, &scratch, &perf_data, events,
+    )
+    .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -1595,17 +1808,11 @@ fn run_stage3_profile(
     .unwrap_or_else(|e| die!("{e}"));
     let cc_out = repo.join("propeller_cc_profile.txt");
     let ld_out = repo.join("propeller_ld_profile.txt");
-    let convert_cmd = format!(
-        "{} --binary={} --profile={} --format=propeller --propeller_output_module_name \
-         --out={} --propeller_symorder={}",
-        sh_single_quote(&pgo.propeller_tool),
-        sh_single_quote(&vmlinux.to_string_lossy()),
-        sh_single_quote(&perf_data.to_string_lossy()),
-        sh_single_quote(&cc_out.to_string_lossy()),
-        sh_single_quote(&ld_out.to_string_lossy()),
-    );
-    blog!("Converting Propeller profile using {}…", vmlinux.display());
-    run_logged_shell(&repo, &convert_cmd, events).unwrap_or_else(|e| die!("{e}"));
+    let tool = resolve_propeller_tool(&pgo.propeller_tool).unwrap_or_else(|e| die!("{e}"));
+    convert_propeller_profiles(
+        &repo, &tool, &vmlinux, &perf_data, &cc_out, &ld_out, events,
+    )
+    .unwrap_or_else(|e| die!("{e}"));
 
     for name in ["propeller_cc_profile.txt", "propeller_ld_profile.txt"] {
         let path = repo.join(name);
@@ -1913,7 +2120,7 @@ fn newest_existing_file(paths: &[PathBuf]) -> Option<PathBuf> {
     existing.last().map(|p| (*p).clone())
 }
 
-/// Resolve the unstripped kernel image used by llvm-profgen / create_llvm_prof.
+/// Resolve the unstripped kernel image used by llvm-profgen / Propeller converters.
 pub fn resolve_vmlinux(
     pgo: &PgoConfig,
     kernel_release: Option<&str>,
@@ -2078,6 +2285,7 @@ fn run_logged_shell(cwd: &Path, cmd: &str, events: &EventLog) -> Result<(), Stri
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let captured_stderr = Arc::new(Mutex::new(String::new()));
 
     // Stream stdout/stderr line-by-line as they arrive so long-running profile/convert
     // steps show live progress (and to the GUI which captures abs stdout/stderr).
@@ -2090,17 +2298,27 @@ fn run_logged_shell(cwd: &Path, cmd: &str, events: &EventLog) -> Result<(), Stri
             });
         }
         if let Some(err) = stderr {
+            let captured = captured_stderr.clone();
             s.spawn(move || {
+                let mut buf = String::new();
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    buf.push_str(&line);
+                    buf.push('\n');
                     events.log_line("stderr", line);
                 }
+                *captured.lock().unwrap() = buf;
             });
         }
     });
 
     let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
-        return Err(format!("command failed: {cmd}"));
+        let detail = captured_stderr.lock().unwrap().clone();
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return Err(format!("command failed: {cmd}"));
+        }
+        return Err(format!("command failed: {cmd}\n{detail}"));
     }
     Ok(())
 }
@@ -2133,6 +2351,50 @@ mod tests {
             auto_restart: false,
             state_file: None,
         }
+    }
+
+    #[test]
+    fn propeller_convert_command_create_llvm_prof_cli() {
+        let cmd = propeller_convert_command(
+            "create_llvm_prof",
+            Path::new("/usr/src/debug/vmlinux"),
+            Path::new("/tmp/propeller.data"),
+            Path::new("/tmp/propeller_cc_profile.txt"),
+            Path::new("/tmp/propeller_ld_profile.txt"),
+        );
+        assert!(cmd.contains("--format=propeller"), "{cmd}");
+        assert!(cmd.contains("--propeller_output_module_name"), "{cmd}");
+        assert!(cmd.contains("--propeller_symorder="), "{cmd}");
+        assert!(!cmd.contains("--cc_profile="), "{cmd}");
+    }
+
+    #[test]
+    fn propeller_convert_command_generate_propeller_profiles_cli() {
+        let cmd = propeller_convert_command(
+            "/opt/llvm-propeller/generate_propeller_profiles",
+            Path::new("/usr/src/debug/vmlinux"),
+            Path::new("/tmp/propeller.data"),
+            Path::new("/tmp/propeller_cc_profile.txt"),
+            Path::new("/tmp/propeller_ld_profile.txt"),
+        );
+        assert!(cmd.contains("--cc_profile="), "{cmd}");
+        assert!(cmd.contains("--ld_profile="), "{cmd}");
+        assert!(cmd.contains("output_module_name: true"), "{cmd}");
+        assert!(!cmd.contains("--format=propeller"), "{cmd}");
+    }
+
+    #[test]
+    fn propeller_tool_auto_and_bb_addr_map_detection() {
+        assert!(propeller_tool_is_auto("auto"));
+        assert!(propeller_tool_is_auto("AUTO"));
+        assert!(propeller_tool_is_auto(""));
+        assert!(!propeller_tool_is_auto("create_llvm_prof"));
+        assert!(is_unsupported_bb_addr_map(
+            "INTERNAL: unsupported SHT_LLVM_BB_ADDR_MAP version: 5"
+        ));
+        assert!(!is_unsupported_bb_addr_map("missing profile file"));
+        let err = resolve_propeller_tool("definitely-not-a-propeller-tool-xyz").unwrap_err();
+        assert!(err.contains("definitely-not-a-propeller-tool-xyz"), "{err}");
     }
 
     #[test]
@@ -2285,6 +2547,30 @@ mod tests {
         fs::write(&big, vec![0u8; MIN_USABLE_PERF_BYTES as usize]).unwrap();
         assert_eq!(super::perf_data_usable(&big), Some(MIN_USABLE_PERF_BYTES));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_perf_data_falls_back_to_repo_copy() {
+        let pid = std::process::id();
+        let scratch = std::env::temp_dir().join(format!("abs-pgo-scratch-{pid}"));
+        let repo = std::env::temp_dir().join(format!("abs-pgo-repo-{pid}"));
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let scratch_file = scratch.join("propeller.data");
+        let repo_file = repo.join("propeller.data");
+        assert!(super::existing_perf_data(&scratch_file, &repo).is_none());
+        fs::write(&repo_file, vec![0u8; MIN_USABLE_PERF_BYTES as usize]).unwrap();
+        let (path, n) = super::existing_perf_data(&scratch_file, &repo).unwrap();
+        assert_eq!(path, repo_file);
+        assert_eq!(n, MIN_USABLE_PERF_BYTES);
+        fs::write(&scratch_file, vec![0u8; MIN_USABLE_PERF_BYTES as usize + 8]).unwrap();
+        let (path, n) = super::existing_perf_data(&scratch_file, &repo).unwrap();
+        assert_eq!(path, scratch_file);
+        assert_eq!(n, MIN_USABLE_PERF_BYTES + 8);
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -2483,9 +2769,11 @@ default = "aur"
         );
 
         let active = super::active_pipelines(&config);
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].package, "linux-zen");
-        assert_eq!(active[0].stage_label, PgoStageId::Stage2Build.label());
+        let zen = active
+            .iter()
+            .find(|p| p.package == "linux-zen")
+            .expect("custom state_file pipeline should be discovered even if other PGO state exists");
+        assert_eq!(zen.stage_label, PgoStageId::Stage2Build.label());
 
         let _ = fs::remove_dir_all(&dir);
     }

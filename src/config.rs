@@ -450,7 +450,7 @@ fn default_afdo_tool() -> String {
 }
 
 fn default_propeller_tool() -> String {
-    "create_llvm_prof".to_string()
+    "auto".to_string()
 }
 
 fn default_afdo_profile_name() -> String {
@@ -497,6 +497,8 @@ pub struct PgoConfig {
     pub vmlinux: String,
     #[serde(default = "default_afdo_tool")]
     pub afdo_tool: String,
+    /// Stage 3 converter. `auto` prefers `generate_propeller_profiles` (LLVM 22+ BB_ADDR_MAP),
+    /// then `create_llvm_prof`. Pin a binary name or path to force one tool.
     #[serde(default = "default_propeller_tool")]
     pub propeller_tool: String,
     #[serde(default = "default_afdo_profile_name")]

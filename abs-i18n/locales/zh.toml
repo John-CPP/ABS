@@ -753,7 +753,7 @@ pgo_perf_event_args = "perf record 的事件参数。auto = 根据 gcc -march=na
 pgo_perf_extra_args = "事件之后的 perf record 标志（mmap-pages、-a、-N、-b、-c）。除非你在此自定义，否则 profiling_quality 会覆盖 -c。"
 pgo_vmlinux = "供 llvm-profgen 使用的 DWARF vmlinux 路径。auto = 已安装 -dbg 软件包中的 /usr/src/debug/<pkgbase>/vmlinux。"
 pgo_afdo_tool = "第 2 阶段的配置文件转换工具（默认 llvm-profgen）。"
-pgo_propeller_tool = "第 3 阶段的配置文件转换工具（默认 create_llvm_prof）。"
+pgo_propeller_tool = "第 3 阶段的配置文件转换工具。auto（默认）优先使用 PATH 中的 generate_propeller_profiles，否则使用 create_llvm_prof。LLVM 22+ 内核需要 generate_propeller_profiles（google/llvm-propeller）；create_llvm_prof 0.30 无法读取 BB_ADDR_MAP v5。"
 pgo_afdo_profile_name = "复制到内核源码树的 AutoFDO 配置文件名（默认 kernel-compilation.afdo）。"
 pgo_state_file = "可选覆盖 PGO 流水线 JSON 状态文件。默认：~/.config/abs/pgo/<package>.json"
 path_packages = "ABS 存放克隆源码（git 树）的目录。跨机器共享是可选的。"

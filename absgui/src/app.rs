@@ -4597,7 +4597,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.pgo_propeller_tool"),
                     Some(field_help::pgo_propeller_tool()),
                     &kstr_value(pkg, KStr::PropellerTool),
-                    "create_llvm_prof",
+                    "auto",
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::PropellerTool, v),
                 ),
@@ -5122,7 +5122,7 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
             }
             KStr::PropellerTool => {
                 pgo.propeller_tool = if trimmed.is_empty() {
-                    "create_llvm_prof".into()
+                    "auto".into()
                 } else {
                     trimmed.to_string()
                 };
