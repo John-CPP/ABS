@@ -423,6 +423,19 @@ pub fn kernel_user_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option
     ]
 }
 
+/// Map GUI/config truthy values to the strings CachyOS PKGBUILDs actually test
+/// (`[ "$_cc_harder" = "yes" ]`). `y` from older GUI saves must become `yes`.
+pub fn normalize_kernel_override(key: &str, value: &str) -> String {
+    if key == "_cc_harder" {
+        let on = matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        );
+        return if on { "yes".into() } else { "no".into() };
+    }
+    value.to_string()
+}
+
 fn default_pgo_preset() -> String {
     "cachyos-kernel".to_string()
 }
@@ -1459,6 +1472,41 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn kernel_override_pairs_include_cc_harder_o3() {
+        let kernel = super::KernelBuildConfig {
+            cc_harder: Some("yes".into()),
+            ..Default::default()
+        };
+        let got: Vec<_> = super::kernel_override_pairs(&kernel)
+            .into_iter()
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val.as_str())))
+            .collect();
+        assert!(
+            got.contains(&("_cc_harder", "yes")),
+            "one-shot kernel builds must apply _cc_harder=yes for -O3, got {got:?}"
+        );
+        let user: Vec<_> = super::kernel_user_override_pairs(&kernel)
+            .into_iter()
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val.as_str())))
+            .collect();
+        assert!(
+            user.contains(&("_cc_harder", "yes")),
+            "PGO stages must keep user -O3 (_cc_harder), got {user:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_cc_harder_maps_y_to_yes() {
+        assert_eq!(super::normalize_kernel_override("_cc_harder", "y"), "yes");
+        assert_eq!(super::normalize_kernel_override("_cc_harder", "yes"), "yes");
+        assert_eq!(super::normalize_kernel_override("_cc_harder", "no"), "no");
+        assert_eq!(
+            super::normalize_kernel_override("_cpusched", "bore"),
+            "bore"
+        );
+    }
 
     #[test]
     fn test_parse_held_packages() {

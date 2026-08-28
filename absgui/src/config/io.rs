@@ -285,6 +285,92 @@ default = "arch"
     }
 
     #[test]
+    fn default_kernel_template_selects_every_kernel_pick() {
+        let k = crate::config::default_kernel_template()
+            .kernel
+            .expect("template kernel");
+        assert_eq!(k.cpusched.as_deref(), Some("cachyos"));
+        assert_eq!(k.processor_opt.as_deref(), Some("native"));
+        assert_eq!(k.use_llvm_lto.as_deref(), Some("thin"));
+        assert_eq!(k.hz_ticks.as_deref(), Some("1000"));
+        assert_eq!(k.tickrate.as_deref(), Some("full"));
+        assert_eq!(k.preempt.as_deref(), Some("full"));
+        assert_eq!(k.hugepage.as_deref(), Some("always"));
+        assert_eq!(k.cc_harder.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn ensure_kernel_seeds_existing_package_with_no_options() {
+        let mut doc = ConfigDocument::default();
+        doc.packages.insert(
+            "linux-cachyos".into(),
+            crate::config::PackageSection::default(),
+        );
+
+        doc.ensure_kernel_from_defaults("linux-cachyos");
+        let pkg = doc.packages.get("linux-cachyos").unwrap();
+        let k = pkg.kernel.as_ref().unwrap();
+        assert_eq!(k.cpusched.as_deref(), Some("cachyos"));
+        assert_eq!(k.processor_opt.as_deref(), Some("native"));
+        assert_eq!(k.use_llvm_lto.as_deref(), Some("thin"));
+        assert_eq!(k.hz_ticks.as_deref(), Some("1000"));
+        assert_eq!(k.tickrate.as_deref(), Some("full"));
+        assert_eq!(k.preempt.as_deref(), Some("full"));
+        assert_eq!(k.hugepage.as_deref(), Some("always"));
+        assert_eq!(k.cc_harder.as_deref(), Some("yes"));
+        assert_eq!(pkg.source.as_deref(), Some("aur"));
+        assert_eq!(pkg.build_env.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn ensure_kernel_seeds_existing_empty_kernel_table() {
+        let mut doc = ConfigDocument::default();
+        doc.packages.insert(
+            "linux-cachyos".into(),
+            crate::config::PackageSection {
+                kernel: Some(crate::config::KernelSection::default()),
+                ..Default::default()
+            },
+        );
+
+        doc.ensure_kernel_from_defaults("linux-cachyos");
+        assert_eq!(
+            doc.packages["linux-cachyos"]
+                .kernel
+                .as_ref()
+                .unwrap()
+                .cpusched
+                .as_deref(),
+            Some("cachyos")
+        );
+    }
+
+    #[test]
+    fn ensure_kernel_keeps_user_selected_scheduler() {
+        let mut doc = ConfigDocument::default();
+        doc.packages.insert(
+            "linux-cachyos".into(),
+            crate::config::PackageSection {
+                kernel: Some(crate::config::KernelSection {
+                    cpusched: Some("bore".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        doc.ensure_kernel_from_defaults("linux-cachyos");
+        assert_eq!(
+            doc.packages["linux-cachyos"]
+                .kernel
+                .as_ref()
+                .unwrap()
+                .cpusched
+                .as_deref(),
+            Some("bore")
+        );
+    }
+
+    #[test]
     fn per_kernel_edits_are_independent() {
         let mut doc = ConfigDocument::default();
         doc.ensure_kernel_from_defaults("linux-cachyos");

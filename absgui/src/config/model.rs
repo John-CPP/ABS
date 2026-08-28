@@ -531,21 +531,35 @@ impl Default for PgoSection {
     }
 }
 
+/// Built-in kernel pick defaults (CachyOS PKGBUILD-aligned) used when a field is unset.
+pub fn default_kernel_section() -> KernelSection {
+    KernelSection {
+        cpusched: Some("cachyos".into()),
+        processor_opt: Some("native".into()),
+        use_llvm_lto: Some("thin".into()),
+        hz_ticks: Some("1000".into()),
+        tickrate: Some("full".into()),
+        preempt: Some("full".into()),
+        hugepage: Some("always".into()),
+        cc_harder: Some("yes".into()),
+        ..Default::default()
+    }
+}
+
+impl KernelSection {
+    /// True when the user has never chosen any kernel option (all fields unset).
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Built-in default template used when a kernel is configured for the first time.
 pub fn default_kernel_template() -> PackageSection {
     PackageSection {
         source: Some("aur".into()),
         build_env: Some("local".into()),
         ramdisk: Some("wr".into()),
-        kernel: Some(KernelSection {
-            cpusched: Some("cachyos".into()),
-            processor_opt: Some("native".into()),
-            use_llvm_lto: Some("thin".into()),
-            hz_ticks: Some("1000".into()),
-            tickrate: Some("full".into()),
-            preempt: Some("full".into()),
-            ..Default::default()
-        }),
+        kernel: Some(default_kernel_section()),
         pgo: Some(PgoSection::default()),
         ..Default::default()
     }
@@ -596,17 +610,44 @@ fn default_repositories() -> HashMap<String, String> {
 
 impl ConfigDocument {
     /// Ensure a kernel package exists, seeding it from `kernel_defaults` on first use.
+    ///
+    /// Packages that already exist but have no kernel options yet (the user never
+    /// picked any) also receive the default picks so the kernel page is not empty.
     pub fn ensure_kernel_from_defaults(&mut self, name: &str) {
         if !self.packages.contains_key(name) {
             let template = self.kernel_defaults.clone();
             self.packages.insert(name.to_string(), template);
         }
+        let default_kernel = self
+            .kernel_defaults
+            .kernel
+            .clone()
+            .filter(|k| !k.is_unset())
+            .unwrap_or_else(default_kernel_section);
+        let default_pgo = self
+            .kernel_defaults
+            .pgo
+            .clone()
+            .unwrap_or_else(PgoSection::default);
+        let default_source = self.kernel_defaults.source.clone();
+        let default_build_env = self.kernel_defaults.build_env.clone();
+        let default_ramdisk = self.kernel_defaults.ramdisk.clone();
+
         let pkg = self.packages.get_mut(name).expect("just inserted");
-        if pkg.kernel.is_none() {
-            pkg.kernel = Some(KernelSection::default());
+        if pkg.kernel.as_ref().is_none_or(KernelSection::is_unset) {
+            pkg.kernel = Some(default_kernel);
         }
         if pkg.pgo.is_none() {
-            pkg.pgo = Some(PgoSection::default());
+            pkg.pgo = Some(default_pgo);
+        }
+        if pkg.source.is_none() {
+            pkg.source = default_source;
+        }
+        if pkg.build_env.is_none() {
+            pkg.build_env = default_build_env;
+        }
+        if pkg.ramdisk.is_none() {
+            pkg.ramdisk = default_ramdisk;
         }
     }
 }

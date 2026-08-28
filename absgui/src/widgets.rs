@@ -742,18 +742,22 @@ where
     )
 }
 
-pub fn field_pick<'a, F>(
+pub fn field_pick<'a, F, S>(
     label: &'a str,
     help: Option<&'a str>,
-    options: &[&'static str],
+    options: impl IntoIterator<Item = S>,
     value: &str,
     app_theme: AppTheme,
     on_change: F,
 ) -> Element<'a, Message>
 where
     F: Fn(String) -> Message + 'a,
+    S: AsRef<str>,
 {
-    let mut opts: Vec<String> = options.iter().map(|s| (*s).to_string()).collect();
+    let mut opts: Vec<String> = options
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .collect();
     if !value.is_empty() && !opts.contains(&value.to_string()) {
         opts.insert(0, value.to_string());
     }

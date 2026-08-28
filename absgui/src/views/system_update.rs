@@ -4,13 +4,13 @@ use crate::messages::Message;
 use crate::style;
 use crate::terminal_themes::LogPalette;
 use crate::widgets::{
-    command_log, dense_header_cell, dense_table, dense_table_row, COMMAND_LOG_PAGE_HEIGHT,
+    COMMAND_LOG_PAGE_HEIGHT, command_log, dense_header_cell, dense_table, dense_table_row,
 };
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::widget::Tree;
 use iced::advanced::{Renderer as _, Widget};
-use iced::widget::{button, column, container, row, text, Space};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{
     Alignment, Background, Border, Color, Element, Font, Length, Padding, Rectangle, Size, Theme,
 };
@@ -93,7 +93,12 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for SpinningGear {
         circle(cx, cy, hub, self.color);
         for i in 0..TEETH {
             let a = self.angle + i as f32 * TAU / TEETH as f32;
-            circle(cx + a.cos() * ring, cy + a.sin() * ring, tooth * 0.55, self.color);
+            circle(
+                cx + a.cos() * ring,
+                cy + a.sin() * ring,
+                tooth * 0.55,
+                self.color,
+            );
         }
         circle(cx, cy, hole, self.hole);
     }
@@ -253,6 +258,22 @@ pub fn view<'a>(
     col.spacing(12).into()
 }
 
+fn pending_repo_label(source: PendingSource, pkg: &crate::abs_runner::PendingPkg) -> String {
+    if let Some(repo) = pkg
+        .repository
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return repo.to_string();
+    }
+    match source {
+        PendingSource::Aur => abs_i18n::t("gui.system_update.source_aur").to_string(),
+        PendingSource::Official => abs_i18n::t("gui.system_update.source_official").to_string(),
+        PendingSource::Abs => abs_i18n::t("gui.system_update.source_abs").to_string(),
+    }
+}
+
 fn pending_dense_table<'a>(
     data: &'a PendingUpdates,
     can_act: bool,
@@ -294,11 +315,7 @@ fn pending_dense_table<'a>(
     }
 
     for (source, pkg) in rows {
-        let source_label = match source {
-            PendingSource::Aur => abs_i18n::t("gui.system_update.source_aur"),
-            PendingSource::Official => abs_i18n::t("gui.system_update.source_official"),
-            PendingSource::Abs => abs_i18n::t("gui.system_update.source_abs"),
-        };
+        let source_label = pending_repo_label(source, pkg);
         let action: Element<'a, Message> = match source {
             PendingSource::Aur => {
                 let name = pkg.name.clone();
@@ -457,6 +474,34 @@ fn skipped_table<'a>(data: &'a PendingUpdates, theme: AppTheme) -> Element<'a, M
 
 #[cfg(test)]
 mod tests {
+    fn pkg(name: &str, repository: Option<&str>) -> crate::abs_runner::PendingPkg {
+        crate::abs_runner::PendingPkg {
+            name: name.into(),
+            old: "1".into(),
+            new: "2".into(),
+            repository: repository.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn repo_column_shows_sync_repository_not_official() {
+        assert_eq!(
+            super::pending_repo_label(
+                super::PendingSource::Official,
+                &pkg("firefox", Some("cachyos-extra"))
+            ),
+            "cachyos-extra"
+        );
+        assert_eq!(
+            super::pending_repo_label(super::PendingSource::Aur, &pkg("yay", Some("aur"))),
+            "aur"
+        );
+        assert_eq!(
+            super::pending_repo_label(super::PendingSource::Abs, &pkg("linux-cachyos", None)),
+            abs_i18n::t("gui.system_update.source_abs")
+        );
+    }
+
     #[test]
     fn fetch_overlay_follows_loading_flag() {
         assert!(super::show_fetch_overlay(true));
@@ -466,9 +511,7 @@ mod tests {
     #[test]
     fn gear_angle_completes_a_turn_each_period() {
         assert!(super::gear_angle(0.0).abs() < 1e-5);
-        assert!(
-            (super::gear_angle(super::GEAR_TURN_SECS) - std::f32::consts::TAU).abs() < 1e-4
-        );
+        assert!((super::gear_angle(super::GEAR_TURN_SECS) - std::f32::consts::TAU).abs() < 1e-4);
         assert!(super::gear_angle(super::GEAR_TURN_SECS / 2.0) > 0.0);
     }
 }

@@ -86,22 +86,32 @@ fn replace_all_pkgrel_lines(content: &str, next: &str) -> String {
 
 /// Replace the first `^key=...` line or append `key=value` when missing.
 /// `value` is written as a bash single-quoted string so metacharacters cannot inject.
+///
+/// CachyOS kernel PKGBUILDs use `: "${_cc_harder:=yes}"` instead of `_cc_harder=yes`.
+/// Those default-assignment lines are replaced in place so the override is the value
+/// `prepare()` actually sees (the PKGBUILD checks `[ "$_cc_harder" = "yes" ]`).
 pub fn replace_pkgbuild_field(content: &str, key: &str, value: &str) -> String {
     let quoted = crate::utils::sh_single_quote(value);
-    let replace_re = Regex::new(&format!(r"(?m)^{}=.*$", regex::escape(key))).unwrap();
-    if replace_re.is_match(content) {
-        let replacement = format!("{key}={quoted}");
-        replace_re
+    let replacement = format!("{key}={quoted}");
+    let escaped = regex::escape(key);
+    let assign_re = Regex::new(&format!(r"(?m)^{escaped}=.*$")).unwrap();
+    if assign_re.is_match(content) {
+        return assign_re
             .replace_all(content, regex::NoExpand(&replacement))
-            .to_string()
-    } else {
-        let mut out = content.to_string();
-        if !out.ends_with('\n') && !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("{key}={quoted}\n"));
-        out
+            .to_string();
     }
+    let default_re = Regex::new(&format!(r#"(?m)^: "\$\{{{escaped}:=.*\}}"$"#)).unwrap();
+    if default_re.is_match(content) {
+        return default_re
+            .replace_all(content, regex::NoExpand(&replacement))
+            .to_string();
+    }
+    let mut out = content.to_string();
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("{replacement}\n"));
+    out
 }
 
 fn is_safe_pkgbuild_key(key: &str) -> bool {
@@ -468,6 +478,20 @@ mod tests {
         let content = "pkgver=1.0\n";
         let out = replace_pkgbuild_field(content, "pkgver", "foo$bar");
         assert_eq!(out, "pkgver='foo$bar'\n");
+    }
+
+    #[test]
+    fn replace_pkgbuild_field_overrides_cachyos_default_assignment() {
+        let content = ": \"${_cc_harder:=yes}\"\npkgver=1.0\n";
+        let out = replace_pkgbuild_field(content, "_cc_harder", "yes");
+        assert!(
+            out.contains("_cc_harder='yes'"),
+            "expected explicit assignment, got {out:?}"
+        );
+        assert!(
+            !out.contains("${_cc_harder:=yes}"),
+            "CachyOS default line should be replaced so -O3 actually applies, got {out:?}"
+        );
     }
 
     #[test]

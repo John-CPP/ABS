@@ -1,4 +1,5 @@
 /target/
+.stignore
 **/*.rs.bk
 .harness/
 __pycache__/

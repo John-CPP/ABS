@@ -940,9 +940,7 @@ fn which(cmd: &str) -> Option<PathBuf> {
             dirs.push(extra);
         }
     }
-    dirs.into_iter()
-        .map(|d| d.join(cmd))
-        .find(|p| p.is_file())
+    dirs.into_iter().map(|d| d.join(cmd)).find(|p| p.is_file())
 }
 
 fn resolve_repo_dir(
@@ -1216,7 +1214,7 @@ fn stage3_build_env(_kernel: &KernelBuildConfig, profile: &str) -> HashMap<Strin
 fn merge_user_kernel_overrides(env: &mut HashMap<String, String>, kernel: &KernelBuildConfig) {
     for (key, val) in config::kernel_user_override_pairs(kernel) {
         if let Some(v) = val {
-            env.insert(key.to_string(), v.clone());
+            env.insert(key.to_string(), config::normalize_kernel_override(key, v));
         }
     }
 }
@@ -1605,10 +1603,8 @@ fn run_stage2_profile(
         remove_undersized_profile(&archive.join(&pgo.afdo_profile_name));
     }
 
-    let perf_data = collect_or_reuse_perf_data(
-        pgo, package, &repo, &scratch, &perf_data, events,
-    )
-    .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
+    let perf_data = collect_or_reuse_perf_data(pgo, package, &repo, &scratch, &perf_data, events)
+        .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -1795,10 +1791,8 @@ fn run_stage3_profile(
     let scratch = scratch_dir(state, pgo, cli, config);
     let _ = fs::create_dir_all(&scratch);
     let perf_data = scratch.join("propeller.data");
-    let perf_data = collect_or_reuse_perf_data(
-        pgo, package, &repo, &scratch, &perf_data, events,
-    )
-    .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
+    let perf_data = collect_or_reuse_perf_data(pgo, package, &repo, &scratch, &perf_data, events)
+        .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -1809,10 +1803,8 @@ fn run_stage3_profile(
     let cc_out = repo.join("propeller_cc_profile.txt");
     let ld_out = repo.join("propeller_ld_profile.txt");
     let tool = resolve_propeller_tool(&pgo.propeller_tool).unwrap_or_else(|e| die!("{e}"));
-    convert_propeller_profiles(
-        &repo, &tool, &vmlinux, &perf_data, &cc_out, &ld_out, events,
-    )
-    .unwrap_or_else(|e| die!("{e}"));
+    convert_propeller_profiles(&repo, &tool, &vmlinux, &perf_data, &cc_out, &ld_out, events)
+        .unwrap_or_else(|e| die!("{e}"));
 
     for name in ["propeller_cc_profile.txt", "propeller_ld_profile.txt"] {
         let path = repo.join(name);
@@ -1862,6 +1854,8 @@ fn run_profile_collection(
         perf_extra,
     );
 
+    probe_branch_stack_sampling(repo, scratch, &perf_events, &perf_extra, events)?;
+
     let bench_cmd = format!(
         "env ABS_PGO_PROFILE_DIR={} ABS_PGO_BENCHMARK_DIR={} ABS_PGO_BENCHMARK={} {}",
         sh_single_quote(&scratch.to_string_lossy()),
@@ -1906,6 +1900,55 @@ fn run_profile_collection(
     }
 
     finish_profile_collection(pgo, repo, perf_data, &build_user)
+}
+
+fn branch_stack_sampling_unavailable(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("doesn't support branch stack sampling")
+        || s.contains("does not support branch stack sampling")
+}
+
+fn branch_stack_unavailable_message(detail: &str) -> String {
+    format!(
+        "perf cannot record branch stacks on this machine. \
+         AutoFDO/Propeller kernel PGO requires Last Branch Records (`perf record -b`). \
+         This is a CPU/hypervisor limit, not an ABS package-selection bug. \
+         On bare metal, enable the PMU and disable the NMI watchdog. \
+         In a VM, the hypervisor must expose the host CPU's branch-sampling facility; \
+         if it does not, run PGO on the host instead.\n\
+         {detail}"
+    )
+}
+
+/// Fail fast before cachyos-benchmarker if this CPU/VM cannot open LBR sampling.
+fn probe_branch_stack_sampling(
+    repo: &Path,
+    scratch: &Path,
+    perf_events: &str,
+    perf_extra: &str,
+    events: &EventLog,
+) -> Result<(), String> {
+    let sudo = crate::utils::shell_sudo();
+    let probe = scratch.join("abs-pgo-branch-stack-probe.data");
+    let _ = fs::remove_file(&probe);
+    let cmd = format!(
+        "{sudo} perf record {perf_events} {extra} -o {out} -- true",
+        extra = perf_extra,
+        out = sh_single_quote(&probe.to_string_lossy()),
+    );
+    events.log_line(
+        "stdout",
+        "Probing perf branch-stack sampling before the profiling workload...".to_string(),
+    );
+    let result = run_logged_shell(repo, &cmd, events);
+    let _ = fs::remove_file(&probe);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if branch_stack_sampling_unavailable(&e) => {
+            Err(branch_stack_unavailable_message(&e))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn sysctl_toggle(pgo: &PgoConfig, enable: bool) -> Result<(), String> {
@@ -2537,6 +2580,24 @@ mod tests {
     }
 
     #[test]
+    fn branch_stack_probe_detects_missing_lbr() {
+        let amd = "amd64_fam1ah_zen5::RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k: \
+                   PMU Hardware or event type doesn't support branch stack sampling.";
+        let intel = "BR_INST_RETIRED.NEAR_TAKEN:k: \
+                     PMU Hardware or event type doesn't support branch stack sampling.";
+        assert!(super::branch_stack_sampling_unavailable(amd));
+        assert!(super::branch_stack_sampling_unavailable(intel));
+        let msg = super::branch_stack_unavailable_message(intel);
+        assert!(msg.contains("perf record -b"));
+        assert!(msg.contains("CPU/hypervisor"));
+        assert!(!msg.contains("LbrExtV2"));
+        assert!(!msg.contains("kvm-amd"));
+        assert!(!super::branch_stack_sampling_unavailable(
+            "sudo: perf: command not found"
+        ));
+    }
+
+    #[test]
     fn perf_data_usable_requires_minimum_size() {
         let dir = std::env::temp_dir().join(format!("abs-pgo-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -2769,10 +2830,9 @@ default = "aur"
         );
 
         let active = super::active_pipelines(&config);
-        let zen = active
-            .iter()
-            .find(|p| p.package == "linux-zen")
-            .expect("custom state_file pipeline should be discovered even if other PGO state exists");
+        let zen = active.iter().find(|p| p.package == "linux-zen").expect(
+            "custom state_file pipeline should be discovered even if other PGO state exists",
+        );
         assert_eq!(zen.stage_label, PgoStageId::Stage2Build.label());
 
         let _ = fs::remove_dir_all(&dir);

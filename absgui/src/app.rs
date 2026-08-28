@@ -224,7 +224,6 @@ const HZ_OPTS: &[&str] = &["100", "250", "300", "500", "600", "750", "1000"];
 const TICK_OPTS: &[&str] = &["full", "idle", "periodic"];
 const PREEMPT_OPTS: &[&str] = &["full", "voluntary", "server", "lazy"];
 const HUGE_OPTS: &[&str] = &["always", "madvise"];
-const SOURCE_OPTS: &[&str] = &["aur", "cachyos", "arch"];
 const ENV_OPTS: &[&str] = &["local", "chroot"];
 const PGO_BENCHMARK_PRESET_OPTS: &[&str] = &["fast", "cachyos"];
 const PGO_PROFILING_QUALITY_OPTS: &[&str] = &["standard", "maximum"];
@@ -2835,7 +2834,8 @@ impl App {
             Length::Fill,
             page_scroll_id(self.page),
         );
-        if self.page == Page::SystemUpdate && system_update::show_fetch_overlay(self.pending_updates_loading)
+        if self.page == Page::SystemUpdate
+            && system_update::show_fetch_overlay(self.pending_updates_loading)
         {
             let elapsed = self
                 .fetch_overlay_started
@@ -3483,7 +3483,13 @@ impl App {
             text(abs_i18n::t("gui.kernels.default_seed"))
                 .size(style::TEXT_HELP)
                 .color(style::muted(theme)),
-            kernel_form(EditTarget::Default, pkg, theme),
+            kernel_form(
+                EditTarget::Default,
+                pkg,
+                None,
+                &self.config.repositories,
+                theme,
+            ),
             button(text(abs_i18n::t("gui.kernels.save_default")).size(14))
                 .style(style::btn_primary(theme))
                 .on_press(Message::SaveConfig),
@@ -3512,31 +3518,8 @@ impl App {
             .map(|r| !r.is_empty())
             .unwrap_or(self.config.ramdisk.enabled);
 
-        let lto_str = pkg
-            .kernel
-            .as_ref()
-            .and_then(|k| k.use_llvm_lto.as_deref())
-            .or_else(|| {
-                self.config
-                    .kernel_defaults
-                    .kernel
-                    .as_ref()
-                    .and_then(|k| k.use_llvm_lto.as_deref())
-            })
-            .unwrap_or("none");
-
-        let hz_str = pkg
-            .kernel
-            .as_ref()
-            .and_then(|k| k.hz_ticks.as_deref().or(k.tickrate.as_deref()))
-            .or_else(|| {
-                self.config
-                    .kernel_defaults
-                    .kernel
-                    .as_ref()
-                    .and_then(|k| k.hz_ticks.as_deref().or(k.tickrate.as_deref()))
-            })
-            .unwrap_or("1000");
+        let lto_str = kstr_pick_value(pkg, Some(&self.config.kernel_defaults), KStr::LlvmLto);
+        let hz_str = kstr_pick_value(pkg, Some(&self.config.kernel_defaults), KStr::HzTicks);
 
         let header_banner = container(
             row![
@@ -3554,22 +3537,28 @@ impl App {
                 .padding(Padding::from([4.0, 12.0]))
                 .style(style::tag_sched(theme, sched)),
                 container(
-                    text(abs_i18n::tf("gui.kernels.lto_tag", &[("lto", lto_str)]))
-                        .size(12)
-                        .font(Font {
-                            weight: iced::font::Weight::Medium,
-                            ..Font::DEFAULT
-                        })
+                    text(abs_i18n::tf(
+                        "gui.kernels.lto_tag",
+                        &[("lto", lto_str.as_str())]
+                    ))
+                    .size(12)
+                    .font(Font {
+                        weight: iced::font::Weight::Medium,
+                        ..Font::DEFAULT
+                    })
                 )
                 .padding(Padding::from([4.0, 12.0]))
                 .style(style::tag(theme)),
                 container(
-                    text(abs_i18n::tf("gui.kernels.tick_tag", &[("hz", hz_str)]))
-                        .size(12)
-                        .font(Font {
-                            weight: iced::font::Weight::Medium,
-                            ..Font::DEFAULT
-                        })
+                    text(abs_i18n::tf(
+                        "gui.kernels.tick_tag",
+                        &[("hz", hz_str.as_str())]
+                    ))
+                    .size(12)
+                    .font(Font {
+                        weight: iced::font::Weight::Medium,
+                        ..Font::DEFAULT
+                    })
                 )
                 .padding(Padding::from([4.0, 12.0]))
                 .style(style::tag_muted(theme)),
@@ -3618,7 +3607,13 @@ impl App {
             self.view_pgo_pipeline(theme),
             self.view_oneshot_build(theme),
             self.view_log(theme),
-            kernel_form(EditTarget::Selected, pkg, theme),
+            kernel_form(
+                EditTarget::Selected,
+                pkg,
+                Some(&self.config.kernel_defaults),
+                &self.config.repositories,
+                theme,
+            ),
         ]
         .spacing(16)
         .into()
@@ -3629,7 +3624,9 @@ impl App {
         let chip_count = |f: PackageListFilter| {
             names
                 .iter()
-                .filter(|n| package_matches_chip(n, &self.config.packages[*n], f))
+                .filter(|n| {
+                    package_matches_chip(n, &self.config.packages[*n], f, &self.config.repositories)
+                })
                 .count()
         };
         let search = self.package_filter.trim().to_ascii_lowercase();
@@ -3738,12 +3735,18 @@ impl App {
             .filter(|n| {
                 let pkg = &self.config.packages[n];
                 (search.is_empty() || n.to_ascii_lowercase().contains(&search))
-                    && package_matches_chip(n, pkg, self.package_list_filter)
+                    && package_matches_chip(
+                        n,
+                        pkg,
+                        self.package_list_filter,
+                        &self.config.repositories,
+                    )
             })
             .collect();
         sort_package_names(
             &mut filtered_names,
             &self.config.packages,
+            &self.config.repositories,
             self.package_sort,
             self.package_sort_desc,
         );
@@ -3827,7 +3830,16 @@ impl App {
                             .style(style::tag_info(theme)),
                     );
                 }
-                let source = package_source_label(pkg);
+                let source = package_source_label(pkg, &self.config.repositories);
+                let source_kind = if source.eq_ignore_ascii_case("aur") {
+                    style::PkgSourceKind::Aur
+                } else {
+                    style::PkgSourceKind::Official
+                };
+                let source_el: Element<'_, Message> = container(text(source.clone()).size(10.5))
+                    .padding(Padding::from([1.0, 6.0]))
+                    .style(style::source_tag(theme, source_kind))
+                    .into();
                 let mut flags = row![].spacing(4).align_y(Alignment::Center);
                 let mut any_flag = false;
                 if let Some(c) = &pkg.compiler {
@@ -3887,7 +3899,8 @@ impl App {
                     .unwrap_or_else(|| abs_i18n::t("gui.packages.unset").to_string());
                 let isolation = package_isolation_label(pkg);
                 let mut actions = row![].spacing(6).align_y(Alignment::Center);
-                if package_is_aur(pkg) {
+                if package_source_label(pkg, &self.config.repositories).eq_ignore_ascii_case("aur")
+                {
                     actions = actions.push(preview_pkgbuild_button(name.clone(), 11.0, theme));
                 }
                 actions = actions.push(
@@ -3906,7 +3919,7 @@ impl App {
                     dense_table_row(
                         vec![
                             name_row.into(),
-                            text(source).size(11.5).color(style::muted(theme)).into(),
+                            source_el,
                             flags_el,
                             text(threads).size(11.5).font(Font::MONOSPACE).into(),
                             container(text(isolation).size(10.5))
@@ -3949,7 +3962,8 @@ impl App {
             return text(abs_i18n::t("gui.packages.no_selected")).into();
         };
         let is_kernel = pkg.kernel.is_some() || pkg.pgo.is_some();
-        let show_pkgbuild = package_is_aur(pkg);
+        let show_pkgbuild =
+            package_source_label(pkg, &self.config.repositories).eq_ignore_ascii_case("aur");
 
         let mut col = column![widgets::breadcrumb_row(
             abs_i18n::t("gui.nav.packages"),
@@ -3972,7 +3986,12 @@ impl App {
             );
         }
 
-        col = col.push(package_form(EditTarget::Package, pkg, theme));
+        col = col.push(package_form(
+            EditTarget::Package,
+            pkg,
+            &self.config.repositories,
+            theme,
+        ));
         let mut actions = row![button(text(abs_i18n::t("gui.packages.save")).size(14))
             .style(style::btn_primary(theme))
             .on_press(Message::SaveConfig),]
@@ -4317,9 +4336,20 @@ impl App {
 fn kernel_form<'a>(
     target: EditTarget,
     pkg: &'a PackageSection,
+    fallback: Option<&'a PackageSection>,
+    repositories: &'a std::collections::HashMap<String, String>,
     theme: AppTheme,
 ) -> Element<'a, Message> {
-    let ramdisk_str = kstr_value(pkg, KStr::Ramdisk);
+    let ramdisk_str = kstr_pick_value(pkg, fallback, KStr::Ramdisk);
+    let cpusched = kstr_pick_value(pkg, fallback, KStr::Cpusched);
+    let processor_opt = kstr_pick_value(pkg, fallback, KStr::ProcessorOpt);
+    let llvm_lto = kstr_pick_value(pkg, fallback, KStr::LlvmLto);
+    let hz_ticks = kstr_pick_value(pkg, fallback, KStr::HzTicks);
+    let tickrate = kstr_pick_value(pkg, fallback, KStr::Tickrate);
+    let preempt = kstr_pick_value(pkg, fallback, KStr::Preempt);
+    let hugepage = kstr_pick_value(pkg, fallback, KStr::Hugepage);
+    let source = kstr_pick_value(pkg, fallback, KStr::Source);
+    let build_env = kstr_pick_value(pkg, fallback, KStr::BuildEnv);
     let (ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r) = parse_ramdisk_flags(&ramdisk_str);
     let kernel = card_section(
         abs_i18n::t("gui.kernels.options"),
@@ -4330,7 +4360,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.scheduler"),
                     Some(field_help::cpusched()),
                     SCHED_OPTS,
-                    &kstr_value(pkg, KStr::Cpusched),
+                    &cpusched,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::Cpusched, v),
                 ),
@@ -4338,7 +4368,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.processor_opt"),
                     Some(field_help::processor_opt()),
                     &["native", "x86-64-v2", "x86-64-v3", "x86-64-v4"],
-                    &kstr_value(pkg, KStr::ProcessorOpt),
+                    &processor_opt,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::ProcessorOpt, v),
                 ),
@@ -4349,7 +4379,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.llvm_lto"),
                     Some(field_help::llvm_lto()),
                     LTO_OPTS,
-                    &kstr_value(pkg, KStr::LlvmLto),
+                    &llvm_lto,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::LlvmLto, v),
                 ),
@@ -4357,7 +4387,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.hz_ticks"),
                     Some(field_help::hz_ticks()),
                     HZ_OPTS,
-                    &kstr_value(pkg, KStr::HzTicks),
+                    &hz_ticks,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::HzTicks, v),
                 ),
@@ -4368,7 +4398,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.tickrate"),
                     Some(field_help::tickrate()),
                     TICK_OPTS,
-                    &kstr_value(pkg, KStr::Tickrate),
+                    &tickrate,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::Tickrate, v),
                 ),
@@ -4376,7 +4406,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.preempt"),
                     Some(field_help::preempt()),
                     PREEMPT_OPTS,
-                    &kstr_value(pkg, KStr::Preempt),
+                    &preempt,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::Preempt, v),
                 ),
@@ -4386,7 +4416,7 @@ fn kernel_form<'a>(
                 abs_i18n::t("gui.field.hugepage"),
                 Some(field_help::hugepage()),
                 HUGE_OPTS,
-                &kstr_value(pkg, KStr::Hugepage),
+                &hugepage,
                 theme,
                 move |v| Message::SetKernelStr(target, KStr::Hugepage, v),
             ),
@@ -4433,8 +4463,8 @@ fn kernel_form<'a>(
                 field_pick(
                     abs_i18n::t("gui.field.source_repo"),
                     Some(field_help::source()),
-                    SOURCE_OPTS,
-                    &kstr_value(pkg, KStr::Source),
+                    source_repo_options(repositories),
+                    &source,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::Source, v),
                 ),
@@ -4442,7 +4472,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.build_env"),
                     Some(field_help::build_env()),
                     ENV_OPTS,
-                    &kstr_value(pkg, KStr::BuildEnv),
+                    &build_env,
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::BuildEnv, v),
                 ),
@@ -4692,6 +4722,7 @@ fn kernel_form<'a>(
 fn package_form<'a>(
     target: EditTarget,
     pkg: &'a PackageSection,
+    repositories: &'a std::collections::HashMap<String, String>,
     theme: AppTheme,
 ) -> Element<'a, Message> {
     let ramdisk_str = kstr_value(pkg, KStr::Ramdisk);
@@ -4705,7 +4736,7 @@ fn package_form<'a>(
                 field_pick(
                     "source",
                     Some(field_help::source()),
-                    SOURCE_OPTS,
+                    source_repo_options(repositories),
                     &kstr_value(pkg, KStr::Source),
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::Source, v),
@@ -4921,25 +4952,53 @@ fn boot_matches(release: Option<&str>, pkg: &str) -> bool {
     release.ends_with(flavor)
 }
 
-fn package_is_aur(pkg: &PackageSection) -> bool {
-    pkg.source
-        .as_deref()
-        .is_some_and(|s| s.eq_ignore_ascii_case("aur"))
+/// `[repositories]` keys a package may use as `source` (skips the `default` alias).
+fn source_repo_options(repositories: &std::collections::HashMap<String, String>) -> Vec<String> {
+    let mut names: Vec<String> = repositories
+        .keys()
+        .filter(|k| !k.eq_ignore_ascii_case("default"))
+        .cloned()
+        .collect();
+    if !names.iter().any(|n| n.eq_ignore_ascii_case("aur")) {
+        names.push("aur".into());
+    }
+    names.sort_by(|a, b| {
+        let rank = |s: &str| if s.eq_ignore_ascii_case("aur") { 0 } else { 1 };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+    });
+    names
 }
 
-fn package_source_label(pkg: &PackageSection) -> String {
-    let mut parts = Vec::new();
-    if let Some(src) = &pkg.source {
-        parts.push(src.clone());
+fn resolved_default_repo(
+    repositories: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let d = repositories.get("default")?.trim();
+    if d.is_empty() {
+        return None;
     }
-    if let Some(up) = &pkg.upstream_github {
-        parts.push(up.clone());
-    }
-    if parts.is_empty() {
-        abs_i18n::t("gui.packages.unset").to_string()
+    if d.contains("://") || d.starts_with("git@") {
+        Some("default".into())
     } else {
-        parts.join(" · ")
+        Some(d.to_string())
     }
+}
+
+fn package_source_label(
+    pkg: &PackageSection,
+    repositories: &std::collections::HashMap<String, String>,
+) -> String {
+    if let Some(src) = pkg
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return src.to_string();
+    }
+    resolved_default_repo(repositories)
+        .unwrap_or_else(|| abs_i18n::t("gui.packages.unset").to_string())
 }
 
 fn package_flags_sort_key(pkg: &PackageSection) -> String {
@@ -4976,6 +5035,7 @@ fn package_isolation_label(pkg: &PackageSection) -> &'static str {
 fn sort_package_names(
     names: &mut [String],
     packages: &std::collections::HashMap<String, PackageSection>,
+    repositories: &std::collections::HashMap<String, String>,
     col: PackageSortCol,
     descending: bool,
 ) {
@@ -4984,9 +5044,9 @@ fn sort_package_names(
         let pb = &packages[b];
         let ord = match col {
             PackageSortCol::Name => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
-            PackageSortCol::Source => package_source_label(pa)
+            PackageSortCol::Source => package_source_label(pa, repositories)
                 .to_ascii_lowercase()
-                .cmp(&package_source_label(pb).to_ascii_lowercase()),
+                .cmp(&package_source_label(pb, repositories).to_ascii_lowercase()),
             PackageSortCol::Flags => package_flags_sort_key(pa).cmp(&package_flags_sort_key(pb)),
             PackageSortCol::Threads => pa.compilation_threads.cmp(&pb.compilation_threads),
             PackageSortCol::Isolation => package_isolation_label(pa)
@@ -5006,7 +5066,12 @@ fn sort_package_names(
     });
 }
 
-fn package_matches_chip(name: &str, pkg: &PackageSection, filter: PackageListFilter) -> bool {
+fn package_matches_chip(
+    name: &str,
+    pkg: &PackageSection,
+    filter: PackageListFilter,
+    repositories: &std::collections::HashMap<String, String>,
+) -> bool {
     match filter {
         PackageListFilter::All => true,
         PackageListFilter::Kernels => {
@@ -5020,11 +5085,12 @@ fn package_matches_chip(name: &str, pkg: &PackageSection, filter: PackageListFil
                     .and_then(|k| k.use_llvm_lto.as_deref())
                     .is_some_and(|v| v != "none")
         }
-        PackageListFilter::Aur => package_is_aur(pkg),
-        PackageListFilter::Official => pkg
-            .source
-            .as_deref()
-            .is_some_and(|s| s.eq_ignore_ascii_case("arch") || s.eq_ignore_ascii_case("cachyos")),
+        PackageListFilter::Aur => {
+            package_source_label(pkg, repositories).eq_ignore_ascii_case("aur")
+        }
+        PackageListFilter::Official => {
+            !package_source_label(pkg, repositories).eq_ignore_ascii_case("aur")
+        }
     }
 }
 
@@ -5078,6 +5144,20 @@ fn validate_pgo_start(section: &PackageSection, package: &str) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+fn kstr_pick_value(pkg: &PackageSection, fallback: Option<&PackageSection>, field: KStr) -> String {
+    let own = kstr_value(pkg, field);
+    if !own.is_empty() {
+        return own;
+    }
+    if let Some(fb) = fallback {
+        let from_defaults = kstr_value(fb, field);
+        if !from_defaults.is_empty() {
+            return from_defaults;
+        }
+    }
+    kstr_value(&crate::config::default_kernel_template(), field)
 }
 
 fn kstr_value(pkg: &PackageSection, field: KStr) -> String {
@@ -5271,7 +5351,8 @@ fn kbool_value(pkg: &PackageSection, field: KBool) -> bool {
             .kernel
             .as_ref()
             .and_then(|k| k.cc_harder.as_deref())
-            .is_some_and(is_truthy),
+            .map(is_truthy)
+            .unwrap_or(true),
         KBool::LtoSuffix => pkg
             .kernel
             .as_ref()
@@ -5302,7 +5383,7 @@ fn set_kbool(pkg: &mut PackageSection, field: KBool, value: bool) {
         KBool::PgoVerifyBoot => pkg.pgo.get_or_insert_with(Default::default).verify_boot = value,
         KBool::CcHarder => {
             pkg.kernel.get_or_insert_with(Default::default).cc_harder =
-                if value { Some("y".into()) } else { None }
+                Some(if value { "yes".into() } else { "no".into() })
         }
         KBool::LtoSuffix => {
             pkg.kernel
@@ -5397,6 +5478,10 @@ mod package_list_sort_tests {
             .collect()
     }
 
+    fn repos() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     #[test]
     fn sorts_by_name_then_toggles_desc() {
         let map = pkgs(&[
@@ -5404,9 +5489,9 @@ mod package_list_sort_tests {
             ("alpha", PackageSection::default()),
         ]);
         let mut names = vec!["zeta".into(), "alpha".into()];
-        sort_package_names(&mut names, &map, PackageSortCol::Name, false);
+        sort_package_names(&mut names, &map, &repos(), PackageSortCol::Name, false);
         assert_eq!(names, ["alpha", "zeta"]);
-        sort_package_names(&mut names, &map, PackageSortCol::Name, true);
+        sort_package_names(&mut names, &map, &repos(), PackageSortCol::Name, true);
         assert_eq!(names, ["zeta", "alpha"]);
     }
 
@@ -5430,7 +5515,7 @@ mod package_list_sort_tests {
             ),
         ]);
         let mut names = vec!["eight".into(), "none".into(), "two".into()];
-        sort_package_names(&mut names, &map, PackageSortCol::Threads, false);
+        sort_package_names(&mut names, &map, &repos(), PackageSortCol::Threads, false);
         assert_eq!(names, ["none", "two", "eight"]);
     }
 
@@ -5447,7 +5532,192 @@ mod package_list_sort_tests {
             ("shared", PackageSection::default()),
         ]);
         let mut names = vec!["solo".into(), "shared".into()];
-        sort_package_names(&mut names, &map, PackageSortCol::Isolation, false);
+        sort_package_names(&mut names, &map, &repos(), PackageSortCol::Isolation, false);
         assert_eq!(names, ["solo", "shared"]);
+    }
+}
+
+#[cfg(test)]
+mod package_source_label_tests {
+    use super::{
+        package_matches_chip, package_source_label, source_repo_options, PackageListFilter,
+    };
+    use crate::config::PackageSection;
+    use std::collections::HashMap;
+
+    fn repos() -> HashMap<String, String> {
+        HashMap::from([
+            ("arch".into(), "https://gitlab.archlinux.org/pkg".into()),
+            ("aur".into(), "https://aur.archlinux.org".into()),
+            (
+                "cachyos".into(),
+                "https://github.com/CachyOS/pkgs.git".into(),
+            ),
+            ("venomo".into(), "https://github.com/Ven0m0/PKG.git".into()),
+            ("default".into(), "arch".into()),
+        ])
+    }
+
+    #[test]
+    fn lists_configured_repo_keys_not_official() {
+        let names = source_repo_options(&repos());
+        assert!(names.contains(&"arch".to_string()));
+        assert!(names.contains(&"cachyos".to_string()));
+        assert!(names.contains(&"venomo".to_string()));
+        assert!(names.contains(&"aur".to_string()));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("default")));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("official")));
+        assert_eq!(names.first().map(String::as_str), Some("aur"));
+    }
+
+    #[test]
+    fn package_row_shows_repo_key_not_official() {
+        let pkg = PackageSection {
+            source: Some("arch".into()),
+            ..Default::default()
+        };
+        assert_eq!(package_source_label(&pkg, &repos()), "arch");
+        let custom = PackageSection {
+            source: Some("venomo".into()),
+            ..Default::default()
+        };
+        assert_eq!(package_source_label(&custom, &repos()), "venomo");
+        let aur = PackageSection {
+            source: Some("aur".into()),
+            ..Default::default()
+        };
+        assert_eq!(package_source_label(&aur, &repos()), "aur");
+    }
+
+    #[test]
+    fn unset_source_uses_default_repo_key() {
+        let pkg = PackageSection::default();
+        assert_eq!(package_source_label(&pkg, &repos()), "arch");
+    }
+
+    #[test]
+    fn repos_filter_includes_custom_and_excludes_aur() {
+        let arch = PackageSection {
+            source: Some("arch".into()),
+            ..Default::default()
+        };
+        let custom = PackageSection {
+            source: Some("venomo".into()),
+            ..Default::default()
+        };
+        let aur = PackageSection {
+            source: Some("aur".into()),
+            ..Default::default()
+        };
+        let r = repos();
+        assert!(package_matches_chip(
+            "vim",
+            &arch,
+            PackageListFilter::Official,
+            &r
+        ));
+        assert!(package_matches_chip(
+            "foo",
+            &custom,
+            PackageListFilter::Official,
+            &r
+        ));
+        assert!(!package_matches_chip(
+            "paru",
+            &aur,
+            PackageListFilter::Official,
+            &r
+        ));
+        assert!(package_matches_chip(
+            "paru",
+            &aur,
+            PackageListFilter::Aur,
+            &r
+        ));
+    }
+}
+
+#[cfg(test)]
+mod kernel_o3_checkbox_tests {
+    use super::{is_truthy, kbool_value, set_kbool, KBool};
+    use crate::config::PackageSection;
+
+    #[test]
+    fn cc_harder_defaults_on_like_cachyos_pkgbuild() {
+        let pkg = PackageSection::default();
+        assert!(
+            kbool_value(&pkg, KBool::CcHarder),
+            "CachyOS PKGBUILD default is _cc_harder=yes (-O3 on)"
+        );
+    }
+
+    #[test]
+    fn cc_harder_checkbox_writes_yes_no_for_pkgbuild() {
+        let mut pkg = PackageSection::default();
+        set_kbool(&mut pkg, KBool::CcHarder, true);
+        assert_eq!(
+            pkg.kernel.as_ref().unwrap().cc_harder.as_deref(),
+            Some("yes"),
+            "PKGBUILD checks [ \"$_cc_harder\" = \"yes\" ]"
+        );
+        set_kbool(&mut pkg, KBool::CcHarder, false);
+        assert_eq!(
+            pkg.kernel.as_ref().unwrap().cc_harder.as_deref(),
+            Some("no")
+        );
+        assert!(!kbool_value(&pkg, KBool::CcHarder));
+        assert!(is_truthy("yes"));
+        assert!(!is_truthy("no"));
+    }
+}
+
+#[cfg(test)]
+mod kernel_pick_default_tests {
+    use super::{kstr_pick_value, KStr};
+    use crate::config::{default_kernel_template, KernelSection, PackageSection};
+
+    #[test]
+    fn empty_kernel_shows_builtin_pick_defaults() {
+        let pkg = PackageSection::default();
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::Cpusched), "cachyos");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::ProcessorOpt), "native");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::LlvmLto), "thin");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::HzTicks), "1000");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::Tickrate), "full");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::Preempt), "full");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::Hugepage), "always");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::Source), "aur");
+        assert_eq!(kstr_pick_value(&pkg, None, KStr::BuildEnv), "local");
+    }
+
+    #[test]
+    fn prefers_package_value_over_defaults() {
+        let pkg = PackageSection {
+            kernel: Some(KernelSection {
+                cpusched: Some("bore".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let defaults = default_kernel_template();
+        assert_eq!(
+            kstr_pick_value(&pkg, Some(&defaults), KStr::Cpusched),
+            "bore"
+        );
+        assert_eq!(
+            kstr_pick_value(&pkg, Some(&defaults), KStr::LlvmLto),
+            "thin"
+        );
+    }
+
+    #[test]
+    fn prefers_kernel_defaults_over_builtin() {
+        let pkg = PackageSection::default();
+        let mut defaults = default_kernel_template();
+        defaults.kernel.as_mut().unwrap().cpusched = Some("eevdf".into());
+        assert_eq!(
+            kstr_pick_value(&pkg, Some(&defaults), KStr::Cpusched),
+            "eevdf"
+        );
     }
 }

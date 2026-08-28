@@ -44,6 +44,9 @@ pub struct PendingPkg {
     pub name: String,
     pub old: String,
     pub new: String,
+    /// Pacman sync repo (`extra`, `cachyos-extra`, …), `aur`, or an ABS `[repositories]` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +103,8 @@ fn helper_from_argv(argv: &[String]) -> UpdateHelper {
 }
 
 /// Parse a `name old -> new` upgrade line (pacman/checkupdates/yay/paru).
-pub fn parse_upgrade_line(line: &str) -> Option<(String, String, String)> {
+/// `repo/name` prefixes (yay/paru) become `repository` + package name.
+pub fn parse_upgrade_line(line: &str) -> Option<PendingPkg> {
     let line = line.trim();
     if line.is_empty() || line.starts_with("::") || line.starts_with("=>") {
         return None;
@@ -108,19 +112,129 @@ pub fn parse_upgrade_line(line: &str) -> Option<(String, String, String)> {
     let (left, right) = line.split_once("->")?;
     let new = right.split_whitespace().next()?.to_string();
     let mut parts = left.split_whitespace();
-    let name = parts.next()?.to_string();
+    let raw_name = parts.next()?.to_string();
     let old = parts.next()?.to_string();
-    if name.is_empty() || old.is_empty() || new.is_empty() {
+    if raw_name.is_empty() || old.is_empty() || new.is_empty() {
         return None;
     }
-    Some((name, old, new))
+    let (repository, name) = split_repo_qualified_name(&raw_name);
+    Some(PendingPkg {
+        name,
+        old,
+        new,
+        repository,
+    })
+}
+
+fn split_repo_qualified_name(raw: &str) -> (Option<String>, String) {
+    match raw.split_once('/') {
+        Some((repo, name)) if !repo.is_empty() && !name.is_empty() => {
+            (Some(repo.to_string()), name.to_string())
+        }
+        _ => (None, raw.to_string()),
+    }
 }
 
 fn parse_upgrade_text(text: &str) -> Vec<PendingPkg> {
-    text.lines()
-        .filter_map(parse_upgrade_line)
-        .map(|(name, old, new)| PendingPkg { name, old, new })
-        .collect()
+    text.lines().filter_map(parse_upgrade_line).collect()
+}
+
+#[derive(Debug, Clone)]
+struct PacmanSiPkg {
+    name: String,
+    repository: String,
+    version: String,
+}
+
+fn parse_pacman_si_packages(out: &str) -> Vec<PacmanSiPkg> {
+    let mut entries = Vec::new();
+    let mut repository = String::new();
+    let mut name = String::new();
+    let mut version = String::new();
+
+    let flush = |entries: &mut Vec<PacmanSiPkg>, repository: &str, name: &str, version: &str| {
+        if !repository.is_empty() && !name.is_empty() && !version.is_empty() {
+            entries.push(PacmanSiPkg {
+                name: name.to_string(),
+                repository: repository.to_string(),
+                version: version.to_string(),
+            });
+        }
+    };
+
+    for line in out.lines() {
+        let line = line.trim();
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let val = val.trim();
+        match key.trim() {
+            "Repository" => {
+                flush(&mut entries, &repository, &name, &version);
+                repository = val.to_string();
+                name.clear();
+                version.clear();
+            }
+            "Name" => name = val.to_string(),
+            "Version" => version = val.to_string(),
+            _ => {}
+        }
+    }
+    flush(&mut entries, &repository, &name, &version);
+    entries
+}
+
+fn apply_si_repositories(pkgs: &mut [PendingPkg], si_output: &str) {
+    let entries = parse_pacman_si_packages(si_output);
+    for pkg in pkgs {
+        if pkg
+            .repository
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            continue;
+        }
+        let matches: Vec<&PacmanSiPkg> = entries.iter().filter(|e| e.name == pkg.name).collect();
+        let Some(chosen) = matches
+            .iter()
+            .find(|e| e.version == pkg.new)
+            .copied()
+            .or_else(|| matches.first().copied())
+        else {
+            continue;
+        };
+        pkg.repository = Some(chosen.repository.clone());
+    }
+}
+
+fn fill_missing_sync_repositories(pkgs: &mut [PendingPkg]) {
+    let names: Vec<String> = pkgs
+        .iter()
+        .filter(|p| p.repository.as_deref().is_none_or(str::is_empty))
+        .map(|p| p.name.clone())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    for chunk in names.chunks(64) {
+        let mut args = Vec::with_capacity(1 + chunk.len());
+        args.push("-Si");
+        args.extend(chunk.iter().map(String::as_str));
+        let Ok(out) = capture_stdout("pacman", &args) else {
+            continue;
+        };
+        apply_si_repositories(pkgs, &out);
+    }
+}
+
+fn abs_package_source(config: &Config, name: &str) -> Option<String> {
+    config
+        .packages
+        .get(name)
+        .and_then(|p| p.source.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub fn skip_reason(config: &Config, name: &str) -> Option<&'static str> {
@@ -190,7 +304,12 @@ fn collect_manual_pending(
             continue;
         };
         if vercmp(&new, &old).ok().is_some_and(|c| c > 0) {
-            manual.push(PendingPkg { name, old, new });
+            manual.push(PendingPkg {
+                name,
+                old,
+                new,
+                repository: None,
+            });
         }
     }
     (manual, rest)
@@ -209,6 +328,7 @@ fn promote_manual_skipped(
                     name: pkg.name,
                     old: pkg.old,
                     new: pkg.new,
+                    repository: None,
                 });
             }
         } else {
@@ -284,12 +404,24 @@ pub fn print_pending(config: &Config, json: bool) {
 pub fn gather(config: &Config) -> Result<PendingUpdates, String> {
     let helper = helper_from_update_command(&config.system_update.command_to_perform_system_update);
     let repo_raw = gather_repo(config)?;
-    let (repo, mut skipped) = classify_pending(repo_raw, config);
+    let (mut repo, mut skipped) = classify_pending(repo_raw, config);
+    fill_missing_sync_repositories(&mut repo);
     let repo_names: HashSet<String> = repo.iter().map(|p| p.name.clone()).collect();
     let aur_raw = gather_aur(helper, &repo_names)?;
-    let (aur, skipped_aur) = classify_pending(aur_raw, config);
+    let (mut aur, skipped_aur) = classify_pending(aur_raw, config);
     skipped.extend(skipped_aur);
-    let (manual, skipped) = collect_manual_pending(config, skipped);
+    for pkg in &mut aur {
+        if pkg.repository.as_deref().is_none_or(str::is_empty) {
+            pkg.repository = Some("aur".into());
+        }
+    }
+    let (mut manual, skipped) = collect_manual_pending(config, skipped);
+    for pkg in &mut manual {
+        if pkg.repository.as_deref().is_none_or(str::is_empty) {
+            pkg.repository = abs_package_source(config, &pkg.name);
+        }
+    }
+    fill_missing_sync_repositories(&mut manual);
     Ok(PendingUpdates {
         helper: helper.as_str().to_string(),
         repo,
@@ -358,6 +490,7 @@ fn gather_aur_rpc() -> Result<Vec<PendingPkg>, String> {
                 name,
                 old,
                 new: new.clone(),
+                repository: None,
             });
         }
     }
@@ -375,7 +508,7 @@ fn print_human(pending: &PendingUpdates) {
         println!("    {}", "(none)".dimmed());
     } else {
         for p in &pending.repo {
-            println!("    {}  {} -> {}", p.name.bold(), p.old, p.new.green());
+            print_pending_pkg(p);
         }
     }
     println!("{} AUR ({})", "==>".green().bold(), pending.aur.len());
@@ -383,7 +516,7 @@ fn print_human(pending: &PendingUpdates) {
         println!("    {}", "(none)".dimmed());
     } else {
         for p in &pending.aur {
-            println!("    {}  {} -> {}", p.name.bold(), p.old, p.new.green());
+            print_pending_pkg(p);
         }
     }
     println!(
@@ -395,7 +528,7 @@ fn print_human(pending: &PendingUpdates) {
         println!("    {}", "(none)".dimmed());
     } else {
         for p in &pending.manual {
-            println!("    {}  {} -> {}", p.name.bold(), p.old, p.new.green());
+            print_pending_pkg(p);
         }
     }
     if !pending.skipped.is_empty() {
@@ -415,6 +548,26 @@ fn print_human(pending: &PendingUpdates) {
         }
     }
     let _ = io::stdout().flush();
+}
+
+fn print_pending_pkg(p: &PendingPkg) {
+    match p
+        .repository
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(repo) => {
+            println!(
+                "    {} [{}]  {} -> {}",
+                p.name.bold(),
+                repo,
+                p.old,
+                p.new.green()
+            )
+        }
+        None => println!("    {}  {} -> {}", p.name.bold(), p.old, p.new.green()),
+    }
 }
 
 fn aur_helper_bin(config: &Config) -> Result<UpdateHelper, String> {
@@ -588,21 +741,73 @@ mod tests {
         );
     }
 
+    fn pending(name: &str, old: &str, new: &str) -> PendingPkg {
+        PendingPkg {
+            name: name.into(),
+            old: old.into(),
+            new: new.into(),
+            repository: None,
+        }
+    }
+
     #[test]
     fn parse_checkupdates_line() {
         assert_eq!(
             parse_upgrade_line("linux 6.8.1.arch1-1 -> 6.8.2.arch1-1"),
-            Some((
-                "linux".into(),
-                "6.8.1.arch1-1".into(),
-                "6.8.2.arch1-1".into()
-            ))
+            Some(pending("linux", "6.8.1.arch1-1", "6.8.2.arch1-1"))
         );
         assert_eq!(parse_upgrade_line(":: Synchronising"), None);
         assert_eq!(parse_upgrade_line(""), None);
         assert_eq!(
             parse_upgrade_line("  extra/firefox 1.0-1 -> 1.1-1 extra"),
-            Some(("extra/firefox".into(), "1.0-1".into(), "1.1-1".into()))
+            Some(PendingPkg {
+                name: "firefox".into(),
+                old: "1.0-1".into(),
+                new: "1.1-1".into(),
+                repository: Some("extra".into()),
+            })
+        );
+        assert_eq!(
+            parse_upgrade_line("aur/yay 12.0-1 -> 12.1-1"),
+            Some(PendingPkg {
+                name: "yay".into(),
+                old: "12.0-1".into(),
+                new: "12.1-1".into(),
+                repository: Some("aur".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn apply_si_repositories_picks_repo_matching_new_version() {
+        let mut pkgs = vec![
+            pending("firefox", "1.0-1", "1.2-1"),
+            PendingPkg {
+                name: "linux".into(),
+                old: "6.8-1".into(),
+                new: "6.9-1".into(),
+                repository: Some("core".into()),
+            },
+        ];
+        let si = "\
+Repository      : extra
+Name            : firefox
+Version         : 1.1-1
+
+Repository      : cachyos-extra
+Name            : firefox
+Version         : 1.2-1
+
+Repository      : core
+Name            : linux
+Version         : 6.9-1
+";
+        apply_si_repositories(&mut pkgs, si);
+        assert_eq!(pkgs[0].repository.as_deref(), Some("cachyos-extra"));
+        assert_eq!(
+            pkgs[1].repository.as_deref(),
+            Some("core"),
+            "already-set repository must not be overwritten"
         );
     }
 
@@ -610,21 +815,9 @@ mod tests {
     fn classify_moves_ignored_to_skipped() {
         let config = minimal_config(vec!["linux-cachyos"], vec!["held-via-ignore"]);
         let upgrades = vec![
-            PendingPkg {
-                name: "firefox".into(),
-                old: "1-1".into(),
-                new: "2-1".into(),
-            },
-            PendingPkg {
-                name: "linux-cachyos".into(),
-                old: "1-1".into(),
-                new: "2-1".into(),
-            },
-            PendingPkg {
-                name: "held-via-ignore".into(),
-                old: "1-1".into(),
-                new: "2-1".into(),
-            },
+            pending("firefox", "1-1", "2-1"),
+            pending("linux-cachyos", "1-1", "2-1"),
+            pending("held-via-ignore", "1-1", "2-1"),
         ];
         let (keep, skipped) = classify_pending(upgrades, &config);
         assert_eq!(keep.len(), 1);
@@ -668,11 +861,7 @@ mod tests {
             helper: "yay".into(),
             repo: vec![],
             aur: vec![],
-            manual: vec![PendingPkg {
-                name: "linux-cachyos".into(),
-                old: "1".into(),
-                new: "2".into(),
-            }],
+            manual: vec![pending("linux-cachyos", "1", "2")],
             skipped: vec![],
         };
         assert!(watched.has_work());

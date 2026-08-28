@@ -1657,7 +1657,10 @@ pub fn process_kernel_oneshot(package: &str, cli: &Cli, config: &Config) -> bool
     let mut spec = PackageSpec::plain(package);
     for (key, val) in crate::config::kernel_override_pairs(&kernel) {
         if let Some(v) = val {
-            spec.kernel_vars.insert(key.to_string(), v.clone());
+            spec.kernel_vars.insert(
+                key.to_string(),
+                crate::config::normalize_kernel_override(key, v),
+            );
         }
     }
 

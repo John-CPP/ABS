@@ -4,13 +4,13 @@ default-members = [".", "absgui"]
 resolver = "2"
 
 [workspace.package]
-version = "2.0.3"
+version = "2.0.4"
 
 [package]
 name = "abs"
 # Literal `version =` (not `version.workspace`) so installed abs --self-update
 # clients that only parse `[package]` can still read this file from GitHub.
-version = "2.0.3"
+version = "2.0.4"
 edition = "2024"
 license = "CC-BY-4.0"
 

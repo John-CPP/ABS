@@ -1,8 +1,8 @@
-use iced::futures::channel::mpsc;
 use iced::futures::FutureExt;
 use iced::futures::SinkExt;
 use iced::futures::Stream;
 use iced::futures::StreamExt;
+use iced::futures::channel::mpsc;
 use iced::stream;
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
@@ -34,6 +34,8 @@ pub struct PendingPkg {
     pub name: String,
     pub old: String,
     pub new: String,
+    #[serde(default)]
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1777,10 +1779,12 @@ mod tests {
             )
             .is_none()
         );
-        assert!(super::sanitize_log_line(
-            "[stderr] (yad:1): Gtk-WARNING **: 00:00:00.000: cannot open display"
-        )
-        .is_none());
+        assert!(
+            super::sanitize_log_line(
+                "[stderr] (yad:1): Gtk-WARNING **: 00:00:00.000: cannot open display"
+            )
+            .is_none()
+        );
         assert_eq!(
             super::sanitize_log_line("==> WARNING: Configured vmlinux lacks debug info").as_deref(),
             Some("==> WARNING: Configured vmlinux lacks debug info")

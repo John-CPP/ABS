@@ -33,8 +33,7 @@ fn linux_wgpu_backend_default(existing: Option<&str>) -> Option<&'static str> {
 
 fn apply_linux_wgpu_backend_default() {
     #[cfg(target_os = "linux")]
-    if let Some(backend) =
-        linux_wgpu_backend_default(std::env::var("WGPU_BACKEND").ok().as_deref())
+    if let Some(backend) = linux_wgpu_backend_default(std::env::var("WGPU_BACKEND").ok().as_deref())
     {
         std::env::set_var("WGPU_BACKEND", backend);
     }
