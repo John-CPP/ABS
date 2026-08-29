@@ -44,7 +44,8 @@ jobs:
             done
           done
           [[ ${#names[@]} -eq 3 ]] || { echo "expected abs, absgui, and abs-full packages, got: ${names[*]}"; exit 1; }
-          notes="$(printf 'Built from %s (pkgver %s).\n\n```\nsudo pacman -U %s %s %s\n```\n' '${{ github.sha }}' "$ver" "${names[0]}" "${names[1]}" "${names[2]}")"
+          commit_msg=$(git log -1 --format=%s)
+          notes="$(printf 'ABS ver. %s\n%s\n\n```\nsudo pacman -U %s %s %s\n```\n' "$ver" "$commit_msg" "${names[0]}" "${names[1]}" "${names[2]}")"
           tag="v${ver}"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" --clobber "${pkgs[@]}"
