@@ -650,10 +650,10 @@ mod tests {
             unix: 1_786_000_000,
             target: LogSaveTarget::Update,
             format: LogSaveFormat::Html,
-            hostname: "workstation".into(),
-            user: "john".into(),
-            home: "/home/john".into(),
-            kernel: "6.15.0-cachyos".into(),
+            hostname: "testhost".into(),
+            user: "builder".into(),
+            home: "/home/builder".into(),
+            kernel: "6.12.0-cachyos".into(),
             pid: 4242,
             version: env!("CARGO_PKG_VERSION").into(),
         }
@@ -682,7 +682,7 @@ mod tests {
         let got = expand_template(t, &ctx());
         assert_eq!(
             got,
-            "2026-08-13 16:01:09 Thursday workstation john 6.15.0-cachyos 4242 /home/john System-Update PM 04 Aug %"
+            "2026-08-13 16:01:09 Thursday testhost builder 6.12.0-cachyos 4242 /home/builder System-Update PM 04 Aug %"
         );
     }
 
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn remember_dir_keeps_template() {
-        let t = "/home/john/logs/%date%_%time%_%log_name%.%ext%";
+        let t = "/home/builder/logs/%date%_%time%_%log_name%.%ext%";
         assert_eq!(
             remember_save_dir(t, "/tmp/out/2026-08-13_16-01-09_update.html"),
             "/tmp/out/%date%_%time%_%log_name%.%ext%"

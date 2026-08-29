@@ -533,8 +533,10 @@ const PGO_REPO_RSYNC_EXCLUDES: &[&str] = &[
     ".git/",
     "kernel.data",
     "kernel.data.old",
+    "kernel.data.kernel.json",
     "propeller.data",
     "propeller.data.old",
+    "propeller.data.kernel.json",
 ];
 
 fn repair_root_owned_pgo_artifacts(repo: &Path) {
@@ -1077,12 +1079,14 @@ pub fn shutdown() {
     let session = session_lock().lock().unwrap().take();
     let Some(session) = session else {
         cleanup_pending_workdirs();
+        crate::pgo_priv::maybe_remove_dropin();
         return;
     };
 
     sync_chroot_to_seed(&session);
     cleanup_pending_workdirs();
     unmount_tmpfs(&session.mount_point, session.unmount_on_shutdown);
+    crate::pgo_priv::maybe_remove_dropin();
 }
 
 /// Unmount the configured ramdisk when the abs process no longer has session state

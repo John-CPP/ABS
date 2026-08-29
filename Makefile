@@ -65,6 +65,7 @@ install: release
 	$(SUDO) $(INSTALL) -Dm755 $(RELEASE_DIR)/abs $(DESTDIR)$(BINDIR)/abs
 	$(SUDO) $(INSTALL) -Dm755 $(RELEASE_DIR)/absgui $(DESTDIR)$(BINDIR)/absgui
 	$(SUDO) $(INSTALL) -Dm755 assets/pgo-benchmark.sh $(DESTDIR)$(DATADIR)/abs/pgo-benchmark.sh
+	$(SUDO) $(INSTALL) -Dm755 assets/build-generate-propeller-profiles.sh $(DESTDIR)$(DATADIR)/abs/build-generate-propeller-profiles.sh
 	$(MAKE) install-desktop-assets
 	@echo "Installed release build to $(DESTDIR)$(BINDIR)/{abs,absgui}"
 

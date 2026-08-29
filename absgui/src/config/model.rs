@@ -436,6 +436,8 @@ pub struct PgoSection {
     pub profile_scratch_dir: String,
     #[serde(default = "default_true")]
     pub perf_data_on_ram: bool,
+    #[serde(default = "default_true")]
+    pub propeller_profiles_on_ram: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_command: Option<String>,
     #[serde(default = "default_benchmark_preset")]
@@ -462,8 +464,28 @@ pub struct PgoSection {
     pub afdo_profile_name: String,
     #[serde(default = "default_true")]
     pub verify_boot: bool,
+    #[serde(default = "default_true")]
+    pub select_boot_kernel: bool,
     #[serde(default)]
     pub auto_restart: bool,
+    #[serde(default)]
+    pub reboot_before_start: bool,
+    #[serde(default)]
+    pub reuse_afdo_profile: bool,
+    #[serde(default)]
+    pub reuse_propeller_profile: bool,
+    #[serde(default)]
+    pub compare_current: bool,
+    #[serde(default)]
+    pub compare_debug: bool,
+    #[serde(default)]
+    pub compare_debug_clean: bool,
+    #[serde(default)]
+    pub compare_autofdo: bool,
+    #[serde(default)]
+    pub compare_autofdo_clean: bool,
+    #[serde(default)]
+    pub compare_final: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_file: Option<String>,
 }
@@ -512,6 +534,7 @@ impl Default for PgoSection {
             profiles_archive_dir: None,
             profile_scratch_dir: default_auto(),
             perf_data_on_ram: true,
+            propeller_profiles_on_ram: true,
             benchmark_command: None,
             benchmark_preset: default_benchmark_preset(),
             profiling_quality: default_profiling_quality(),
@@ -525,7 +548,17 @@ impl Default for PgoSection {
             propeller_tool: default_propeller_tool(),
             afdo_profile_name: default_afdo_profile_name(),
             verify_boot: true,
+            select_boot_kernel: true,
             auto_restart: false,
+            reboot_before_start: false,
+            reuse_afdo_profile: false,
+            reuse_propeller_profile: false,
+            compare_current: false,
+            compare_debug: false,
+            compare_debug_clean: false,
+            compare_autofdo: false,
+            compare_autofdo_clean: false,
+            compare_final: false,
             state_file: None,
         }
     }

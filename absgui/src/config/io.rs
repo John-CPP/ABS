@@ -270,13 +270,13 @@ default = "arch"
             .pgo
             .as_mut()
             .unwrap()
-            .profiles_archive_dir = Some("/mnt/hdd/profiles".into());
+            .profiles_archive_dir = Some("/mnt/data/profiles".into());
 
         doc.ensure_kernel_from_defaults("linux-cachyos-bore");
         let pkg = doc.packages.get("linux-cachyos-bore").unwrap();
         assert_eq!(
             pkg.pgo.as_ref().unwrap().profiles_archive_dir.as_deref(),
-            Some("/mnt/hdd/profiles")
+            Some("/mnt/data/profiles")
         );
         assert_eq!(
             pkg.kernel.as_ref().unwrap().cpusched.as_deref(),

@@ -165,10 +165,25 @@ default = "arch"
 #
 # [packages.linux-cachyos.pgo]
 # enabled = true
-# profiles_archive_dir = "/mnt/hdd/abs/pgo/profiles"
+# profiles_archive_dir = "/mnt/data/abs/pgo/profiles"
+# propeller_profiles_on_ram = true  # skip HDD archive; final Propeller build is same boot
 # benchmark_command = "/path/to/custom-benchmark.sh"  # optional; default is bundled assets/pgo-benchmark.sh
 # profiling_quality = "maximum"  # standard | maximum (default: maximum)
+# propeller_tool = "auto"  # generate_propeller_profiles (built if needed for LLVM 22+) or create_llvm_prof
 # perf_extra_args = "--mmap-pages 131072 -a -N -b -c 48000"  # override auto quality tuning
-# build_user = "john"
+# build_user = "builder"
 # sysctl_command = "cachyos-perf-sysctl"
-# auto_restart = false  # reboot + resume via user systemd until PGO completes (--pgo-auto)
+# auto_restart = false  # reboot + resume in a visible terminal until PGO completes (--pgo-auto)
+# select_boot_kernel = true  # oneshot next boot to this stage's kernel (bootctl / grub-reboot); does not change the default
+# reboot_before_start = false  # reboot into the current kernel before the first comparison (same cold-boot as later stages)
+# reuse_afdo_profile = false  # skip AutoFDO collection when a suitable archived profile exists
+# reuse_propeller_profile = false  # skip Propeller collection when suitable archived profiles exist
+# Comparison charts: {profiles_archive_dir}/compare-benchmarks.
+# Checkboxes are no-perf cachyos-benchmarker runs. Profiling (with perf) still feeds with-overhead charts
+# whenever any comparison is on. A standalone clean run drops page cache and does a short fast warm-up;
+# a clean run right after profiling on the same kernel skips that.
+# compare_current = false   # kernel already booted, before the debug PGO build
+# compare_debug_clean = false  # debug kernel, no perf
+# compare_autofdo_clean = false  # AutoFDO kernel, no perf
+# compare_final = false     # Propeller kernel after the last reboot
+# compare_debug / compare_autofdo remain valid in old configs (with-overhead is automatic now)

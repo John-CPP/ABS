@@ -72,12 +72,14 @@ fn is_valid_pgo_phase_key(key: &str) -> bool {
 fn pgo_stage_label(key: &str) -> &'static str {
     match key {
         "stage1_build" => abs_i18n::t("gui.pgo.stage1_build"),
+        "wait_reboot0" => abs_i18n::t("gui.pgo.wait_reboot0"),
         "wait_reboot1" => abs_i18n::t("gui.pgo.wait_reboot1"),
         "stage2_profile" => abs_i18n::t("gui.pgo.stage2_profile"),
         "stage2_build" => abs_i18n::t("gui.pgo.stage2_build"),
         "wait_reboot2" => abs_i18n::t("gui.pgo.wait_reboot2"),
         "stage3_profile" => abs_i18n::t("gui.pgo.stage3_profile"),
         "stage3_build" => abs_i18n::t("gui.pgo.stage3_build"),
+        "wait_reboot3" => abs_i18n::t("gui.pgo.wait_reboot3"),
         _ => abs_i18n::t_or(key, "?"),
     }
 }
@@ -96,8 +98,10 @@ fn pgo_stage_index(stage: &str) -> Option<usize> {
 /// Next runnable phase after a reboot wait gate.
 fn pgo_next_phase_after_wait(wait_key: &str) -> Option<&'static str> {
     match wait_key {
+        "wait_reboot0" => Some("stage1_build"),
         "wait_reboot1" => Some("stage2_profile"),
         "wait_reboot2" => Some("stage3_profile"),
+        "wait_reboot3" => Some("stage3_build"),
         _ => None,
     }
 }
@@ -112,20 +116,43 @@ fn pgo_default_selected_stage(saved: &str) -> String {
     }
 }
 
-/// Stage passed to `--pgo-resume --pgo-stage`. Wait gates are not runnable; omit the flag so abs
-/// auto-advances to the next profile/build step.
+fn pgo_is_wait_reboot(key: &str) -> bool {
+    matches!(
+        key,
+        "wait_reboot0" | "wait_reboot1" | "wait_reboot2" | "wait_reboot3"
+    )
+}
+
+/// Stage passed to `--pgo-resume --pgo-stage`. Wait gates must omit the flag so abs
+/// runs the wait handler (verify boot, optional skip-collect, current/clean benches).
 fn pgo_resume_stage_arg<'a>(selected: &'a str, saved: &str) -> Option<&'a str> {
-    if matches!(selected, "wait_reboot1" | "wait_reboot2") {
-        return None;
-    }
-    if matches!(saved, "wait_reboot1" | "wait_reboot2") && selected == saved {
+    if pgo_is_wait_reboot(selected) || pgo_is_wait_reboot(saved) {
         return None;
     }
     Some(selected)
 }
 
 fn pgo_saved_at_wait_reboot(saved: &str) -> bool {
-    matches!(saved, "wait_reboot1" | "wait_reboot2")
+    pgo_is_wait_reboot(saved)
+}
+
+/// OS-package install and oneshot compile reuse `busy`, but they are not a PGO run.
+fn pgo_timeline_is_live(busy: bool, oneshot: bool, sys_update: bool) -> bool {
+    busy && !oneshot && !sys_update
+}
+
+/// Abort is allowed while a run is in flight, or on the PGO page even when idle
+/// so leftover stages and the reboot auto-resume unit can be cleared.
+fn pgo_abort_allowed(
+    oneshot: bool,
+    busy: bool,
+    has_external_run: bool,
+    _saved_stage: &str,
+) -> bool {
+    if oneshot {
+        return busy || has_external_run;
+    }
+    true
 }
 
 fn join_log_lines(lines: &VecDeque<String>) -> String {
@@ -835,6 +862,37 @@ impl App {
         ))
     }
 
+    fn start_abs_on_kernel_log(&mut self, abs_cmd: String, status: String) -> Task<Message> {
+        if self.busy {
+            return self.push_log(abs_i18n::t("gui.msg.busy_build"));
+        }
+        if let Err(e) = abs_runner::verify_abs_binary() {
+            self.status_message = Some(e.clone());
+            return self.push_log(abs_i18n::tf("gui.msg.cannot_build", &[("e", &e)]));
+        }
+        if let Err(e) = abs_runner::require_gui_askpass() {
+            self.status_message = Some(e.clone());
+            return self.push_log(abs_i18n::tf("gui.msg.cannot_build", &[("e", &e)]));
+        }
+        self.busy = true;
+        self.building_oneshot = true;
+        self.pgo_run.reset();
+        self.build_log.autoscroll = true;
+        self.build_log.pinned = true;
+        self.log_inbox.lock().unwrap().clear();
+        self.log_flush_scheduled.store(false, Ordering::Release);
+        self.last_log_target = LogSaveTarget::Build;
+        self.last_event_log_path = None;
+        self.status_message = Some(status);
+        self.append_log(format!("$ {abs_cmd}"));
+        let handle = self.pgo_run.clone();
+        Task::stream(Self::absorb_abs_stream(
+            self.log_inbox.clone(),
+            self.log_flush_scheduled.clone(),
+            stream_abs_command(abs_cmd, handle, None),
+        ))
+    }
+
     fn sync_terminal_previews(&mut self) {
         self.terminal_preview_dark = self.gui_settings.terminal_theme_dark;
         self.terminal_preview_light = self.gui_settings.terminal_theme_light;
@@ -1047,7 +1105,7 @@ impl App {
             async move {
                 if let Some(p) = pkg {
                     // abort() already runs --ramdisk-shutdown after stopping the build.
-                    let _ = handle.abort(&p, run_pgo_abort, pid_path.as_deref());
+                    let _ = handle.abort(&p, run_pgo_abort, pid_path.as_deref(), true, true);
                 } else {
                     let _ = run_ramdisk_shutdown();
                 }
@@ -1975,10 +2033,8 @@ impl App {
                         abs_runner::pid_file_process_alive(self.external_pid_path.as_deref());
                     // Reboot gates / done / aborted mean abs returned control (the terminal shell
                     // may still be alive waiting for Enter — that must not keep us "busy").
-                    let parked = matches!(
-                        status.stage.as_str(),
-                        "wait_reboot1" | "wait_reboot2" | "done" | "aborted"
-                    );
+                    let parked = pgo_is_wait_reboot(status.stage.as_str())
+                        || matches!(status.stage.as_str(), "done" | "aborted");
                     if parked || !pid_alive {
                         self.busy = false;
                         self.external_run_since = None;
@@ -2031,7 +2087,7 @@ impl App {
                     .unwrap_or_else(|| abs_i18n::t("gui.msg.kernel_fallback"));
                 let status =
                     abs_i18n::tf("gui.msg.pgo_phase_for", &[("label", label), ("pkg", pkg)]);
-                return self.launch_pgo_run(PgoAction::Resume, stage_arg, true, &status);
+                return self.launch_pgo_run(PgoAction::Resume, stage_arg, false, &status);
             }
             Message::PgoContinueAfterReboot => {
                 let pkg = self
@@ -2039,7 +2095,7 @@ impl App {
                     .as_deref()
                     .unwrap_or_else(|| abs_i18n::t("gui.msg.kernel_fallback"));
                 let status = abs_i18n::tf("gui.msg.pgo_continue_reboot", &[("pkg", pkg)]);
-                return self.launch_pgo_run(PgoAction::Resume, None, true, &status);
+                return self.launch_pgo_run(PgoAction::Resume, None, false, &status);
             }
             Message::KernelBuildStart => {
                 let Some(pkg) = self.selected_kernel.clone() else {
@@ -2191,6 +2247,15 @@ impl App {
                     false,
                 );
             }
+            Message::InstallOsKernel => {
+                let Some(pkg) = self.selected_kernel.clone() else {
+                    return Task::none();
+                };
+                return self.start_abs_on_kernel_log(
+                    abs_runner::format_install_os_package(&pkg),
+                    abs_i18n::tf("gui.msg.installing_os", &[("pkg", &pkg)]),
+                );
+            }
             Message::PreviewPkgbuild(name) => {
                 let name = name.trim().to_string();
                 let packages_path = self.config.paths.packages_path.clone();
@@ -2259,13 +2324,19 @@ impl App {
                 let Some(pkg) = self.selected_kernel.clone() else {
                     return Task::none();
                 };
-                if !self.busy && self.external_run_since.is_none() {
+                if !pgo_abort_allowed(
+                    self.building_oneshot,
+                    self.busy,
+                    self.external_run_since.is_some(),
+                    self.effective_pgo_stage(),
+                ) {
                     return self.push_log(abs_i18n::t("gui.msg.no_pgo_active"));
                 }
                 self.status_message =
                     Some(abs_i18n::tf("gui.msg.aborting_build", &[("pkg", &pkg)]));
                 let handle = self.pgo_run.clone();
                 let run_pgo_abort = !self.building_oneshot;
+                let shutdown_ramdisk = self.busy || self.building_oneshot;
                 let pid_path = self.external_pid_path.clone();
                 handle.stop_running_build(pid_path.as_deref());
                 let scroll = self.push_log(abs_i18n::tf(
@@ -2277,9 +2348,19 @@ impl App {
                 if run_pgo_abort {
                     abort_tasks.push(self.push_log(format!("$ {abs_bin} --pgo-abort {pkg}")));
                 }
-                abort_tasks.push(self.push_log(format!("$ {abs_bin} --ramdisk-shutdown")));
+                if shutdown_ramdisk {
+                    abort_tasks.push(self.push_log(format!("$ {abs_bin} --ramdisk-shutdown")));
+                }
                 abort_tasks.push(Task::perform(
-                    async move { handle.abort(&pkg, run_pgo_abort, pid_path.as_deref()) },
+                    async move {
+                        handle.abort(
+                            &pkg,
+                            run_pgo_abort,
+                            pid_path.as_deref(),
+                            false,
+                            shutdown_ramdisk,
+                        )
+                    },
                     Message::PgoAbortFinished,
                 ));
                 return Task::batch(abort_tasks);
@@ -2382,6 +2463,8 @@ impl App {
                 }
                 self.append_log(abs_i18n::t("gui.msg.pipeline_stopped"));
                 self.status_message = Some(abs_i18n::t("gui.msg.aborted").into());
+                self.pgo_selected_stage = pgo_first_phase_key().to_string();
+                self.pgo_status = None;
                 return Task::done(Message::RefreshPgoStatus);
             }
             Message::PgoAbortFinished(Err(e)) => {
@@ -2391,8 +2474,10 @@ impl App {
                 self.running_system_update = false;
                 self.external_run_since = None;
                 self.external_pid_path = None;
+                self.pgo_selected_stage = pgo_first_phase_key().to_string();
                 self.status_message = Some(abs_i18n::tf("gui.msg.abort_failed", &[("e", &e)]));
-                return self.push_log(abs_i18n::tf("gui.msg.abort_failed", &[("e", &e)]));
+                let log = self.push_log(abs_i18n::tf("gui.msg.abort_failed", &[("e", &e)]));
+                return Task::batch([log, Task::done(Message::RefreshPgoStatus)]);
             }
             Message::LogClear => {
                 self.log_inbox.lock().unwrap().clear();
@@ -3606,6 +3691,7 @@ impl App {
             header_banner,
             self.view_pgo_pipeline(theme),
             self.view_oneshot_build(theme),
+            self.view_install_os_kernel(theme),
             self.view_log(theme),
             kernel_form(
                 EditTarget::Selected,
@@ -4152,6 +4238,23 @@ impl App {
         )
     }
 
+    fn view_install_os_kernel(&self, theme: AppTheme) -> Element<'_, Message> {
+        let pkg = self.selected_kernel.as_deref().unwrap_or_default();
+        card_section(
+            abs_i18n::t("gui.kernels.install_os"),
+            theme,
+            column![
+                text(abs_i18n::tf("gui.kernels.install_os_help", &[("pkg", pkg)]))
+                    .size(style::TEXT_HELP)
+                    .color(style::muted(theme)),
+                button(text(abs_i18n::tf("gui.kernels.install_os_btn", &[("pkg", pkg)])).size(13))
+                    .style(style::btn_secondary(theme))
+                    .on_press_maybe((!self.busy).then_some(Message::InstallOsKernel)),
+            ]
+            .spacing(12),
+        )
+    }
+
     fn view_pgo_pipeline(&self, theme: AppTheme) -> Element<'_, Message> {
         let selected = self.pgo_selected_stage.as_str();
         let saved = self.effective_pgo_stage();
@@ -4160,12 +4263,14 @@ impl App {
         let show_start_from_phase =
             !at_wait_reboot && self.pgo_selected_stage != pgo_first_phase_key();
 
+        let pgo_live =
+            pgo_timeline_is_live(self.busy, self.building_oneshot, self.running_system_update);
         let n = PGO_STEPS.len() as u16;
         let (done_n, active_n) = if saved == "done" {
             (n, 0)
         } else if let Some(idx) = saved_idx {
             (idx as u16, 1)
-        } else if self.busy {
+        } else if pgo_live {
             (pgo_stage_index(selected).unwrap_or(0) as u16, 1)
         } else {
             (0, 0)
@@ -4179,7 +4284,7 @@ impl App {
                 let is_selected = selected == key;
                 let is_saved = saved == key || (saved == "done" && key == "stage3_build");
                 let is_done = saved == "done" || saved_idx.is_some_and(|idx| i < idx);
-                let is_active = if self.busy {
+                let is_active = if pgo_live {
                     is_selected && !is_done
                 } else {
                     is_saved && !is_done
@@ -4193,7 +4298,7 @@ impl App {
                 }
             })
             .collect();
-        let timeline = pgo_round_pipeline(steps, done_n, active_n, !self.busy, theme);
+        let timeline = pgo_round_pipeline(steps, done_n, active_n, !pgo_live, theme);
 
         let status_row: Element<'_, Message> = if let Some(ref s) = self.pgo_status {
             let mut badges = row![].spacing(8).align_y(Alignment::Center);
@@ -4557,11 +4662,89 @@ fn kernel_form<'a>(
                     move |v| Message::SetKernelBool(target, KBool::PgoVerifyBoot, v),
                 ),
                 field_checkbox(
-                    abs_i18n::t("gui.field.pgo_perf_data_on_ram"),
-                    Some(field_help::pgo_perf_data_on_ram()),
-                    kbool_value(pkg, KBool::PgoPerfDataOnRam),
+                    abs_i18n::t("gui.field.pgo_select_boot_kernel"),
+                    Some(field_help::pgo_select_boot_kernel()),
+                    kbool_value(pkg, KBool::PgoSelectBootKernel),
                     theme,
-                    move |v| Message::SetKernelBool(target, KBool::PgoPerfDataOnRam, v),
+                    move |v| Message::SetKernelBool(target, KBool::PgoSelectBootKernel, v),
+                ),
+            ]
+            .spacing(16),
+            row![field_checkbox(
+                abs_i18n::t("gui.field.pgo_reboot_before_start"),
+                Some(field_help::pgo_reboot_before_start()),
+                kbool_value(pkg, KBool::PgoRebootBeforeStart),
+                theme,
+                move |v| Message::SetKernelBool(target, KBool::PgoRebootBeforeStart, v),
+            ),]
+            .spacing(16),
+            row![field_checkbox(
+                abs_i18n::t("gui.field.pgo_perf_data_on_ram"),
+                Some(field_help::pgo_perf_data_on_ram()),
+                kbool_value(pkg, KBool::PgoPerfDataOnRam),
+                theme,
+                move |v| Message::SetKernelBool(target, KBool::PgoPerfDataOnRam, v),
+            ),]
+            .spacing(16),
+            row![field_checkbox(
+                abs_i18n::t("gui.field.pgo_propeller_profiles_on_ram"),
+                Some(field_help::pgo_propeller_profiles_on_ram()),
+                kbool_value(pkg, KBool::PgoPropellerProfilesOnRam),
+                theme,
+                move |v| Message::SetKernelBool(target, KBool::PgoPropellerProfilesOnRam, v),
+            ),]
+            .spacing(16),
+            text(abs_i18n::t("gui.pgo.compare_title"))
+                .size(13)
+                .color(style::muted(theme)),
+            row![
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_compare_current"),
+                    Some(field_help::pgo_compare_current()),
+                    kbool_value(pkg, KBool::PgoCompareCurrent),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoCompareCurrent, v),
+                ),
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_compare_final"),
+                    Some(field_help::pgo_compare_final()),
+                    kbool_value(pkg, KBool::PgoCompareFinal),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoCompareFinal, v),
+                ),
+            ]
+            .spacing(16),
+            row![
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_compare_debug_clean"),
+                    Some(field_help::pgo_compare_debug_clean()),
+                    kbool_value(pkg, KBool::PgoCompareDebugClean),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoCompareDebugClean, v),
+                ),
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_compare_autofdo_clean"),
+                    Some(field_help::pgo_compare_autofdo_clean()),
+                    kbool_value(pkg, KBool::PgoCompareAutofdoClean),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoCompareAutofdoClean, v),
+                ),
+            ]
+            .spacing(16),
+            row![
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_reuse_afdo_profile"),
+                    Some(field_help::pgo_reuse_afdo_profile()),
+                    kbool_value(pkg, KBool::PgoReuseAfdoProfile),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoReuseAfdoProfile, v),
+                ),
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_reuse_propeller_profile"),
+                    Some(field_help::pgo_reuse_propeller_profile()),
+                    kbool_value(pkg, KBool::PgoReusePropellerProfile),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoReusePropellerProfile, v),
                 ),
             ]
             .spacing(16),
@@ -4577,7 +4760,7 @@ fn kernel_form<'a>(
                 abs_i18n::t("gui.field.pgo_archive_dir"),
                 Some(field_help::pgo_archive_dir()),
                 &kstr_value(pkg, KStr::ArchiveDir),
-                "/mnt/hdd/abs/pgo/profiles",
+                "/mnt/data/abs/pgo/profiles",
                 WPathField::PgoArchiveDir,
                 WPathKind::Folder,
                 theme,
@@ -4644,7 +4827,7 @@ fn kernel_form<'a>(
                     abs_i18n::t("gui.field.pgo_build_user"),
                     Some(field_help::pgo_build_user()),
                     &kstr_value(pkg, KStr::BuildUser),
-                    "john",
+                    "builder",
                     theme,
                     move |v| Message::SetKernelStr(target, KStr::BuildUser, v),
                 ),
@@ -5346,7 +5529,44 @@ fn kbool_value(pkg: &PackageSection, field: KBool) -> bool {
         KBool::PgoEnabled => pkg.pgo.as_ref().map(|p| p.enabled).unwrap_or(true),
         KBool::PgoAutoRestart => pkg.pgo.as_ref().map(|p| p.auto_restart).unwrap_or(false),
         KBool::PgoPerfDataOnRam => pkg.pgo.as_ref().map(|p| p.perf_data_on_ram).unwrap_or(true),
+        KBool::PgoPropellerProfilesOnRam => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.propeller_profiles_on_ram)
+            .unwrap_or(true),
         KBool::PgoVerifyBoot => pkg.pgo.as_ref().map(|p| p.verify_boot).unwrap_or(true),
+        KBool::PgoSelectBootKernel => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.select_boot_kernel)
+            .unwrap_or(true),
+        KBool::PgoCompareCurrent => pkg.pgo.as_ref().map(|p| p.compare_current).unwrap_or(false),
+        KBool::PgoCompareDebugClean => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.compare_debug_clean)
+            .unwrap_or(false),
+        KBool::PgoCompareAutofdoClean => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.compare_autofdo_clean)
+            .unwrap_or(false),
+        KBool::PgoCompareFinal => pkg.pgo.as_ref().map(|p| p.compare_final).unwrap_or(false),
+        KBool::PgoRebootBeforeStart => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.reboot_before_start)
+            .unwrap_or(false),
+        KBool::PgoReuseAfdoProfile => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.reuse_afdo_profile)
+            .unwrap_or(false),
+        KBool::PgoReusePropellerProfile => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.reuse_propeller_profile)
+            .unwrap_or(false),
         KBool::CcHarder => pkg
             .kernel
             .as_ref()
@@ -5380,7 +5600,48 @@ fn set_kbool(pkg: &mut PackageSection, field: KBool, value: bool) {
                 .get_or_insert_with(Default::default)
                 .perf_data_on_ram = value
         }
+        KBool::PgoPropellerProfilesOnRam => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .propeller_profiles_on_ram = value
+        }
         KBool::PgoVerifyBoot => pkg.pgo.get_or_insert_with(Default::default).verify_boot = value,
+        KBool::PgoSelectBootKernel => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .select_boot_kernel = value
+        }
+        KBool::PgoCompareCurrent => {
+            pkg.pgo.get_or_insert_with(Default::default).compare_current = value
+        }
+        KBool::PgoCompareDebugClean => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .compare_debug_clean = value
+        }
+        KBool::PgoCompareAutofdoClean => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .compare_autofdo_clean = value
+        }
+        KBool::PgoCompareFinal => {
+            pkg.pgo.get_or_insert_with(Default::default).compare_final = value
+        }
+        KBool::PgoRebootBeforeStart => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .reboot_before_start = value
+        }
+        KBool::PgoReuseAfdoProfile => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .reuse_afdo_profile = value
+        }
+        KBool::PgoReusePropellerProfile => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .reuse_propeller_profile = value
+        }
         KBool::CcHarder => {
             pkg.kernel.get_or_insert_with(Default::default).cc_harder =
                 Some(if value { "yes".into() } else { "no".into() })
@@ -5448,6 +5709,19 @@ mod pgo_validation_tests {
             ..Default::default()
         };
         validate_pgo_start(&section, "linux-cachyos").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pgo_timeline_tests {
+    use super::pgo_timeline_is_live;
+
+    #[test]
+    fn os_install_and_oneshot_do_not_light_the_pgo_timeline() {
+        assert!(pgo_timeline_is_live(true, false, false));
+        assert!(!pgo_timeline_is_live(true, true, false));
+        assert!(!pgo_timeline_is_live(true, false, true));
+        assert!(!pgo_timeline_is_live(false, false, false));
     }
 }
 
@@ -5719,5 +5993,63 @@ mod kernel_pick_default_tests {
             kstr_pick_value(&pkg, Some(&defaults), KStr::Cpusched),
             "eevdf"
         );
+    }
+}
+
+#[cfg(test)]
+mod pgo_abort_tests {
+    use super::pgo_abort_allowed;
+
+    #[test]
+    fn idle_reboot_wait_can_be_aborted() {
+        assert!(pgo_abort_allowed(false, false, false, "wait_reboot1"));
+        assert!(pgo_abort_allowed(false, false, false, "stage2_build"));
+    }
+
+    #[test]
+    fn idle_pgo_pipeline_can_always_be_aborted() {
+        assert!(pgo_abort_allowed(false, false, false, ""));
+        assert!(pgo_abort_allowed(false, false, false, "wait_reboot1"));
+        assert!(pgo_abort_allowed(false, false, false, "done"));
+    }
+
+    #[test]
+    fn busy_or_external_run_can_be_aborted() {
+        assert!(pgo_abort_allowed(false, true, false, ""));
+        assert!(pgo_abort_allowed(false, false, true, ""));
+        assert!(pgo_abort_allowed(true, true, false, ""));
+        assert!(!pgo_abort_allowed(true, false, false, "wait_reboot1"));
+    }
+}
+
+#[cfg(test)]
+mod pgo_wait_tests {
+    use super::{
+        pgo_default_selected_stage, pgo_is_wait_reboot, pgo_resume_stage_arg,
+        pgo_saved_at_wait_reboot,
+    };
+
+    #[test]
+    fn wait_reboot0_and_3_are_wait_gates() {
+        assert!(pgo_is_wait_reboot("wait_reboot0"));
+        assert!(pgo_is_wait_reboot("wait_reboot3"));
+        assert!(pgo_saved_at_wait_reboot("wait_reboot0"));
+        assert!(!pgo_is_wait_reboot("stage1_build"));
+    }
+
+    #[test]
+    fn resume_omits_stage_flag_at_any_wait_gate() {
+        assert_eq!(pgo_resume_stage_arg("stage1_build", "wait_reboot0"), None);
+        assert_eq!(pgo_resume_stage_arg("stage2_profile", "wait_reboot1"), None);
+        assert_eq!(
+            pgo_resume_stage_arg("stage1_build", "stage1_build"),
+            Some("stage1_build")
+        );
+    }
+
+    #[test]
+    fn default_selected_after_start_reboot_is_debug_build() {
+        assert_eq!(pgo_default_selected_stage("wait_reboot0"), "stage1_build");
+        assert_eq!(pgo_default_selected_stage("wait_reboot3"), "stage3_build");
     }
 }

@@ -1812,6 +1812,19 @@ mod tests {
             super::pgo_pkgbase_from_env("linux-cachyos-bore", &stage2),
             "linux-cachyos-bore-lto"
         );
+        let thin_keep_name = HashMap::from([
+            ("_use_llvm_lto".into(), "thin".into()),
+            ("_use_lto_suffix".into(), "no".into()),
+            ("_use_gcc_suffix".into(), "no".into()),
+        ]);
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos", &thin_keep_name),
+            "linux-cachyos"
+        );
+        assert_eq!(
+            super::pgo_pkgbase_from_env("linux-cachyos-bore", &thin_keep_name),
+            "linux-cachyos-bore"
+        );
         // A package already named with the -lto suffix builds the plain kernel at stage 1
         // and does not double the suffix at stage 2.
         assert_eq!(
@@ -1909,6 +1922,7 @@ mod tests {
             pending_updates: false,
             install_repo_updates: false,
             install_aur: None,
+            install_os_package: None,
             set_default_lang: None,
         }
     }

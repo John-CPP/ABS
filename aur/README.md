@@ -36,7 +36,8 @@ Or remove the conflicting files first, then `makepkg -si`:
 sudo rm -f /usr/bin/abs /usr/bin/absgui \
   /usr/share/applications/absgui.desktop \
   /usr/share/icons/hicolor/*/apps/absgui.png \
-  /usr/share/abs/pgo-benchmark.sh
+  /usr/share/abs/pgo-benchmark.sh \
+  /usr/share/abs/build-generate-propeller-profiles.sh
 cd aur && makepkg -si
 ```
 

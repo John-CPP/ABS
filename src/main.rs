@@ -1,4 +1,5 @@
 mod aur_rpc;
+mod boot_entry;
 mod build;
 mod build_env;
 mod cli;
@@ -15,11 +16,14 @@ mod package_spec;
 mod pending_updates;
 mod pgo;
 mod pgo_benchmark;
+mod pgo_priv;
+mod pgo_scraper;
 mod pkgbuild;
 mod purge;
 mod ramdisk;
 mod self_update;
 mod system;
+mod terminal;
 mod toml_pretty;
 mod upstream;
 mod utils;
@@ -286,6 +290,9 @@ macro_rules! vlog {
 }
 
 fn main() {
+    if let Some(args) = pgo_priv::take_cli_args(std::env::args().skip(1)) {
+        std::process::exit(pgo_priv::main_as_root(&args));
+    }
     let cli = Cli::parse();
     let _terminal_guard = crate::utils::TerminalRestoreGuard::new();
 
@@ -397,6 +404,12 @@ fn main() {
         }
         return;
     }
+    if let Some(pkg) = &cli.install_os_package {
+        if let Err(e) = pending_updates::install_os_package(pkg) {
+            die!("{}", e);
+        }
+        return;
+    }
 
     if cli.check_update {
         match self_update::check_for_update() {
@@ -502,17 +515,22 @@ fn main() {
             || cli.pgo_restart.is_some()
             || cli.pgo_goto
             || cli.pgo_abort.is_some();
-        if !cli.dry_run && pgo_needs_sudo {
-            if let Err(e) = prime_sudo_for_session() {
-                if std::env::var_os("ABS_GUI").is_some() {
-                    die!("{}", e);
+        // Auto-resume from systemd has no TTY: the child terminal will prime sudo instead.
+        let handoff = pgo::should_handoff_to_visible_terminal(&cli, &config);
+        if !cli.dry_run && pgo_needs_sudo && !handoff {
+            let _ = pgo_priv::try_enable_client();
+            if !pgo_priv::client_enabled() {
+                if let Err(e) = prime_sudo_for_session() {
+                    if std::env::var_os("ABS_GUI").is_some() {
+                        die!("{}", e);
+                    }
+                    ewarn!(
+                        "sudo -v failed (PGO build steps may prompt for a password again): {}",
+                        e
+                    );
                 }
-                ewarn!(
-                    "sudo -v failed (PGO build steps may prompt for a password again): {}",
-                    e
-                );
+                spawn_sudo_keepalive();
             }
-            spawn_sudo_keepalive();
         }
         pgo::handle_cli(&cli, &config);
         return;

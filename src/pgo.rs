@@ -8,8 +8,8 @@ use crate::utils::{run_command, run_command_with_output, sh_single_quote};
 use crate::{blog, die, ewarn, vlog};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -17,11 +17,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROPELLER_TOOL_GENERATE: &str = "generate_propeller_profiles";
 const PROPELLER_TOOL_CREATE_LLVM_PROF: &str = "create_llvm_prof";
+/// Current LLVM SHT_LLVM_BB_ADDR_MAP (see llvm/BinaryFormat/ELF.h).
+const SHT_LLVM_BB_ADDR_MAP: u32 = 0x6fff_4c0a;
+/// Legacy BB_ADDR_MAP type (SHT_LLVM_BB_ADDR_MAP_V0).
+const SHT_LLVM_BB_ADDR_MAP_V0: u32 = 0x6fff_4c08;
+const PROPELLER_BUILD_SCRIPT: &str = include_str!("../assets/build-generate-propeller-profiles.sh");
 
 /// Pipeline stage identifiers persisted in state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PgoStageId {
+    WaitReboot0,
     Stage1Build,
     WaitReboot1,
     Stage2Profile,
@@ -37,6 +43,7 @@ pub enum PgoStageId {
 impl PgoStageId {
     pub fn label(self) -> &'static str {
         match self {
+            Self::WaitReboot0 => "Waiting for reboot (fresh boot before first comparison)",
             Self::Stage1Build => "Stage 1: debug kernel build",
             Self::WaitReboot1 => "Waiting for reboot (boot stage-1 kernel)",
             Self::Stage2Profile => "Stage 2: profile AutoFDO",
@@ -50,9 +57,17 @@ impl PgoStageId {
         }
     }
 
+    pub fn is_wait_reboot(self) -> bool {
+        matches!(
+            self,
+            Self::WaitReboot0 | Self::WaitReboot1 | Self::WaitReboot2 | Self::WaitReboot3
+        )
+    }
+
     /// Stages the user may select with `--pgo-stage` (excludes terminal `done` / `aborted`).
     pub fn selectable_stages() -> &'static [PgoStageId] {
         &[
+            Self::WaitReboot0,
             Self::Stage1Build,
             Self::WaitReboot1,
             Self::Stage2Profile,
@@ -69,6 +84,7 @@ impl PgoStageId {
 pub fn parse_pgo_stage(raw: &str) -> Result<PgoStageId, String> {
     let norm = raw.trim().to_lowercase().replace('-', "_");
     let stage = match norm.as_str() {
+        "wait0" | "reboot0" | "wait_reboot0" | "start_reboot" => PgoStageId::WaitReboot0,
         "1" | "stage1" | "stage1_build" | "debug" | "debug_build" => PgoStageId::Stage1Build,
         "wait1" | "reboot1" | "wait_reboot1" => PgoStageId::WaitReboot1,
         "2p" | "profile" | "stage2_profile" | "autofdo_profile" | "profile_autofdo" => {
@@ -228,6 +244,18 @@ pub fn handle_cli(cli: &Cli, config: &Config) {
         run_abort(&package, cli, config, &events);
         return;
     }
+
+    if should_handoff_to_visible_terminal(cli, config) {
+        match crate::terminal::handoff_auto_resume() {
+            Ok(0) => return,
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                die!(
+                    "Could not continue PGO auto-resume ({e}). Log in graphically or on a console/SSH TTY, then run: abs --pgo-resume {package}"
+                );
+            }
+        }
+    }
     if !cli.pgo_goto {
         crate::utils::request_exit_pause();
     }
@@ -308,8 +336,49 @@ fn pgo_auto_enabled(pgo: &PgoConfig, cli: &Cli) -> bool {
     cli.pgo_auto || pgo.auto_restart
 }
 
+/// Auto PGO started without a TTY (systemd after reboot) should open a terminal.
+pub fn should_handoff_to_visible_terminal(cli: &Cli, config: &Config) -> bool {
+    if cli.json || cli.pgo_status.is_some() || cli.pgo_goto || cli.pgo_abort.is_some() {
+        return false;
+    }
+    if cli.pgo.is_none() && cli.pgo_resume.is_none() && cli.pgo_restart.is_none() {
+        return false;
+    }
+    let package = cli
+        .pgo
+        .as_deref()
+        .or(cli.pgo_resume.as_deref())
+        .or(cli.pgo_restart.as_deref())
+        .or_else(|| cli.packages.first().map(String::as_str));
+    let auto = cli.pgo_auto
+        || package
+            .and_then(|pkg| config.packages.get(pkg))
+            .and_then(|p| p.pgo.as_ref())
+            .is_some_and(|p| p.auto_restart);
+    crate::terminal::should_handoff(
+        auto,
+        cli.json,
+        crate::terminal::stdin_is_tty(),
+        crate::terminal::already_in_visible_terminal(),
+    )
+}
+
 fn pgo_auto_systemd_unit(package: &str) -> String {
     format!("abs-pgo@{package}.service")
+}
+
+fn pgo_auto_resume_enable_links(unit_dir: &Path, package: &str) -> Vec<PathBuf> {
+    let instance = pgo_auto_systemd_unit(package);
+    ["default.target.wants", "graphical-session.target.wants"]
+        .iter()
+        .map(|wants| unit_dir.join(wants).join(&instance))
+        .collect()
+}
+
+fn unlink_pgo_auto_resume_links(unit_dir: &Path, package: &str) {
+    for path in pgo_auto_resume_enable_links(unit_dir, package) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn systemd_quote_exec(path: &str) -> String {
@@ -339,28 +408,36 @@ fn install_pgo_auto_resume_service(package: &str) -> Result<(), String> {
     let template = unit_dir.join("abs-pgo@.service");
     // Note: no After=network-online.target — user units cannot order against that system
     // target, and git/network steps in the pipeline fail with clear errors on their own.
-    let unit = format!(
-        "[Unit]\n\
-         Description=Resume ABS PGO pipeline for %i after reboot\n\
-         \n\
-         [Service]\n\
-         Type=oneshot\n\
-         ExecStart={} --pgo-resume %i --pgo-auto\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        systemd_quote_exec(&abs_bin)
-    );
+    let unit = pgo_auto_unit_text(&abs_bin);
     fs::write(&template, unit).map_err(|e| format!("write {}: {e}", template.display()))?;
     run_command("systemctl", &["--user", "daemon-reload"], None::<&str>)
         .map_err(|e| e.to_string())?;
+    if let Err(e) = crate::pgo_priv::install_dropin() {
+        return Err(format!(
+            "could not install passwordless PGO sudo helper (needed after reboot): {e}"
+        ));
+    }
     let instance = pgo_auto_systemd_unit(package);
+    // reenable drops a previous WantedBy= (e.g. graphical-session.target) so the unit follows the
+    // current template after a reboot.
     run_command(
         "systemctl",
-        &["--user", "enable", instance.as_str()],
+        &["--user", "reenable", instance.as_str()],
         None::<&str>,
     )
     .map_err(|e| format!("enable {instance}: {e}"))?;
+    match run_command("loginctl", &["enable-linger"], None::<&str>) {
+        Ok(()) => {
+            blog!(
+                "Enabled lingering for this user so PGO can wait for a console login after reboot"
+            );
+        }
+        Err(e) => {
+            ewarn!(
+                "Could not enable linger ({e}); without a graphical login, log in on a TTY after reboot or run: loginctl enable-linger"
+            );
+        }
+    }
     blog!("Installed user systemd unit {instance} for PGO auto-restart");
     Ok(())
 }
@@ -372,26 +449,34 @@ pub fn remove_pgo_auto_resume_service(package: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    unlink_pgo_auto_resume_links(&pgo_auto_systemd_dir(), package);
 }
 
-fn trigger_pgo_auto_reboot(package: &str) -> Result<(), String> {
+fn pgo_auto_unit_text(abs_bin: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Resume ABS PGO pipeline for %i after reboot\n\
+         After=graphical-session.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         TimeoutStartSec=infinity\n\
+         ExecStart={} --pgo-resume %i --pgo-auto\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        systemd_quote_exec(abs_bin)
+    )
+}
+
+fn trigger_pgo_auto_reboot(
+    package: &str,
+    next: Option<&crate::boot_entry::NextBoot>,
+) -> Result<(), String> {
     install_pgo_auto_resume_service(package)?;
     blog!("PGO auto-restart: rebooting in 5 seconds to continue pipeline…");
     std::thread::sleep(std::time::Duration::from_secs(5));
-    run_command("sudo", &["reboot"], None::<&str>).map_err(|e| e.to_string())
-}
-
-/// Continue the pipeline in a fresh abs process (profile → build) without rebooting.
-fn trigger_pgo_auto_resume_now(package: &str) -> Result<(), String> {
-    install_pgo_auto_resume_service(package)?;
-    let instance = pgo_auto_systemd_unit(package);
-    blog!("PGO auto-restart: scheduling {instance} to continue pipeline…");
-    run_command(
-        "systemctl",
-        &["--user", "start", instance.as_str()],
-        None::<&str>,
-    )
-    .map_err(|e| format!("start {instance}: {e}"))
+    crate::boot_entry::reboot(next)
 }
 
 fn transition(state: &mut PgoState, stage: PgoStageId) {
@@ -459,16 +544,26 @@ fn run_start(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
             ewarn!("Source prefetch failed; makepkg may download the kernel archive again");
         }
     }
+    let plan = live_work_plan(&pgo);
     let mut state = PgoState {
         package: package.to_string(),
         repo_dir: repo.pkg_dir.to_string_lossy().into_owned(),
-        current_stage: PgoStageId::Stage1Build,
+        current_stage: if plan.reboot_before_start {
+            PgoStageId::WaitReboot0
+        } else {
+            first_post_start_reboot_stage(plan)
+        },
         started_at: EventLog::now(),
         updated_at: EventLog::now(),
         expected_kernel_uname: None,
         expected_package_base: None,
         stage_history: Vec::new(),
     };
+    if plan.reboot_before_start {
+        stamp_running_kernel(&mut state);
+    } else {
+        maybe_run_compare_benchmark(&pgo, package, CompareStage::Current, events, false);
+    }
     save_state(&state_path, &state);
     execute_current_stage(
         &mut state,
@@ -554,22 +649,61 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
         }
     } else {
         match state.current_stage {
+            PgoStageId::WaitReboot0 => {
+                if pgo.verify_boot {
+                    verify_boot_kernel(&state, &pgo);
+                }
+                maybe_run_compare_benchmark(&pgo, package, CompareStage::Current, events, false);
+                transition(
+                    &mut state,
+                    first_post_start_reboot_stage(live_work_plan(&pgo)),
+                );
+            }
             PgoStageId::WaitReboot1 => {
                 if pgo.verify_boot {
                     verify_boot_kernel(&state, &pgo);
                 }
-                transition(&mut state, PgoStageId::Stage2Profile);
+                let plan = live_work_plan(&pgo);
+                if plan.run_afdo_collect {
+                    transition(&mut state, PgoStageId::Stage2Profile);
+                } else {
+                    maybe_run_compare_benchmark(
+                        &pgo,
+                        package,
+                        CompareStage::DebugClean,
+                        events,
+                        false,
+                    );
+                    if plan.run_autofdo_build {
+                        transition(&mut state, PgoStageId::Stage2Build);
+                    } else {
+                        transition(&mut state, PgoStageId::Stage3Build);
+                    }
+                }
             }
             PgoStageId::WaitReboot2 => {
                 if pgo.verify_boot {
                     verify_boot_kernel(&state, &pgo);
                 }
-                transition(&mut state, PgoStageId::Stage3Profile);
+                let plan = live_work_plan(&pgo);
+                if plan.run_propeller_collect {
+                    transition(&mut state, PgoStageId::Stage3Profile);
+                } else {
+                    maybe_run_compare_benchmark(
+                        &pgo,
+                        package,
+                        CompareStage::AutofdoClean,
+                        events,
+                        false,
+                    );
+                    transition(&mut state, PgoStageId::Stage3Build);
+                }
             }
             PgoStageId::WaitReboot3 => {
                 if pgo.verify_boot {
                     verify_boot_kernel(&state, &pgo);
                 }
+                maybe_run_compare_benchmark(&pgo, package, CompareStage::Final, events, false);
                 transition(&mut state, PgoStageId::Done);
                 crate::pkgbuild::restore_pkgbuild(Path::new(&state.repo_dir));
                 remove_pgo_auto_resume_service(package);
@@ -647,7 +781,10 @@ fn run_status(package: &str, config: &Config, json: bool, _events: &EventLog) {
         }
         blog!("  State file: {}", state_path.display());
         match state.current_stage {
-            PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3 => {
+            PgoStageId::WaitReboot0
+            | PgoStageId::WaitReboot1
+            | PgoStageId::WaitReboot2
+            | PgoStageId::WaitReboot3 => {
                 blog!("  Action: reboot, then run: abs --pgo-resume {}", package);
             }
             PgoStageId::Done => blog!("  Action: none (complete)"),
@@ -682,13 +819,30 @@ fn stage_id_name(stage: PgoStageId) -> String {
         .unwrap_or_else(|| format!("{stage:?}"))
 }
 
-fn run_abort(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
-    let disposition = if cli.pgo_keep_stage {
+fn abort_disposition(keep_stage: bool) -> PgoAbortDisposition {
+    if keep_stage {
         PgoAbortDisposition::KeepStage
     } else {
-        PgoAbortDisposition::MarkAborted
-    };
-    run_abort_inner(package, config, events, disposition);
+        PgoAbortDisposition::RemoveState
+    }
+}
+
+fn apply_abort_state(state_path: &Path, disposition: PgoAbortDisposition) {
+    match disposition {
+        PgoAbortDisposition::KeepStage => {}
+        PgoAbortDisposition::RemoveState => {
+            let _ = fs::remove_file(state_path);
+        }
+    }
+}
+
+fn run_abort(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
+    run_abort_inner(
+        package,
+        config,
+        events,
+        abort_disposition(cli.pgo_keep_stage),
+    );
 }
 
 fn run_restart(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
@@ -702,7 +856,6 @@ fn run_restart(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PgoAbortDisposition {
     KeepStage,
-    MarkAborted,
     RemoveState,
 }
 
@@ -761,27 +914,10 @@ fn run_abort_inner(
                 });
             }
         }
-        PgoAbortDisposition::MarkAborted => {
-            if let Some(mut state) = load_state(&state_path) {
-                transition(&mut state, PgoStageId::Aborted);
-                save_state(&state_path, &state);
-            }
-            blog!(
-                "PGO pipeline aborted for {} (kernel packages released from system-update hold; run --pgo to start fresh)",
-                package
-            );
-            events.emit(&PgoEvent::Error {
-                ts: EventLog::now(),
-                message: format!("PGO pipeline aborted for {package}"),
-            });
-        }
         PgoAbortDisposition::RemoveState => {
-            let _ = fs::remove_file(&state_path);
-            blog!("PGO pipeline reset for {package}; starting from stage 1");
-            events.log_line(
-                "stdout",
-                format!("PGO pipeline reset for {package}; starting from stage 1"),
-            );
+            apply_abort_state(&state_path, disposition);
+            blog!("PGO pipeline reset for {package}");
+            events.log_line("stdout", format!("PGO pipeline reset for {package}"));
         }
     }
 }
@@ -846,19 +982,12 @@ fn print_json_status(state: &PgoState, pgo: &PgoConfig) {
         next_action: String,
         stages: Vec<StageOut>,
     }
-    let boot_ready = matches!(
-        state.current_stage,
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3
-    ) && boot_matches_expected(state);
+    let boot_ready = state.current_stage.is_wait_reboot() && boot_matches_expected(state);
     let (reboot_required, next_action) = match state.current_stage {
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3
-            if boot_ready =>
-        {
+        stage if stage.is_wait_reboot() && boot_ready => {
             (false, format!("abs --pgo-resume {}", state.package))
         }
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3 => {
-            (true, reboot_resume_message(state, &state.package))
-        }
+        stage if stage.is_wait_reboot() => (true, reboot_resume_message(state, &state.package)),
         PgoStageId::Done => (false, "none".to_string()),
         PgoStageId::Aborted => (false, "run --pgo to start a fresh pipeline".to_string()),
         _ => (false, format!("abs --pgo-resume {}", state.package)),
@@ -897,11 +1026,24 @@ fn preflight(pgo: &PgoConfig, package: &str, config: &Config) {
     if which(&pgo.afdo_tool).is_none() {
         die!("PGO requires '{}' in PATH (afdo_tool)", pgo.afdo_tool);
     }
-    if let Err(e) = resolve_propeller_tool(&pgo.propeller_tool) {
-        die!("{e}");
+    match resolve_propeller_tool(&pgo.propeller_tool) {
+        Ok(_) => {}
+        Err(_) if can_bootstrap_generate_propeller_profiles() => {
+            ewarn!(
+                "No Propeller converter in PATH; stage 3 will build {PROPELLER_TOOL_GENERATE} \
+                 from https://github.com/google/llvm-propeller against system LLVM"
+            );
+        }
+        Err(e) => die!("{e}"),
     }
     if let Err(e) = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command) {
         die!("{e}");
+    }
+    if pgo.compare_any() && which("cachyos-benchmarker").is_none() {
+        die!(
+            "Comparison benchmarks require cachyos-benchmarker in PATH \
+             (enable compare_current / compare_debug_clean / compare_autofdo_clean / compare_final)"
+        );
     }
     if let Some(pc) = config.packages.get(package)
         && let Ok(targets) = crate::ramdisk::resolve_ramdisk_targets(config, Some(pc), None, None)
@@ -941,6 +1083,380 @@ fn which(cmd: &str) -> Option<PathBuf> {
         }
     }
     dirs.into_iter().map(|d| d.join(cmd)).find(|p| p.is_file())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompareStage {
+    Current,
+    Debug,
+    DebugClean,
+    Autofdo,
+    AutofdoClean,
+    Final,
+}
+
+impl CompareStage {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Debug => "debug",
+            Self::DebugClean => "debug_clean",
+            Self::Autofdo => "autofdo",
+            Self::AutofdoClean => "autofdo_clean",
+            Self::Final => "final",
+        }
+    }
+
+    fn enabled(self, pgo: &PgoConfig) -> bool {
+        match self {
+            Self::Current => pgo.compare_current,
+            Self::Debug => pgo.compare_debug,
+            Self::DebugClean => pgo.compare_debug_clean,
+            Self::Autofdo => pgo.compare_autofdo,
+            Self::AutofdoClean => pgo.compare_autofdo_clean,
+            Self::Final => pgo.compare_final,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Current => "current (pre-PGO) kernel",
+            Self::Debug => "debug PGO kernel (with perf)",
+            Self::DebugClean => "debug PGO kernel (no perf)",
+            Self::Autofdo => "AutoFDO kernel (with perf)",
+            Self::AutofdoClean => "AutoFDO kernel (no perf)",
+            Self::Final => "final Propeller kernel",
+        }
+    }
+
+    /// Debug and AutoFDO comparison scores come from the AutoFDO/Propeller
+    /// `perf record` pass. Current, final, and the extra *_clean stages stay
+    /// as clean standalone runs.
+    fn shares_profiling_run(self) -> bool {
+        matches!(self, Self::Debug | Self::Autofdo)
+    }
+}
+
+fn should_run_standalone_compare(pgo: &PgoConfig, stage: CompareStage) -> bool {
+    stage.enabled(pgo) && !stage.shares_profiling_run()
+}
+
+fn profile_compare_stage(pgo: &PgoConfig, stage: CompareStage) -> Option<CompareStage> {
+    if stage.shares_profiling_run() && pgo.compare_any() {
+        Some(stage)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PgoWorkPlan {
+    reboot_before_start: bool,
+    run_debug_build: bool,
+    run_afdo_collect: bool,
+    run_autofdo_build: bool,
+    run_propeller_collect: bool,
+}
+
+fn pgo_work_plan(pgo: &PgoConfig, afdo_reusable: bool, propeller_reusable: bool) -> PgoWorkPlan {
+    let afdo_ok = pgo.reuse_afdo_profile && afdo_reusable;
+    let prop_ok = pgo.reuse_propeller_profile && propeller_reusable;
+    PgoWorkPlan {
+        reboot_before_start: pgo.reboot_before_start,
+        run_debug_build: pgo.compare_debug_clean || !afdo_ok,
+        run_afdo_collect: !afdo_ok,
+        run_autofdo_build: pgo.compare_autofdo_clean || !prop_ok,
+        run_propeller_collect: !prop_ok,
+    }
+}
+
+fn live_work_plan(pgo: &PgoConfig) -> PgoWorkPlan {
+    pgo_work_plan(
+        pgo,
+        archived_afdo_reusable(pgo),
+        archived_propeller_reusable(pgo),
+    )
+}
+
+fn first_post_start_reboot_stage(plan: PgoWorkPlan) -> PgoStageId {
+    if plan.run_debug_build {
+        PgoStageId::Stage1Build
+    } else if plan.run_autofdo_build {
+        PgoStageId::Stage2Build
+    } else {
+        PgoStageId::Stage3Build
+    }
+}
+
+fn archived_afdo_reusable(pgo: &PgoConfig) -> bool {
+    let Some(archive) = pgo.resolved_archive_dir() else {
+        return false;
+    };
+    validate_afdo_profile(&archive.join(&pgo.afdo_profile_name)).is_ok()
+}
+
+fn archived_propeller_reusable(pgo: &PgoConfig) -> bool {
+    let Some(archive) = pgo.resolved_archive_dir() else {
+        return false;
+    };
+    validate_propeller_profile(&archive.join("propeller_cc_profile.txt")).is_ok()
+        && validate_propeller_profile(&archive.join("propeller_ld_profile.txt")).is_ok()
+}
+
+fn profiling_workload(pgo: &PgoConfig, combine: Option<CompareStage>) -> (&str, Option<String>) {
+    let preset = resolved_benchmark_preset(pgo, combine.is_some());
+    let label = combine.map(|s| crate::pgo_benchmark::compare_run_label(s.slug()));
+    (preset, label)
+}
+
+fn benchie_logs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut logs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("benchie_") && n.ends_with(".log"))
+        })
+        .collect();
+    logs.sort();
+    logs
+}
+
+fn drop_page_cache() {
+    if let Err(e) = run_command(
+        "sudo",
+        &["sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches"],
+        None::<&str>,
+    ) {
+        ewarn!("Could not drop page cache before comparison benchmark: {e}");
+    }
+}
+
+/// Clean cachyos-benchmarker run (no perf record) plus comparison charts.
+/// Debug/AutoFDO stages skip this: their comparison is the profiling run.
+/// `after_perf`: the profiling pass just ran on this kernel, so skip cache-drop + fast warm-up.
+fn maybe_run_compare_benchmark(
+    pgo: &PgoConfig,
+    package: &str,
+    stage: CompareStage,
+    events: &EventLog,
+    after_perf: bool,
+) {
+    if !should_run_standalone_compare(pgo, stage) {
+        return;
+    }
+    let assets = pgo.resolved_benchmark_workdir(package);
+    if let Err(e) = fs::create_dir_all(&assets) {
+        die!("create benchmark workdir {}: {e}", assets.display());
+    }
+
+    let run_label = crate::pgo_benchmark::compare_run_label(stage.slug());
+    blog!(
+        "Comparison benchmark: {} (label={run_label}, no perf record)…",
+        stage.title()
+    );
+    events.log_line(
+        "stdout",
+        format!(
+            "Clean cachyos-benchmarker for {} — charts in {}",
+            stage.title(),
+            pgo.resolved_compare_dir(package).display()
+        ),
+    );
+
+    let benchmark = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command)
+        .unwrap_or_else(|e| die!("{e}"));
+    if after_perf {
+        blog!("Skipping warm-up (profiling run on this kernel just finished)");
+    } else {
+        drop_page_cache();
+        blog!("Warm-up (fast sysbench/stress-ng) before scored comparison…");
+        let warm = crate::pgo_benchmark::warmup_compare_command(&assets, &benchmark);
+        if let Err(e) = run_logged_shell(&assets, &warm, events) {
+            ewarn!("Comparison warm-up failed (continuing with scored run): {e}");
+        }
+    }
+
+    let before = benchie_logs(&assets);
+    let cmd = crate::pgo_benchmark::standalone_compare_command(&assets, &run_label, &benchmark);
+    if let Err(e) = run_logged_shell(&assets, &cmd, events) {
+        die!("Comparison benchmark ({}) failed: {e}", stage.title());
+    }
+
+    publish_compare_log(pgo, package, stage, events, Some(&before), true);
+}
+
+fn publish_compare_log(
+    pgo: &PgoConfig,
+    package: &str,
+    stage: CompareStage,
+    events: &EventLog,
+    before: Option<&[PathBuf]>,
+    required: bool,
+) {
+    let assets = pgo.resolved_benchmark_workdir(package);
+    let compare_dir = pgo.resolved_compare_dir(package);
+    if let Err(e) = fs::create_dir_all(&compare_dir) {
+        die!("create compare-benchmarks {}: {e}", compare_dir.display());
+    }
+
+    let uname = running_kernel_uname();
+    let run_label = crate::pgo_benchmark::compare_run_label(stage.slug());
+    let after = benchie_logs(&assets);
+    let new_logs: Vec<_> = before
+        .map(|old| {
+            after
+                .iter()
+                .filter(|p| !old.iter().any(|prev| prev == *p))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let src = new_logs
+        .last()
+        .cloned()
+        .or_else(|| after_last_matching(&assets, &run_label));
+    let Some(src) = src else {
+        let msg = format!(
+            "Comparison benchmark produced no benchie_*.log in {}",
+            assets.display()
+        );
+        if required {
+            die!("{msg}");
+        }
+        ewarn!("{msg}");
+        return;
+    };
+
+    let raw = fs::read_to_string(&src).unwrap_or_else(|e| die!("read {}: {e}", src.display()));
+    let relabeled = crate::pgo_benchmark::relabel_compare_log(&raw, stage.slug(), &uname);
+    let dest_name = format!(
+        "benchie_{}_{}.log",
+        crate::pgo_benchmark::compare_run_label(stage.slug()),
+        uname.replace('/', "-")
+    );
+    // Replace any previous log for this stage so scraper series stay 1:1 with kernels.
+    if let Ok(entries) = fs::read_dir(&compare_dir) {
+        let prefix = format!(
+            "benchie_{}_",
+            crate::pgo_benchmark::compare_run_label(stage.slug())
+        );
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".log"))
+            {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+    let dest = compare_dir.join(dest_name);
+    if let Err(e) = fs::write(&dest, relabeled) {
+        die!("write {}: {e}", dest.display());
+    }
+    blog!("Comparison log: {}", dest.display());
+    compile_compare_chart_sets(pgo, package, events);
+}
+
+fn compile_compare_chart_sets(pgo: &PgoConfig, package: &str, events: &EventLog) {
+    use crate::pgo_benchmark::{
+        chart_kernel_token, chart_set_dir_name, compare_index_html, compare_stage_is_overhead,
+        include_stage_in_chart_set, relabel_kernel_token, slug_from_benchie_name,
+    };
+
+    let compare_dir = pgo.resolved_compare_dir(package);
+    let mut logs: Vec<(String, PathBuf)> = Vec::new();
+    for path in benchie_logs(&compare_dir) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(slug) = slug_from_benchie_name(name) else {
+            continue;
+        };
+        logs.push((slug.to_string(), path));
+    }
+    if logs.is_empty() {
+        return;
+    }
+    logs.sort_by(|a, b| chart_kernel_token(&a.0).cmp(chart_kernel_token(&b.0)));
+    let has_overhead = logs.iter().any(|(s, _)| compare_stage_is_overhead(s));
+
+    let mut without_tokens: Vec<&str> = Vec::new();
+    let mut with_tokens: Vec<&str> = Vec::new();
+    for with_overhead in [false, true] {
+        if with_overhead && !has_overhead {
+            continue;
+        }
+        let set_dir = compare_dir.join(chart_set_dir_name(with_overhead));
+        let _ = fs::remove_dir_all(&set_dir);
+        if let Err(e) = fs::create_dir_all(&set_dir) {
+            ewarn!("create {}: {e}", set_dir.display());
+            continue;
+        }
+        for (slug, src) in &logs {
+            if !include_stage_in_chart_set(slug, with_overhead) {
+                continue;
+            }
+            let token = chart_kernel_token(slug);
+            let Ok(raw) = fs::read_to_string(src) else {
+                continue;
+            };
+            let dest = set_dir.join(format!("benchie_{token}.log"));
+            if let Err(e) = fs::write(&dest, relabel_kernel_token(&raw, token)) {
+                ewarn!("write {}: {e}", dest.display());
+                continue;
+            }
+            if with_overhead {
+                if !with_tokens.contains(&token) {
+                    with_tokens.push(token);
+                }
+            } else if !without_tokens.contains(&token) {
+                without_tokens.push(token);
+            }
+        }
+        scrape_compare_dir(&set_dir, events);
+    }
+
+    let html = compare_index_html(has_overhead, &without_tokens, &with_tokens);
+    let index = compare_dir.join("index.html");
+    if let Err(e) = fs::write(&index, html) {
+        ewarn!("write {}: {e}", index.display());
+        return;
+    }
+    blog!("Comparison report: {}", index.display());
+}
+
+fn scrape_compare_dir(dir: &Path, _events: &EventLog) {
+    match crate::pgo_scraper::scrape_benchie_dir(dir) {
+        Ok(true) => {
+            blog!(
+                "Comparison charts updated in {} (categorized_comparison_All.svg, \
+                 kernel_version_comparison_All.svg, test_performance.html)",
+                dir.display()
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            ewarn!(
+                "comparison charts failed ({e}); logs are still in {}",
+                dir.display()
+            );
+        }
+    }
+}
+
+fn after_last_matching(dir: &Path, run_label: &str) -> Option<PathBuf> {
+    let needle = format!("benchie_{run_label}_");
+    benchie_logs(dir).into_iter().rev().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&needle))
+    })
 }
 
 fn resolve_repo_dir(
@@ -1012,10 +1528,11 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
         });
         blog!("PGO {}: {}", package, state.current_stage.label());
 
+        let plan = live_work_plan(pgo);
         match state.current_stage {
             PgoStageId::Stage1Build => {
                 let kernel = kernel_cfg();
-                let mut env = stage1_env(&kernel);
+                let mut env = stage1_env(package, &kernel);
                 merge_user_kernel_overrides(&mut env, &kernel);
                 let build_ctx = PgoBuildContext {
                     env_vars: env,
@@ -1032,25 +1549,18 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
             }
             PgoStageId::Stage2Profile => {
                 run_stage2_profile(state, pgo, package, cli, config, events);
-                events.emit(&PgoEvent::StageDone {
-                    ts: EventLog::now(),
-                    stage: entry_stage,
-                    package,
-                });
-                transition(state, PgoStageId::Stage2Build);
-                save_state(state_path, state);
-                if pgo_auto_enabled(pgo, cli)
-                    && !run_once
-                    && let Err(e) = trigger_pgo_auto_resume_now(package)
-                {
-                    die!("PGO auto-restart failed: {e}");
+                maybe_run_compare_benchmark(pgo, package, CompareStage::DebugClean, events, true);
+                if plan.run_autofdo_build {
+                    transition(state, PgoStageId::Stage2Build);
+                } else {
+                    transition(state, PgoStageId::Stage3Build);
                 }
-                return;
+                save_state(state_path, state);
             }
             PgoStageId::Stage2Build => {
-                restore_profiles_to_repo(state, pgo, &["kernel-compilation.afdo"]);
+                restore_profiles_to_repo(state, pgo, &["kernel-compilation.afdo"], None);
                 let kernel = kernel_cfg();
-                let mut env = stage2_build_env(&kernel, &pgo.afdo_profile_name);
+                let mut env = stage2_build_env(package, &kernel, &pgo.afdo_profile_name);
                 merge_user_kernel_overrides(&mut env, &kernel);
                 let build_ctx = PgoBuildContext {
                     env_vars: env,
@@ -1063,26 +1573,20 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 run_pgo_build(package, cli, config, &build_ctx, events);
                 let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
                 record_installed_kernel(state, &pkgbase);
-                transition(state, PgoStageId::WaitReboot2);
+                if plan.run_propeller_collect || pgo.compare_autofdo_clean {
+                    transition(state, PgoStageId::WaitReboot2);
+                } else {
+                    transition(state, PgoStageId::Stage3Build);
+                }
             }
             PgoStageId::Stage3Profile => {
                 run_stage3_profile(state, pgo, package, cli, config, events);
-                events.emit(&PgoEvent::StageDone {
-                    ts: EventLog::now(),
-                    stage: entry_stage,
-                    package,
-                });
+                maybe_run_compare_benchmark(pgo, package, CompareStage::AutofdoClean, events, true);
                 transition(state, PgoStageId::Stage3Build);
                 save_state(state_path, state);
-                if pgo_auto_enabled(pgo, cli)
-                    && !run_once
-                    && let Err(e) = trigger_pgo_auto_resume_now(package)
-                {
-                    die!("PGO auto-restart failed: {e}");
-                }
-                return;
             }
             PgoStageId::Stage3Build => {
+                let scratch = scratch_dir(state, pgo, cli, config);
                 restore_profiles_to_repo(
                     state,
                     pgo,
@@ -1091,9 +1595,10 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                         "propeller_cc_profile.txt",
                         "propeller_ld_profile.txt",
                     ],
+                    Some(&scratch),
                 );
                 let kernel = kernel_cfg();
-                let mut env = stage3_build_env(&kernel, &pgo.afdo_profile_name);
+                let mut env = stage3_build_env(package, &kernel, &pgo.afdo_profile_name);
                 merge_user_kernel_overrides(&mut env, &kernel);
                 let build_ctx = PgoBuildContext {
                     env_vars: env,
@@ -1108,8 +1613,13 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 record_installed_kernel(state, &pkgbase);
                 transition(state, PgoStageId::WaitReboot3);
             }
-            PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3 => {
-                let msg = if pgo_auto_enabled(pgo, cli) && !run_once {
+            PgoStageId::WaitReboot0
+            | PgoStageId::WaitReboot1
+            | PgoStageId::WaitReboot2
+            | PgoStageId::WaitReboot3 => {
+                let auto = pgo_auto_enabled(pgo, cli) && !run_once;
+                let next = select_pgo_boot_kernel(pgo, state, auto);
+                let msg = if auto {
                     format!(
                         "PGO auto-restart: rebooting to continue pipeline for {package}. {}",
                         bootloader_hint(state)
@@ -1128,9 +1638,9 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                     stage: state.current_stage,
                     package,
                 });
-                if pgo_auto_enabled(pgo, cli) && !run_once {
+                if auto {
                     save_state(state_path, state);
-                    if let Err(e) = trigger_pgo_auto_reboot(package) {
+                    if let Err(e) = trigger_pgo_auto_reboot(package, next.as_ref()) {
                         die!("PGO auto-restart failed: {e}");
                     }
                 }
@@ -1139,9 +1649,9 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
             PgoStageId::Done | PgoStageId::Aborted => return,
         }
 
-        // Reached only by build stages that fall through (Stage1Build/Stage2Build transition to a
-        // WaitReboot stage; Stage3Build transitions to Done). Log completion of the stage that just
-        // ran, then loop so the WaitReboot/Done arm handles messaging and returns.
+        // Build stages fall through to WaitReboot; profile stages fall through to the matching
+        // build (same boot). Log completion of the stage that just ran, then loop. `--pgo-once`
+        // stops after this one stage.
         events.emit(&PgoEvent::StageDone {
             ts: EventLog::now(),
             stage: entry_stage,
@@ -1154,11 +1664,14 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
     }
 }
 
+fn stamp_running_kernel(state: &mut PgoState) {
+    let id = running_kernel_identity();
+    state.expected_kernel_uname = Some(id.uname);
+    state.expected_package_base = id.pkgbase;
+}
+
 fn emit_reboot_hint_if_waiting(state: &PgoState, package: &str, events: &EventLog) {
-    if !matches!(
-        state.current_stage,
-        PgoStageId::WaitReboot1 | PgoStageId::WaitReboot2 | PgoStageId::WaitReboot3
-    ) {
+    if !state.current_stage.is_wait_reboot() {
         return;
     }
     let msg = reboot_resume_message(state, package);
@@ -1170,11 +1683,22 @@ fn emit_reboot_hint_if_waiting(state: &PgoState, package: &str, events: &EventLo
     });
 }
 
-fn stage1_env(_kernel: &KernelBuildConfig) -> HashMap<String, String> {
+/// CachyOS PKGBUILD appends `-lto` to pkgbase when this is `yes` and LLVM LTO is on.
+/// Keep the package name the user started PGO with so a later `linux-cachyos-lto` is not
+/// a different repo package that CachyOS will try to replace.
+fn pgo_lto_suffix_flag(package: &str) -> &'static str {
+    let name = package.strip_suffix("-dbg").unwrap_or(package);
+    if name.ends_with("-lto") { "yes" } else { "no" }
+}
+
+fn stage1_env(package: &str, _kernel: &KernelBuildConfig) -> HashMap<String, String> {
     HashMap::from([
         ("_use_llvm_lto".into(), "none".into()),
         ("_processor_opt".into(), "native".into()),
-        ("_use_lto_suffix".into(), "no".into()),
+        (
+            "_use_lto_suffix".into(),
+            pgo_lto_suffix_flag(package).into(),
+        ),
         ("_use_kcfi".into(), "yes".into()),
         ("_build_debug".into(), "yes".into()),
         ("_autofdo".into(), "yes".into()),
@@ -1182,11 +1706,18 @@ fn stage1_env(_kernel: &KernelBuildConfig) -> HashMap<String, String> {
     ])
 }
 
-fn stage2_build_env(_kernel: &KernelBuildConfig, profile: &str) -> HashMap<String, String> {
+fn stage2_build_env(
+    package: &str,
+    _kernel: &KernelBuildConfig,
+    profile: &str,
+) -> HashMap<String, String> {
     HashMap::from([
         ("_use_llvm_lto".into(), "thin".into()),
         ("_processor_opt".into(), "native".into()),
-        ("_use_lto_suffix".into(), "yes".into()),
+        (
+            "_use_lto_suffix".into(),
+            pgo_lto_suffix_flag(package).into(),
+        ),
         ("_use_kcfi".into(), "yes".into()),
         ("_build_debug".into(), "yes".into()),
         ("_autofdo".into(), "yes".into()),
@@ -1196,11 +1727,18 @@ fn stage2_build_env(_kernel: &KernelBuildConfig, profile: &str) -> HashMap<Strin
     ])
 }
 
-fn stage3_build_env(_kernel: &KernelBuildConfig, profile: &str) -> HashMap<String, String> {
+fn stage3_build_env(
+    package: &str,
+    _kernel: &KernelBuildConfig,
+    profile: &str,
+) -> HashMap<String, String> {
     HashMap::from([
         ("_use_llvm_lto".into(), "thin".into()),
         ("_processor_opt".into(), "native".into()),
-        ("_use_lto_suffix".into(), "yes".into()),
+        (
+            "_use_lto_suffix".into(),
+            pgo_lto_suffix_flag(package).into(),
+        ),
         ("_use_kcfi".into(), "yes".into()),
         ("_build_debug".into(), "no".into()),
         ("_autofdo".into(), "yes".into()),
@@ -1379,6 +1917,44 @@ fn kernel_hold_package_names(state: &PgoState) -> Vec<String> {
     names
 }
 
+fn select_pgo_boot_kernel(
+    pgo: &PgoConfig,
+    state: &PgoState,
+    auto: bool,
+) -> Option<crate::boot_entry::NextBoot> {
+    if !pgo.select_boot_kernel {
+        return None;
+    }
+    let pkgbase = state
+        .expected_package_base
+        .as_deref()
+        .unwrap_or(&state.package);
+    match crate::boot_entry::set_next_boot_kernel(pkgbase) {
+        Ok(next) => {
+            let id = match &next {
+                crate::boot_entry::NextBoot::Bli { id }
+                | crate::boot_entry::NextBoot::Grub { id } => id.as_str(),
+            };
+            blog!("Next boot (oneshot) set to {id} for {pkgbase}");
+            Some(next)
+        }
+        Err(e) if auto => {
+            die!(
+                "Could not select bootloader entry for '{pkgbase}': {e}. \
+                 Refusing to reboot into the wrong kernel. {}",
+                bootloader_hint(state)
+            );
+        }
+        Err(e) => {
+            ewarn!(
+                "Could not select bootloader entry for '{pkgbase}': {e}. {}",
+                bootloader_hint(state)
+            );
+            None
+        }
+    }
+}
+
 fn bootloader_hint(state: &PgoState) -> String {
     let pkgbase = state
         .expected_package_base
@@ -1471,8 +2047,9 @@ fn scratch_dir(state: &PgoState, pgo: &PgoConfig, cli: &Cli, config: &Config) ->
     )
     .unwrap_or_default();
 
-    let want_ramdisk =
-        ramdisk_targets.profiles || (pgo.perf_data_on_ram && ramdisk_targets.build_workdir);
+    let want_ramdisk = ramdisk_targets.profiles
+        || ((pgo.perf_data_on_ram || pgo.propeller_profiles_on_ram)
+            && ramdisk_targets.build_workdir);
 
     if want_ramdisk {
         match crate::ramdisk::ensure_pgo_scratch_dir(config, &state.package, &ramdisk_targets) {
@@ -1516,6 +2093,13 @@ fn scratch_dir(state: &PgoState, pgo: &PgoConfig, cli: &Cli, config: &Config) ->
 /// Minimum perf.data size to treat a failed `perf record` as usable (benchmark may exit non-zero).
 const MIN_USABLE_PERF_BYTES: u64 = 50 * 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PerfKernelIdentity {
+    uname: String,
+    #[serde(default)]
+    pkgbase: Option<String>,
+}
+
 fn perf_data_usable(path: &Path) -> Option<u64> {
     let len = fs::metadata(path).ok()?.len();
     if len >= MIN_USABLE_PERF_BYTES {
@@ -1525,10 +2109,84 @@ fn perf_data_usable(path: &Path) -> Option<u64> {
     }
 }
 
+fn perf_identity_sidecar_path(perf_data: &Path) -> PathBuf {
+    let mut name = perf_data.as_os_str().to_os_string();
+    name.push(".kernel.json");
+    PathBuf::from(name)
+}
+
+fn write_perf_kernel_identity(perf_data: &Path, id: &PerfKernelIdentity) -> Result<(), String> {
+    let path = perf_identity_sidecar_path(perf_data);
+    let text = serde_json::to_string_pretty(id)
+        .map_err(|e| format!("serialize perf kernel identity: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn read_perf_kernel_identity(perf_data: &Path) -> Option<PerfKernelIdentity> {
+    let text = fs::read_to_string(perf_identity_sidecar_path(perf_data)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn perf_identity_matches(stored: &PerfKernelIdentity, running: &PerfKernelIdentity) -> bool {
+    if stored.uname != running.uname {
+        return false;
+    }
+    match (&stored.pkgbase, &running.pkgbase) {
+        (Some(stored_base), Some(running_base)) => stored_base.trim() == running_base.trim(),
+        _ => false,
+    }
+}
+
+fn running_kernel_identity() -> PerfKernelIdentity {
+    let uname = running_kernel_uname();
+    let pkgbase = fs::read_to_string(format!("/usr/lib/modules/{uname}/pkgbase"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    PerfKernelIdentity { uname, pkgbase }
+}
+
+/// Ramdisk captures vanish on reboot. Reuse a sidecar-less file there so a failed
+/// `chown` after `perf record` does not throw away a multi-GB profile in the same boot.
+fn allow_anonymous_perf_reuse(path: &Path) -> bool {
+    crate::utils::path_has_prefix(Path::new("/run"), path)
+}
+
+fn usable_matching_perf(path: &Path, running: &PerfKernelIdentity) -> Option<u64> {
+    let n = perf_data_usable(path)?;
+    match read_perf_kernel_identity(path) {
+        Some(stored) if perf_identity_matches(&stored, running) => Some(n),
+        Some(stored) => {
+            ewarn!(
+                "Ignoring existing perf data {} (collected on {} / {}); running kernel is {} / {}",
+                path.display(),
+                stored.uname,
+                stored.pkgbase.as_deref().unwrap_or("unknown"),
+                running.uname,
+                running.pkgbase.as_deref().unwrap_or("unknown"),
+            );
+            None
+        }
+        None if allow_anonymous_perf_reuse(path) => Some(n),
+        None => {
+            ewarn!(
+                "Ignoring existing perf data {} (no kernel identity sidecar); will collect a fresh profile",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Prefer scratch, then the repo copy left after a previous capture (convert can
 /// fail after collection; resume must not throw away a gigabyte of LBR data).
-fn existing_perf_data(scratch_file: &Path, repo: &Path) -> Option<(PathBuf, u64)> {
-    if let Some(n) = perf_data_usable(scratch_file) {
+/// Reuse only when a sidecar records the same running kernel (`uname` + `pkgbase`).
+fn existing_perf_data(
+    scratch_file: &Path,
+    repo: &Path,
+    running: &PerfKernelIdentity,
+) -> Option<(PathBuf, u64)> {
+    if let Some(n) = usable_matching_perf(scratch_file, running) {
         return Some((scratch_file.to_path_buf(), n));
     }
     let name = scratch_file.file_name()?;
@@ -1536,7 +2194,15 @@ fn existing_perf_data(scratch_file: &Path, repo: &Path) -> Option<(PathBuf, u64)
     if repo_file == *scratch_file {
         return None;
     }
-    perf_data_usable(&repo_file).map(|n| (repo_file, n))
+    usable_matching_perf(&repo_file, running).map(|n| (repo_file, n))
+}
+
+fn compare_stage_for_perf_data(perf_data: &Path) -> Option<CompareStage> {
+    match perf_data.file_name().and_then(|n| n.to_str()) {
+        Some("kernel.data") => Some(CompareStage::Debug),
+        Some("propeller.data") => Some(CompareStage::Autofdo),
+        _ => None,
+    }
 }
 
 fn collect_or_reuse_perf_data(
@@ -1546,25 +2212,45 @@ fn collect_or_reuse_perf_data(
     scratch: &Path,
     perf_data: &Path,
     events: &EventLog,
+    persist_to_repo: bool,
 ) -> Result<PathBuf, String> {
-    if let Some((path, bytes)) = existing_perf_data(perf_data, repo) {
+    let combine =
+        compare_stage_for_perf_data(perf_data).and_then(|stage| profile_compare_stage(pgo, stage));
+    let running = running_kernel_identity();
+    let build_user = pgo_build_user(pgo);
+    if let Some((path, bytes)) = existing_perf_data(perf_data, repo, &running) {
         blog!(
             "Reusing existing perf data {} ({bytes} bytes) — skipping collection",
             path.display()
         );
+        write_perf_kernel_identity(&path, &running)?;
+        chown_perf_to_build_user(repo, &path, &build_user)?;
+        if let Some(stage) = combine {
+            publish_compare_log(pgo, package, stage, events, None, false);
+        }
         return Ok(path);
     }
-    run_profile_collection(pgo, package, repo, scratch, perf_data, events)?;
-    sync_perf_data_to_repo(perf_data, repo)?;
+    run_profile_collection(pgo, package, repo, scratch, perf_data, events, combine)?;
+    write_perf_kernel_identity(perf_data, &running)?;
+    if persist_to_repo {
+        sync_perf_data_to_repo(perf_data, repo)?;
+    } else {
+        blog!(
+            "Leaving {} on ramdisk scratch (not copying to the package repo)",
+            perf_data.display()
+        );
+    }
     Ok(perf_data.to_path_buf())
 }
 
-fn finish_profile_collection(
-    pgo: &PgoConfig,
-    repo: &Path,
-    perf_data: &Path,
-    build_user: &str,
-) -> Result<(), String> {
+fn pgo_build_user(pgo: &PgoConfig) -> String {
+    pgo.build_user
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "nobody".to_string())
+}
+
+fn chown_perf_to_build_user(repo: &Path, perf_data: &Path, build_user: &str) -> Result<(), String> {
     run_command(
         "sudo",
         &[
@@ -1575,7 +2261,16 @@ fn finish_profile_collection(
         ],
         Some(repo),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+}
+
+fn finish_profile_collection(
+    pgo: &PgoConfig,
+    repo: &Path,
+    perf_data: &Path,
+    build_user: &str,
+) -> Result<(), String> {
+    chown_perf_to_build_user(repo, perf_data, build_user)?;
     // Brief grace period so perf finishes flushing buffers to perf.data before the
     // profiling sysctls (kptr_restrict / perf_event_paranoid) are restored.
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1603,8 +2298,9 @@ fn run_stage2_profile(
         remove_undersized_profile(&archive.join(&pgo.afdo_profile_name));
     }
 
-    let perf_data = collect_or_reuse_perf_data(pgo, package, &repo, &scratch, &perf_data, events)
-        .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
+    let perf_data =
+        collect_or_reuse_perf_data(pgo, package, &repo, &scratch, &perf_data, events, true)
+            .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -1673,27 +2369,259 @@ fn propeller_tool_exists(tool: &str) -> bool {
     }
 }
 
+fn cached_propeller_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("abs")
+        .join("llvm-propeller")
+}
+
+fn find_generate_propeller_profiles_in(root: &Path) -> Option<String> {
+    let p = root.join("bin").join(PROPELLER_TOOL_GENERATE);
+    p.is_file().then(|| p.to_string_lossy().into_owned())
+}
+
+fn find_generate_propeller_profiles() -> Option<String> {
+    if let Some(p) = which(PROPELLER_TOOL_GENERATE) {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    find_generate_propeller_profiles_in(&cached_propeller_root())
+}
+
+fn bootstrap_tool_present(name: &str) -> bool {
+    which(name).is_some()
+}
+
+fn can_bootstrap_generate_propeller_profiles() -> bool {
+    ["git", "cmake", "ninja", "clang", "clang++"]
+        .into_iter()
+        .all(bootstrap_tool_present)
+        && (bootstrap_tool_present("llvm-config") || bootstrap_tool_present("llvm-config-22"))
+}
+
+fn bb_addr_map_needs_llvm_propeller(version: Option<u8>) -> bool {
+    version.is_some_and(|v| v >= 5)
+}
+
+fn bb_addr_map_version(path: &Path) -> Option<u8> {
+    let mut f = File::open(path).ok()?;
+    let mut ehdr = [0u8; 64];
+    f.read_exact(&mut ehdr).ok()?;
+    if ehdr.get(0..4) != Some(b"\x7fELF") || ehdr[4] != 2 || ehdr[5] != 1 {
+        return None;
+    }
+    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().ok()?);
+    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().ok()?);
+    let mut e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().ok()?);
+    let mut e_shstrndx = u16::from_le_bytes(ehdr[62..64].try_into().ok()?);
+    if e_shentsize != 64 {
+        return None;
+    }
+    // ELF extended numbering: e_shnum/e_shstrndx of 0/SHN_XINDEX store the
+    // real counts in section 0.
+    if e_shnum == 0 || e_shstrndx == 0xffff {
+        let mut sh0 = [0u8; 64];
+        f.seek(SeekFrom::Start(e_shoff)).ok()?;
+        f.read_exact(&mut sh0).ok()?;
+        if e_shnum == 0 {
+            e_shnum = u64::from_le_bytes(sh0[32..40].try_into().ok()?)
+                .try_into()
+                .ok()?;
+        }
+        if e_shstrndx == 0xffff {
+            e_shstrndx = u32::from_le_bytes(sh0[40..44].try_into().ok()?)
+                .try_into()
+                .ok()?;
+        }
+    }
+    if e_shnum == 0 {
+        return None;
+    }
+    let mut shdrs = vec![0u8; e_shnum as usize * 64];
+    f.seek(SeekFrom::Start(e_shoff)).ok()?;
+    f.read_exact(&mut shdrs).ok()?;
+
+    let str_off = 64 * e_shstrndx as usize;
+    let strtab = if str_off + 64 <= shdrs.len() {
+        let off = u64::from_le_bytes(shdrs[str_off + 24..str_off + 32].try_into().ok()?);
+        let size = u64::from_le_bytes(shdrs[str_off + 32..str_off + 40].try_into().ok()?);
+        let size = usize::try_from(size).ok()?.min(1 << 20);
+        let mut buf = vec![0u8; size];
+        if f.seek(SeekFrom::Start(off)).is_ok() && f.read_exact(&mut buf).is_ok() {
+            buf
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    for i in 0..e_shnum as usize {
+        let rec = &shdrs[i * 64..(i + 1) * 64];
+        let sh_name = u32::from_le_bytes(rec[0..4].try_into().ok()?);
+        let sh_type = u32::from_le_bytes(rec[4..8].try_into().ok()?);
+        let sh_offset = u64::from_le_bytes(rec[24..32].try_into().ok()?);
+        let sh_size = u64::from_le_bytes(rec[32..40].try_into().ok()?);
+        let name = {
+            let start = sh_name as usize;
+            if start < strtab.len() {
+                let end = strtab[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| start + p)
+                    .unwrap_or(strtab.len());
+                String::from_utf8_lossy(&strtab[start..end]).into_owned()
+            } else {
+                String::new()
+            }
+        };
+        let by_type = sh_type == SHT_LLVM_BB_ADDR_MAP || sh_type == SHT_LLVM_BB_ADDR_MAP_V0;
+        let by_name = name.contains("bb_addr_map");
+        if (by_type || by_name) && sh_size > 0 {
+            f.seek(SeekFrom::Start(sh_offset)).ok()?;
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).ok()?;
+            return Some(b[0]);
+        }
+    }
+    None
+}
+
 fn resolve_propeller_tool(configured: &str) -> Result<String, String> {
     if propeller_tool_is_auto(configured) {
-        for name in [PROPELLER_TOOL_GENERATE, PROPELLER_TOOL_CREATE_LLVM_PROF] {
-            if propeller_tool_exists(name) {
-                return Ok(name.to_string());
-            }
+        if let Some(p) = find_generate_propeller_profiles() {
+            return Ok(p);
+        }
+        if propeller_tool_exists(PROPELLER_TOOL_CREATE_LLVM_PROF) {
+            return Ok(PROPELLER_TOOL_CREATE_LLVM_PROF.to_string());
         }
         return Err(format!(
-            "PGO requires a Propeller converter in PATH (tried {PROPELLER_TOOL_GENERATE}, \
-             {PROPELLER_TOOL_CREATE_LLVM_PROF}). LLVM 22+ kernels need {PROPELLER_TOOL_GENERATE} \
-             from https://github.com/google/llvm-propeller; {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x \
-             cannot read SHT_LLVM_BB_ADDR_MAP version 5."
+            "PGO requires a Propeller converter (tried {PROPELLER_TOOL_GENERATE}, \
+             {PROPELLER_TOOL_CREATE_LLVM_PROF}). LLVM 22+ kernels need {PROPELLER_TOOL_GENERATE}; \
+             ABS can build it from https://github.com/google/llvm-propeller if git, cmake, ninja, \
+             clang, and llvm are installed. {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x cannot read \
+             SHT_LLVM_BB_ADDR_MAP version 5."
         ));
     }
     let configured = configured.trim();
     if propeller_tool_exists(configured) {
         return Ok(configured.to_string());
     }
+    if let Some(p) = find_generate_propeller_profiles()
+        && (configured == PROPELLER_TOOL_GENERATE || configured.contains("generate_propeller"))
+    {
+        return Ok(p);
+    }
     Err(format!(
         "PGO requires '{configured}' in PATH (propeller_tool)"
     ))
+}
+
+fn materialize_propeller_build_script() -> Result<PathBuf, String> {
+    let path = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("abs")
+        .join("build-generate-propeller-profiles.sh");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(&path)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        file.write_all(PROPELLER_BUILD_SCRIPT.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, PROPELLER_BUILD_SCRIPT.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn bootstrap_generate_propeller_profiles(repo: &Path, events: &EventLog) -> Result<String, String> {
+    if !can_bootstrap_generate_propeller_profiles() {
+        return Err(format!(
+            "Need {PROPELLER_TOOL_GENERATE} for this vmlinux (SHT_LLVM_BB_ADDR_MAP v5 / LLVM 22+). \
+             Install build deps and retry: sudo pacman -S --needed cmake ninja clang llvm git libelf. \
+             {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x cannot convert LLVM 22 kernels."
+        ));
+    }
+    let root = cached_propeller_root();
+    fs::create_dir_all(root.join("bin")).map_err(|e| format!("create {}: {e}", root.display()))?;
+    let script = materialize_propeller_build_script()?;
+    blog!(
+        "Building {PROPELLER_TOOL_GENERATE} from llvm-propeller against system LLVM \
+         (needed for SHT_LLVM_BB_ADDR_MAP v5)…"
+    );
+    let cmd = format!(
+        "{} {}",
+        sh_single_quote(&script.to_string_lossy()),
+        sh_single_quote(&root.to_string_lossy())
+    );
+    run_logged_shell(repo, &cmd, events).map_err(|e| {
+        format!(
+            "Failed to build {PROPELLER_TOOL_GENERATE} from llvm-propeller: {e}. \
+             Install: sudo pacman -S --needed cmake ninja clang llvm git libelf"
+        )
+    })?;
+    find_generate_propeller_profiles_in(&root).ok_or_else(|| {
+        format!(
+            "llvm-propeller build finished but {} is missing",
+            root.join("bin").join(PROPELLER_TOOL_GENERATE).display()
+        )
+    })
+}
+
+fn ensure_propeller_tool(
+    configured: &str,
+    vmlinux: &Path,
+    repo: &Path,
+    events: &EventLog,
+) -> Result<String, String> {
+    let version = bb_addr_map_version(vmlinux);
+    if let Some(v) = version {
+        blog!("vmlinux SHT_LLVM_BB_ADDR_MAP version {v}");
+    }
+    let need_generate = bb_addr_map_needs_llvm_propeller(version);
+    if !propeller_tool_is_auto(configured) {
+        let configured = configured.trim();
+        if propeller_tool_exists(configured) {
+            if propeller_tool_kind(configured) == PropellerToolKind::GeneratePropellerProfiles
+                || !need_generate
+            {
+                return Ok(configured.to_string());
+            }
+            ewarn!(
+                "{configured} cannot read SHT_LLVM_BB_ADDR_MAP v{} on this vmlinux; \
+                 switching to {PROPELLER_TOOL_GENERATE}",
+                version.unwrap_or(5)
+            );
+        } else if propeller_tool_kind(configured) != PropellerToolKind::GeneratePropellerProfiles
+            && !need_generate
+        {
+            return Err(format!(
+                "PGO requires '{configured}' in PATH (propeller_tool)"
+            ));
+        }
+    }
+    if let Some(p) = find_generate_propeller_profiles() {
+        return Ok(p);
+    }
+    if need_generate || propeller_tool_is_auto(configured) {
+        return bootstrap_generate_propeller_profiles(repo, events);
+    }
+    resolve_propeller_tool(configured)
 }
 
 fn propeller_convert_command(
@@ -1729,9 +2657,8 @@ fn is_unsupported_bb_addr_map(err: &str) -> bool {
 fn propeller_bb_addr_map_hint(tried: &str) -> String {
     format!(
         "{tried} cannot read this vmlinux (unsupported SHT_LLVM_BB_ADDR_MAP, typical of LLVM 22+). \
-         Install {PROPELLER_TOOL_GENERATE} from https://github.com/google/llvm-propeller, put it on \
-         PATH, and set propeller_tool = \"{PROPELLER_TOOL_GENERATE}\" or \"auto\". \
-         {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x cannot convert LLVM 22 kernels."
+         ABS builds {PROPELLER_TOOL_GENERATE} from llvm-propeller when git, cmake, ninja, clang, \
+         and llvm are installed. {PROPELLER_TOOL_CREATE_LLVM_PROF} 0.30.x cannot convert LLVM 22 kernels."
     )
 }
 
@@ -1753,22 +2680,19 @@ fn convert_propeller_profiles(
         Ok(()) => Ok(()),
         Err(err)
             if is_unsupported_bb_addr_map(&err)
-                && propeller_tool_kind(tool) != PropellerToolKind::GeneratePropellerProfiles
-                && propeller_tool_exists(PROPELLER_TOOL_GENERATE) =>
+                && propeller_tool_kind(tool) != PropellerToolKind::GeneratePropellerProfiles =>
         {
+            let retry_tool = match find_generate_propeller_profiles() {
+                Some(p) => p,
+                None => bootstrap_generate_propeller_profiles(repo, events)?,
+            };
             ewarn!(
-                "{tool} cannot read SHT_LLVM_BB_ADDR_MAP on this vmlinux; retrying with {PROPELLER_TOOL_GENERATE}"
+                "{tool} cannot read SHT_LLVM_BB_ADDR_MAP on this vmlinux; retrying with {retry_tool}"
             );
-            let retry = propeller_convert_command(
-                PROPELLER_TOOL_GENERATE,
-                vmlinux,
-                perf_data,
-                cc_out,
-                ld_out,
-            );
+            let retry = propeller_convert_command(&retry_tool, vmlinux, perf_data, cc_out, ld_out);
             run_logged_shell(repo, &retry, events).map_err(|err2| {
                 if is_unsupported_bb_addr_map(&err2) {
-                    propeller_bb_addr_map_hint(PROPELLER_TOOL_GENERATE)
+                    propeller_bb_addr_map_hint(&retry_tool)
                 } else {
                     err2
                 }
@@ -1790,9 +2714,18 @@ fn run_stage3_profile(
     let repo = PathBuf::from(&state.repo_dir);
     let scratch = scratch_dir(state, pgo, cli, config);
     let _ = fs::create_dir_all(&scratch);
+    let persist_disk = persist_propeller_to_disk(pgo);
     let perf_data = scratch.join("propeller.data");
-    let perf_data = collect_or_reuse_perf_data(pgo, package, &repo, &scratch, &perf_data, events)
-        .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
+    let perf_data = collect_or_reuse_perf_data(
+        pgo,
+        package,
+        &repo,
+        &scratch,
+        &perf_data,
+        events,
+        persist_disk,
+    )
+    .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -1800,19 +2733,31 @@ fn run_stage3_profile(
         state.expected_package_base.as_deref(),
     )
     .unwrap_or_else(|e| die!("{e}"));
-    let cc_out = repo.join("propeller_cc_profile.txt");
-    let ld_out = repo.join("propeller_ld_profile.txt");
-    let tool = resolve_propeller_tool(&pgo.propeller_tool).unwrap_or_else(|e| die!("{e}"));
+    // Convert on scratch when keeping profiles on ramdisk; copy the small cc/ld
+    // texts into the package dir for makepkg. Skip the HDD archive — stage 3
+    // build runs in the same boot.
+    let profile_dir = if persist_disk { &repo } else { &scratch };
+    let cc_out = profile_dir.join("propeller_cc_profile.txt");
+    let ld_out = profile_dir.join("propeller_ld_profile.txt");
+    let tool = ensure_propeller_tool(&pgo.propeller_tool, &vmlinux, &repo, events)
+        .unwrap_or_else(|e| die!("{e}"));
     convert_propeller_profiles(&repo, &tool, &vmlinux, &perf_data, &cc_out, &ld_out, events)
         .unwrap_or_else(|e| die!("{e}"));
 
     for name in ["propeller_cc_profile.txt", "propeller_ld_profile.txt"] {
-        let path = repo.join(name);
+        let path = profile_dir.join(name);
         let bytes = validate_propeller_profile(&path).unwrap_or_else(|e| die!("{e}"));
         blog!("Propeller profile {name} OK ({bytes} bytes)");
-        archive_profile(pgo, &path, name).unwrap_or_else(|e| die!("{e}"));
+        if persist_disk {
+            archive_profile(pgo, &path, name).unwrap_or_else(|e| die!("{e}"));
+        } else {
+            blog!("Keeping Propeller profile {name} on ramdisk scratch (skipping HDD archive)");
+        }
+        let repo_path = repo.join(name);
+        if path != repo_path {
+            copy_to_repo(&path, &repo_path).unwrap_or_else(|e| die!("{e}"));
+        }
     }
-    let _ = package;
 }
 
 fn run_profile_collection(
@@ -1822,11 +2767,12 @@ fn run_profile_collection(
     scratch: &Path,
     perf_data: &Path,
     events: &EventLog,
+    combine: Option<CompareStage>,
 ) -> Result<(), String> {
     sysctl_toggle(pgo, true)?;
     let perf_events = detect_perf_event_args(pgo)?;
     let perf_extra = resolved_perf_extra_args(pgo);
-    let preset = resolved_benchmark_preset(pgo);
+    let (preset, compare_label) = profiling_workload(pgo, combine);
     let benchmark = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command)?;
     let bench_cache = pgo.resolved_benchmark_workdir(package);
     fs::create_dir_all(&bench_cache)
@@ -1837,11 +2783,7 @@ fn run_profile_collection(
         bench_cache.display()
     );
     blog!("PGO perf scratch (may be tmpfs): {}", scratch.display());
-    let build_user = pgo
-        .build_user
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "nobody".to_string());
+    let build_user = pgo_build_user(pgo);
 
     blog!(
         "PGO profiling: quality={}, benchmark_preset={}, perf_extra={}",
@@ -1856,13 +2798,27 @@ fn run_profile_collection(
 
     probe_branch_stack_sampling(repo, scratch, &perf_events, &perf_extra, events)?;
 
-    let bench_cmd = format!(
-        "env ABS_PGO_PROFILE_DIR={} ABS_PGO_BENCHMARK_DIR={} ABS_PGO_BENCHMARK={} {}",
+    if combine.is_some() {
+        drop_page_cache();
+    }
+    let before = if combine.is_some() {
+        benchie_logs(&bench_cache)
+    } else {
+        Vec::new()
+    };
+
+    let mut bench_cmd = format!(
+        "env ABS_PGO_PROFILE_DIR={} ABS_PGO_BENCHMARK_DIR={} ABS_PGO_BENCHMARK={}",
         sh_single_quote(&scratch.to_string_lossy()),
         sh_single_quote(&bench_cache.to_string_lossy()),
         sh_single_quote(preset),
-        crate::pgo_benchmark::shell_benchmark_runner(&benchmark),
     );
+    if let Some(label) = &compare_label {
+        bench_cmd.push_str(" ABS_PGO_COMPARE_LABEL=");
+        bench_cmd.push_str(&sh_single_quote(label));
+    }
+    bench_cmd.push(' ');
+    bench_cmd.push_str(&crate::pgo_benchmark::shell_benchmark_runner(&benchmark));
 
     // Write perf data to the absolute scratch path; cwd may differ from `scratch`
     // (e.g. when perf_data_on_ram puts scratch on the ramdisk while cwd stays the repo).
@@ -1877,14 +2833,30 @@ fn run_profile_collection(
         user = sh_single_quote(&build_user),
         bench = bench_cmd,
     );
-    blog!("Running benchmark with perf record...");
+    if let Some(stage) = combine {
+        blog!(
+            "Running {} comparison + profile collection under perf record (one pass)…",
+            stage.title()
+        );
+    } else {
+        blog!("Running benchmark with perf record...");
+    }
     blog!("PGO benchmark command: {bench_cmd}");
     events.log_line(
         "stdout",
-        format!(
-            "Profiling workload ({preset}): perf record runs until the benchmark script exits. \
-             profiling_quality=maximum forces cachyos-benchmarker and denser sampling."
-        ),
+        if let Some(stage) = combine {
+            format!(
+                "Profiling + comparison ({preset}, label={}): perf record runs until \
+                 cachyos-benchmarker exits. This is the {} chart series, not a second run.",
+                compare_label.as_deref().unwrap_or(""),
+                stage.title()
+            )
+        } else {
+            format!(
+                "Profiling workload ({preset}): perf record runs until the benchmark script exits. \
+                 profiling_quality=maximum forces cachyos-benchmarker and denser sampling."
+            )
+        },
     );
     let perf_result = run_logged_shell(repo, &perf_cmd, events);
     if let Err(e) = perf_result {
@@ -1899,6 +2871,13 @@ fn run_profile_collection(
         }
     }
 
+    if let Some(stage) = combine {
+        publish_compare_log(pgo, package, stage, events, Some(&before), true);
+    }
+
+    // Stamp identity before chown so a helper rejection cannot strand a multi-GB
+    // capture without a sidecar (resume would otherwise collect again).
+    write_perf_kernel_identity(perf_data, &running_kernel_identity())?;
     finish_profile_collection(pgo, repo, perf_data, &build_user)
 }
 
@@ -1993,8 +2972,8 @@ fn profiling_quality_is_maximum(pgo: &PgoConfig) -> bool {
     )
 }
 
-fn resolved_benchmark_preset(pgo: &PgoConfig) -> &str {
-    if profiling_quality_is_maximum(pgo) {
+fn resolved_benchmark_preset(pgo: &PgoConfig, combine_compare: bool) -> &str {
+    if combine_compare || profiling_quality_is_maximum(pgo) {
         return "cachyos";
     }
     let preset = pgo.benchmark_preset.trim();
@@ -2265,7 +3244,54 @@ fn sync_perf_data_to_repo(perf_data: &Path, repo: &Path) -> Result<(), String> {
     );
     fs::copy(perf_data, &dest).map_err(|e| format!("copy perf data to repo failed: {e}"))?;
     crate::utils::ensure_build_user_can_read(&dest)?;
+    let src_id = perf_identity_sidecar_path(perf_data);
+    if src_id.is_file() {
+        let dest_id = perf_identity_sidecar_path(&dest);
+        fs::copy(&src_id, &dest_id)
+            .map_err(|e| format!("copy perf kernel identity to repo failed: {e}"))?;
+        let _ = crate::utils::ensure_build_user_can_read(&dest_id);
+    }
     Ok(())
+}
+
+fn persist_propeller_to_disk(pgo: &PgoConfig) -> bool {
+    !pgo.propeller_profiles_on_ram
+}
+
+fn is_propeller_profile_name(name: &str) -> bool {
+    name == "propeller_cc_profile.txt" || name == "propeller_ld_profile.txt"
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileRestore {
+    AlreadyPresent,
+    From(PathBuf),
+    Missing,
+}
+
+fn resolve_profile_restore(
+    repo: &Path,
+    archive: &Path,
+    scratch: Option<&Path>,
+    name: &str,
+    skip_archive: bool,
+) -> ProfileRestore {
+    if repo.join(name).is_file() {
+        return ProfileRestore::AlreadyPresent;
+    }
+    if let Some(scratch) = scratch {
+        let src = scratch.join(name);
+        if src.is_file() {
+            return ProfileRestore::From(src);
+        }
+    }
+    if !skip_archive {
+        let src = archive.join(name);
+        if src.is_file() {
+            return ProfileRestore::From(src);
+        }
+    }
+    ProfileRestore::Missing
 }
 
 fn archive_profile(pgo: &PgoConfig, src: &Path, name: &str) -> Result<(), String> {
@@ -2282,35 +3308,58 @@ fn copy_to_repo(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn restore_profiles_to_repo(state: &PgoState, pgo: &PgoConfig, names: &[&str]) {
+fn restore_profiles_to_repo(
+    state: &PgoState,
+    pgo: &PgoConfig,
+    names: &[&str],
+    scratch: Option<&Path>,
+) {
     let repo = PathBuf::from(&state.repo_dir);
     let archive = pgo
         .resolved_archive_dir()
         .unwrap_or_else(|| die!("profiles_archive_dir not set"));
     for name in names {
         let dest = repo.join(name);
-        if dest.exists() {
-            continue;
-        }
-        let src = archive.join(name);
-        if src.exists() {
-            if *name == "kernel-compilation.afdo"
-                && let Ok(meta) = fs::metadata(&src)
-                && meta.len() < MIN_AFDO_PROFILE_BYTES
-            {
+        let skip_archive = pgo.propeller_profiles_on_ram && is_propeller_profile_name(name);
+        match resolve_profile_restore(&repo, &archive, scratch, name, skip_archive) {
+            ProfileRestore::AlreadyPresent => continue,
+            ProfileRestore::From(src) => {
+                if *name == "kernel-compilation.afdo"
+                    && let Ok(meta) = fs::metadata(&src)
+                    && meta.len() < MIN_AFDO_PROFILE_BYTES
+                {
+                    die!(
+                        "Archived AutoFDO profile '{}' is only {} bytes — re-run stage 2 profiling \
+                         after installing linux-cachyos-dbg",
+                        name,
+                        meta.len()
+                    );
+                }
+                let origin = if scratch.is_some_and(|s| src.starts_with(s)) {
+                    "ramdisk scratch"
+                } else {
+                    "archive"
+                };
+                blog!("Restoring profile {name} from {origin}...");
+                if let Err(e) = fs::copy(&src, &dest) {
+                    die!("Failed to restore profile {name}: {e}");
+                }
+            }
+            ProfileRestore::Missing if *name == "kernel-compilation.afdo" => {
+                die!("Required profile '{name}' missing in repo and archive");
+            }
+            ProfileRestore::Missing if is_propeller_profile_name(name) => {
                 die!(
-                    "Archived AutoFDO profile '{}' is only {} bytes — re-run stage 2 profiling \
-                     after installing linux-cachyos-dbg",
-                    name,
-                    meta.len()
+                    "Required Propeller profile '{name}' missing in the package dir{}. \
+                     Re-run stage 3 profiling.",
+                    if skip_archive {
+                        " and ramdisk scratch"
+                    } else {
+                        " and archive"
+                    }
                 );
             }
-            blog!("Restoring profile {name} from archive...");
-            if let Err(e) = fs::copy(&src, &dest) {
-                die!("Failed to restore profile {name}: {e}");
-            }
-        } else if *name == "kernel-compilation.afdo" {
-            die!("Required profile '{name}' missing in repo and archive");
+            ProfileRestore::Missing => {}
         }
     }
 }
@@ -2378,6 +3427,7 @@ mod tests {
             profiles_archive_dir: Some("/tmp/abs-pgo-test".into()),
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
+            propeller_profiles_on_ram: true,
             benchmark_command: Some("/bin/true".into()),
             benchmark_workdir: None,
             benchmark_preset: "fast".into(),
@@ -2391,7 +3441,17 @@ mod tests {
             propeller_tool: "create_llvm_prof".into(),
             afdo_profile_name: "kernel-compilation.afdo".into(),
             verify_boot: true,
+            select_boot_kernel: true,
             auto_restart: false,
+            reboot_before_start: false,
+            reuse_afdo_profile: false,
+            reuse_propeller_profile: false,
+            compare_current: false,
+            compare_debug: false,
+            compare_debug_clean: false,
+            compare_autofdo: false,
+            compare_autofdo_clean: false,
+            compare_final: false,
             state_file: None,
         }
     }
@@ -2427,6 +3487,184 @@ mod tests {
     }
 
     #[test]
+    fn pgo_auto_unit_has_no_start_timeout_and_waits_for_session() {
+        let unit = super::pgo_auto_unit_text("/usr/bin/abs");
+        assert!(unit.contains("TimeoutStartSec=infinity"), "{unit}");
+        assert!(unit.contains("After=graphical-session.target"), "{unit}");
+        assert!(
+            !unit.contains("PartOf=graphical-session.target"),
+            "PartOf would stop TTY-only resume: {unit}"
+        );
+        assert!(unit.contains("--pgo-resume %i --pgo-auto"), "{unit}");
+        assert!(unit.contains("WantedBy=default.target"), "{unit}");
+        assert!(
+            !unit.contains("WantedBy=graphical-session.target"),
+            "graphical-session never starts on a console-only machine: {unit}"
+        );
+    }
+
+    #[test]
+    fn compare_benchmarks_dir_is_separate_from_profiling_assets() {
+        let pgo = test_pgo();
+        assert_eq!(
+            pgo.resolved_compare_dir("linux-cachyos"),
+            PathBuf::from("/tmp/abs-pgo-test/compare-benchmarks")
+        );
+        assert_eq!(
+            pgo.resolved_benchmark_workdir("linux-cachyos"),
+            PathBuf::from("/tmp/abs-pgo-test/benchmark-workdir")
+        );
+        assert!(!pgo.compare_any());
+        let mut on = test_pgo();
+        on.compare_current = true;
+        on.compare_final = true;
+        assert!(on.compare_any());
+    }
+
+    #[test]
+    fn debug_and_autofdo_compare_share_the_profiling_run() {
+        assert!(CompareStage::Debug.shares_profiling_run());
+        assert!(CompareStage::Autofdo.shares_profiling_run());
+        assert!(!CompareStage::Current.shares_profiling_run());
+        assert!(!CompareStage::Final.shares_profiling_run());
+        assert!(!CompareStage::DebugClean.shares_profiling_run());
+        assert!(!CompareStage::AutofdoClean.shares_profiling_run());
+    }
+
+    #[test]
+    fn standalone_compare_includes_optional_clean_debug_and_autofdo() {
+        let mut pgo = test_pgo();
+        pgo.compare_current = true;
+        pgo.compare_debug = true;
+        pgo.compare_debug_clean = true;
+        pgo.compare_autofdo = true;
+        pgo.compare_autofdo_clean = true;
+        pgo.compare_final = true;
+        assert!(should_run_standalone_compare(&pgo, CompareStage::Current));
+        assert!(!should_run_standalone_compare(&pgo, CompareStage::Debug));
+        assert!(should_run_standalone_compare(
+            &pgo,
+            CompareStage::DebugClean
+        ));
+        assert!(!should_run_standalone_compare(&pgo, CompareStage::Autofdo));
+        assert!(should_run_standalone_compare(
+            &pgo,
+            CompareStage::AutofdoClean
+        ));
+        assert!(should_run_standalone_compare(&pgo, CompareStage::Final));
+    }
+
+    #[test]
+    fn profile_compare_stage_follows_any_comparison() {
+        let mut pgo = test_pgo();
+        assert_eq!(profile_compare_stage(&pgo, CompareStage::Debug), None);
+        pgo.compare_final = true;
+        assert_eq!(
+            profile_compare_stage(&pgo, CompareStage::Debug),
+            Some(CompareStage::Debug)
+        );
+        assert_eq!(profile_compare_stage(&pgo, CompareStage::Current), None);
+        assert_eq!(
+            profile_compare_stage(&pgo, CompareStage::Autofdo),
+            Some(CompareStage::Autofdo)
+        );
+    }
+
+    #[test]
+    fn work_plan_reuse_skips_upstream_unless_clean_bench_needs_the_kernel() {
+        let mut pgo = test_pgo();
+        pgo.reuse_afdo_profile = true;
+        pgo.reuse_propeller_profile = true;
+        let plan = pgo_work_plan(&pgo, true, true);
+        assert!(!plan.run_debug_build);
+        assert!(!plan.run_afdo_collect);
+        assert!(!plan.run_autofdo_build);
+        assert!(!plan.run_propeller_collect);
+        assert_eq!(first_post_start_reboot_stage(plan), PgoStageId::Stage3Build);
+
+        pgo.compare_debug_clean = true;
+        let plan = pgo_work_plan(&pgo, true, true);
+        assert!(plan.run_debug_build);
+        assert!(!plan.run_afdo_collect);
+        assert!(!plan.run_autofdo_build);
+
+        pgo.compare_debug_clean = false;
+        pgo.compare_autofdo_clean = true;
+        let plan = pgo_work_plan(&pgo, true, true);
+        assert!(!plan.run_debug_build);
+        assert!(plan.run_autofdo_build);
+        assert!(!plan.run_propeller_collect);
+        assert_eq!(first_post_start_reboot_stage(plan), PgoStageId::Stage2Build);
+    }
+
+    #[test]
+    fn work_plan_without_reuse_runs_the_full_chain() {
+        let mut pgo = test_pgo();
+        pgo.reboot_before_start = true;
+        let plan = pgo_work_plan(&pgo, true, true);
+        assert!(plan.reboot_before_start);
+        assert!(plan.run_debug_build);
+        assert!(plan.run_afdo_collect);
+        assert!(plan.run_autofdo_build);
+        assert!(plan.run_propeller_collect);
+        assert_eq!(first_post_start_reboot_stage(plan), PgoStageId::Stage1Build);
+    }
+
+    #[test]
+    fn new_pipeline_flags_default_off() {
+        let pgo: PgoConfig = toml::from_str("").unwrap();
+        assert!(!pgo.reboot_before_start);
+        assert!(!pgo.reuse_afdo_profile);
+        assert!(!pgo.reuse_propeller_profile);
+        assert!(!pgo.compare_current);
+        assert!(!pgo.compare_debug_clean);
+        assert!(!pgo.compare_autofdo_clean);
+        assert!(!pgo.compare_final);
+    }
+
+    #[test]
+    fn combined_compare_forces_cachyos_preset() {
+        let mut pgo = test_pgo();
+        pgo.profiling_quality = "standard".into();
+        pgo.benchmark_preset = "fast".into();
+        assert_eq!(resolved_benchmark_preset(&pgo, false), "fast");
+        assert_eq!(resolved_benchmark_preset(&pgo, true), "cachyos");
+    }
+
+    #[test]
+    fn profiling_workload_sets_compare_label_when_combined() {
+        let pgo = test_pgo();
+        let (preset, label) = profiling_workload(&pgo, Some(CompareStage::Debug));
+        assert_eq!(preset, "cachyos");
+        assert_eq!(label.as_deref(), Some("abs-debug"));
+        let (preset, label) = profiling_workload(&pgo, Some(CompareStage::Autofdo));
+        assert_eq!(preset, "cachyos");
+        assert_eq!(label.as_deref(), Some("abs-autofdo"));
+        let mut pgo = test_pgo();
+        pgo.profiling_quality = "standard".into();
+        pgo.benchmark_preset = "fast".into();
+        let (preset, label) = profiling_workload(&pgo, None);
+        assert_eq!(preset, "fast");
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn compare_stage_follows_perf_data_filename() {
+        assert_eq!(
+            compare_stage_for_perf_data(Path::new("/scratch/kernel.data")),
+            Some(CompareStage::Debug)
+        );
+        assert_eq!(
+            compare_stage_for_perf_data(Path::new("/scratch/propeller.data")),
+            Some(CompareStage::Autofdo)
+        );
+        assert_eq!(
+            compare_stage_for_perf_data(Path::new("/scratch/other.data")),
+            None
+        );
+    }
+
+    #[test]
     fn propeller_tool_auto_and_bb_addr_map_detection() {
         assert!(propeller_tool_is_auto("auto"));
         assert!(propeller_tool_is_auto("AUTO"));
@@ -2438,6 +3676,122 @@ mod tests {
         assert!(!is_unsupported_bb_addr_map("missing profile file"));
         let err = resolve_propeller_tool("definitely-not-a-propeller-tool-xyz").unwrap_err();
         assert!(err.contains("definitely-not-a-propeller-tool-xyz"), "{err}");
+    }
+
+    fn write_elf64_with_bb_addr_map(path: &Path, version: u8, section_type: u32) {
+        fn put_u16(buf: &mut Vec<u8>, v: u16) {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put_u32(buf: &mut Vec<u8>, v: u32) {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put_u64(buf: &mut Vec<u8>, v: u64) {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        fn shdr(name: u32, typ: u32, offset: u64, size: u64) -> Vec<u8> {
+            let mut s = Vec::new();
+            put_u32(&mut s, name);
+            put_u32(&mut s, typ);
+            put_u64(&mut s, 0);
+            put_u64(&mut s, 0);
+            put_u64(&mut s, offset);
+            put_u64(&mut s, size);
+            put_u32(&mut s, 0);
+            put_u32(&mut s, 0);
+            put_u64(&mut s, 1);
+            put_u64(&mut s, 0);
+            s
+        }
+
+        let strtab = b"\0.llvm_bb_addr_map\0.shstrtab\0";
+        let data_off = 64u64;
+        let str_off = data_off + 1;
+        let sh_off = 128u64;
+
+        let mut ehdr = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        put_u16(&mut ehdr, 2); // ET_EXEC
+        put_u16(&mut ehdr, 62); // EM_X86_64
+        put_u32(&mut ehdr, 1);
+        put_u64(&mut ehdr, 0); // e_entry
+        put_u64(&mut ehdr, 0); // e_phoff
+        put_u64(&mut ehdr, sh_off);
+        put_u32(&mut ehdr, 0);
+        put_u16(&mut ehdr, 64);
+        put_u16(&mut ehdr, 0);
+        put_u16(&mut ehdr, 0);
+        put_u16(&mut ehdr, 64);
+        put_u16(&mut ehdr, 3);
+        put_u16(&mut ehdr, 2);
+        assert_eq!(ehdr.len(), 64);
+
+        let mut buf = ehdr;
+        buf.push(version);
+        buf.extend_from_slice(strtab);
+        buf.resize(sh_off as usize, 0);
+        buf.extend(shdr(0, 0, 0, 0));
+        buf.extend(shdr(1, section_type, data_off, 1));
+        buf.extend(shdr(19, 3, str_off, strtab.len() as u64));
+        fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn bb_addr_map_version_reads_v5_from_elf() {
+        let dir = std::env::temp_dir().join(format!("abs-bbmap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmlinux");
+        write_elf64_with_bb_addr_map(&path, 5, SHT_LLVM_BB_ADDR_MAP);
+        assert_eq!(bb_addr_map_version(&path), Some(5));
+        assert!(bb_addr_map_needs_llvm_propeller(Some(5)));
+        assert!(!bb_addr_map_needs_llvm_propeller(Some(4)));
+        assert!(!bb_addr_map_needs_llvm_propeller(None));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bb_addr_map_version_reads_installed_vmlinux_if_present() {
+        for path in [
+            "/usr/src/debug/linux-cachyos-lto/vmlinux",
+            "/usr/src/debug/linux-cachyos/vmlinux",
+        ] {
+            let path = Path::new(path);
+            if path.is_file() {
+                let version = bb_addr_map_version(path);
+                assert!(
+                    version.is_some_and(|v| v >= 2),
+                    "{}: {version:?}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn find_generate_propeller_profiles_uses_cache_bin() {
+        let dir = std::env::temp_dir().join(format!("abs-prop-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bin = dir.join("bin").join("generate_propeller_profiles");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            find_generate_propeller_profiles_in(&dir).as_deref(),
+            Some(bin.to_str().unwrap())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn propeller_bootstrap_script_is_embedded() {
+        assert!(PROPELLER_BUILD_SCRIPT.starts_with("#!/"));
+        assert!(PROPELLER_BUILD_SCRIPT.contains("generate_propeller_profiles"));
+        assert!(PROPELLER_BUILD_SCRIPT.contains("find_package(LLVM"));
+        assert!(PROPELLER_BUILD_SCRIPT.contains("google/llvm-propeller"));
     }
 
     #[test]
@@ -2490,10 +3844,36 @@ mod tests {
 
     #[test]
     fn stage1_env_has_autofdo_and_debug() {
-        let env = stage1_env(&KernelBuildConfig::default());
+        let env = stage1_env("linux-cachyos", &KernelBuildConfig::default());
         assert_eq!(env.get("_autofdo").map(String::as_str), Some("yes"));
         assert_eq!(env.get("_build_debug").map(String::as_str), Some("yes"));
         assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("none"));
+        assert_eq!(env.get("_use_lto_suffix").map(String::as_str), Some("no"));
+    }
+
+    #[test]
+    fn pgo_lto_suffix_follows_starting_package() {
+        assert_eq!(pgo_lto_suffix_flag("linux-cachyos"), "no");
+        assert_eq!(pgo_lto_suffix_flag("linux-cachyos-bore"), "no");
+        assert_eq!(pgo_lto_suffix_flag("linux-cachyos-lto"), "yes");
+        assert_eq!(pgo_lto_suffix_flag("linux-cachyos-bore-lto"), "yes");
+    }
+
+    #[test]
+    fn stage2_env_keeps_starting_package_name() {
+        let env = stage2_build_env(
+            "linux-cachyos",
+            &KernelBuildConfig::default(),
+            "kernel-compilation.afdo",
+        );
+        assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("thin"));
+        assert_eq!(env.get("_use_lto_suffix").map(String::as_str), Some("no"));
+        let lto = stage2_build_env(
+            "linux-cachyos-lto",
+            &KernelBuildConfig::default(),
+            "kernel-compilation.afdo",
+        );
+        assert_eq!(lto.get("_use_lto_suffix").map(String::as_str), Some("yes"));
     }
 
     #[test]
@@ -2504,7 +3884,7 @@ mod tests {
             use_kcfi: Some("no".into()),
             ..Default::default()
         };
-        let mut env = stage1_env(&kernel);
+        let mut env = stage1_env("linux-cachyos", &kernel);
         merge_user_kernel_overrides(&mut env, &kernel);
         assert_eq!(env.get("_cpusched").map(String::as_str), Some("bore"));
         assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("none"));
@@ -2513,12 +3893,17 @@ mod tests {
 
     #[test]
     fn stage3_env_has_propeller_profiles() {
-        let env = stage3_build_env(&KernelBuildConfig::default(), "kernel-compilation.afdo");
+        let env = stage3_build_env(
+            "linux-cachyos",
+            &KernelBuildConfig::default(),
+            "kernel-compilation.afdo",
+        );
         assert_eq!(
             env.get("_propeller_profiles").map(String::as_str),
             Some("yes")
         );
         assert_eq!(env.get("_build_debug").map(String::as_str), Some("no"));
+        assert_eq!(env.get("_use_lto_suffix").map(String::as_str), Some("no"));
     }
 
     #[test]
@@ -2611,6 +3996,33 @@ mod tests {
     }
 
     #[test]
+    fn ramdisk_perf_without_sidecar_may_be_reused() {
+        assert!(super::allow_anonymous_perf_reuse(Path::new(
+            "/run/abs-ram/pgo-scratch/linux-cachyos/kernel.data"
+        )));
+        assert!(super::allow_anonymous_perf_reuse(Path::new(
+            "/run/abs-ram/pgo-scratch/linux-cachyos/propeller.data"
+        )));
+        assert!(!super::allow_anonymous_perf_reuse(Path::new(
+            "/tmp/kernel.data"
+        )));
+        assert!(!super::allow_anonymous_perf_reuse(Path::new(
+            "/home/john/.cache/abs/kernel.data"
+        )));
+    }
+
+    fn running_debug() -> super::PerfKernelIdentity {
+        super::PerfKernelIdentity {
+            uname: "7.2.2-1-cachyos".into(),
+            pkgbase: Some("linux-cachyos".into()),
+        }
+    }
+
+    fn write_usable_perf(path: &Path, extra: usize) {
+        fs::write(path, vec![0u8; MIN_USABLE_PERF_BYTES as usize + extra]).unwrap();
+    }
+
+    #[test]
     fn existing_perf_data_falls_back_to_repo_copy() {
         let pid = std::process::id();
         let scratch = std::env::temp_dir().join(format!("abs-pgo-scratch-{pid}"));
@@ -2621,17 +4033,174 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let scratch_file = scratch.join("propeller.data");
         let repo_file = repo.join("propeller.data");
-        assert!(super::existing_perf_data(&scratch_file, &repo).is_none());
-        fs::write(&repo_file, vec![0u8; MIN_USABLE_PERF_BYTES as usize]).unwrap();
-        let (path, n) = super::existing_perf_data(&scratch_file, &repo).unwrap();
+        let running = running_debug();
+        assert!(super::existing_perf_data(&scratch_file, &repo, &running).is_none());
+        write_usable_perf(&repo_file, 0);
+        super::write_perf_kernel_identity(&repo_file, &running).unwrap();
+        let (path, n) = super::existing_perf_data(&scratch_file, &repo, &running).unwrap();
         assert_eq!(path, repo_file);
         assert_eq!(n, MIN_USABLE_PERF_BYTES);
-        fs::write(&scratch_file, vec![0u8; MIN_USABLE_PERF_BYTES as usize + 8]).unwrap();
-        let (path, n) = super::existing_perf_data(&scratch_file, &repo).unwrap();
+        write_usable_perf(&scratch_file, 8);
+        super::write_perf_kernel_identity(&scratch_file, &running).unwrap();
+        let (path, n) = super::existing_perf_data(&scratch_file, &repo, &running).unwrap();
         assert_eq!(path, scratch_file);
         assert_eq!(n, MIN_USABLE_PERF_BYTES + 8);
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn existing_perf_data_ignores_file_without_kernel_identity() {
+        let pid = std::process::id();
+        let scratch = std::env::temp_dir().join(format!("abs-pgo-noid-{pid}"));
+        let repo = std::env::temp_dir().join(format!("abs-pgo-noid-repo-{pid}"));
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let scratch_file = scratch.join("kernel.data");
+        let repo_file = repo.join("kernel.data");
+        write_usable_perf(&repo_file, 0);
+        assert!(
+            super::existing_perf_data(&scratch_file, &repo, &running_debug()).is_none(),
+            "size-only leftover from an unknown kernel must not be reused"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn existing_perf_data_ignores_other_kernel_identity() {
+        let pid = std::process::id();
+        let scratch = std::env::temp_dir().join(format!("abs-pgo-otherk-{pid}"));
+        let repo = std::env::temp_dir().join(format!("abs-pgo-otherk-repo-{pid}"));
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let scratch_file = scratch.join("kernel.data");
+        let repo_file = repo.join("kernel.data");
+        write_usable_perf(&repo_file, 0);
+        super::write_perf_kernel_identity(
+            &repo_file,
+            &super::PerfKernelIdentity {
+                uname: "7.2.2-1-cachyos".into(),
+                pkgbase: Some("linux-cachyos-lto".into()),
+            },
+        )
+        .unwrap();
+        assert!(
+            super::existing_perf_data(&scratch_file, &repo, &running_debug()).is_none(),
+            "same uname, different pkgbase (debug vs AutoFDO -lto) must not be reused"
+        );
+        super::write_perf_kernel_identity(
+            &repo_file,
+            &super::PerfKernelIdentity {
+                uname: "7.1.9-1-cachyos".into(),
+                pkgbase: Some("linux-cachyos".into()),
+            },
+        )
+        .unwrap();
+        assert!(
+            super::existing_perf_data(&scratch_file, &repo, &running_debug()).is_none(),
+            "same pkgbase, different uname must not be reused"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn perf_identity_matches_requires_uname_and_pkgbase() {
+        let debug = running_debug();
+        assert!(super::perf_identity_matches(&debug, &debug));
+        assert!(!super::perf_identity_matches(
+            &debug,
+            &super::PerfKernelIdentity {
+                uname: debug.uname.clone(),
+                pkgbase: Some("linux-cachyos-lto".into()),
+            }
+        ));
+        assert!(!super::perf_identity_matches(
+            &debug,
+            &super::PerfKernelIdentity {
+                uname: "7.1.9-1-cachyos".into(),
+                pkgbase: debug.pkgbase.clone(),
+            }
+        ));
+        assert!(!super::perf_identity_matches(
+            &debug,
+            &super::PerfKernelIdentity {
+                uname: debug.uname.clone(),
+                pkgbase: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn sync_perf_data_to_repo_copies_kernel_identity() {
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("abs-pgo-sync-id-{pid}"));
+        let _ = fs::remove_dir_all(&root);
+        let scratch = root.join("scratch");
+        let repo = root.join("repo");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let src = scratch.join("kernel.data");
+        write_usable_perf(&src, 0);
+        super::write_perf_kernel_identity(&src, &running_debug()).unwrap();
+        super::sync_perf_data_to_repo(&src, &repo).unwrap();
+        let dest = repo.join("kernel.data");
+        let id = super::read_perf_kernel_identity(&dest).expect("sidecar copied");
+        assert_eq!(id, running_debug());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn propeller_profiles_on_ram_defaults_true() {
+        let pgo: PgoConfig = toml::from_str("").unwrap();
+        assert!(pgo.propeller_profiles_on_ram);
+        assert!(pgo.perf_data_on_ram);
+        let pgo: PgoConfig = toml::from_str("propeller_profiles_on_ram = false\n").unwrap();
+        assert!(!pgo.propeller_profiles_on_ram);
+    }
+
+    #[test]
+    fn persist_propeller_to_disk_follows_checkbox() {
+        let mut pgo = test_pgo();
+        pgo.propeller_profiles_on_ram = true;
+        assert!(!super::persist_propeller_to_disk(&pgo));
+        pgo.propeller_profiles_on_ram = false;
+        assert!(super::persist_propeller_to_disk(&pgo));
+    }
+
+    #[test]
+    fn propeller_restore_prefers_scratch_and_skips_archive() {
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("abs-pgo-restore-{pid}"));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let archive = root.join("archive");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        let name = "propeller_cc_profile.txt";
+        fs::write(archive.join(name), "from-archive").unwrap();
+        assert_eq!(
+            super::resolve_profile_restore(&repo, &archive, Some(&scratch), name, true),
+            super::ProfileRestore::Missing
+        );
+        fs::write(scratch.join(name), "from-scratch").unwrap();
+        match super::resolve_profile_restore(&repo, &archive, Some(&scratch), name, true) {
+            super::ProfileRestore::From(path) => assert_eq!(path, scratch.join(name)),
+            other => panic!("expected scratch, got {other:?}"),
+        }
+        fs::write(repo.join(name), "already").unwrap();
+        assert_eq!(
+            super::resolve_profile_restore(&repo, &archive, Some(&scratch), name, true),
+            super::ProfileRestore::AlreadyPresent
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2649,6 +4218,12 @@ mod tests {
             parse_pgo_stage("stage1_build").unwrap(),
             PgoStageId::Stage1Build
         );
+        assert_eq!(parse_pgo_stage("wait0").unwrap(), PgoStageId::WaitReboot0);
+        assert_eq!(
+            parse_pgo_stage("start_reboot").unwrap(),
+            PgoStageId::WaitReboot0
+        );
+        assert!(PgoStageId::WaitReboot0.is_wait_reboot());
         assert!(parse_pgo_stage("not-a-stage").is_err());
     }
 
@@ -2805,6 +4380,7 @@ default = "aur"
             profiles_archive_dir: Some(dir.to_string_lossy().into_owned()),
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
+            propeller_profiles_on_ram: true,
             benchmark_command: None,
             benchmark_workdir: None,
             benchmark_preset: "fast".into(),
@@ -2818,7 +4394,17 @@ default = "aur"
             propeller_tool: "create_llvm_prof".into(),
             afdo_profile_name: "kernel-compilation.afdo".into(),
             verify_boot: true,
+            select_boot_kernel: true,
             auto_restart: false,
+            reboot_before_start: false,
+            reuse_afdo_profile: false,
+            reuse_propeller_profile: false,
+            compare_current: false,
+            compare_debug: false,
+            compare_debug_clean: false,
+            compare_autofdo: false,
+            compare_autofdo_clean: false,
+            compare_final: false,
             state_file: Some(state_path.to_string_lossy().into_owned()),
         };
         config.packages.insert(
@@ -2889,6 +4475,63 @@ default = "aur"
         });
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("test"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_pgo_abort_clears_pipeline_state() {
+        assert_eq!(
+            super::abort_disposition(false),
+            super::PgoAbortDisposition::RemoveState
+        );
+        assert_eq!(
+            super::abort_disposition(true),
+            super::PgoAbortDisposition::KeepStage
+        );
+    }
+
+    #[test]
+    fn remove_state_deletes_the_pipeline_file() {
+        let dir = std::env::temp_dir().join(format!("abs-pgo-abort-state-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("linux-cachyos.json");
+        fs::write(&path, "{\"package\":\"linux-cachyos\"}").unwrap();
+        super::apply_abort_state(&path, super::PgoAbortDisposition::RemoveState);
+        assert!(!path.exists(), "abort should delete saved PGO state");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_resume_enable_links_include_default_and_graphical_wants() {
+        let dir = PathBuf::from("/tmp/abs-systemd-user");
+        let links = super::pgo_auto_resume_enable_links(&dir, "linux-cachyos");
+        assert!(
+            links
+                .iter()
+                .any(|p| p.ends_with("default.target.wants/abs-pgo@linux-cachyos.service")),
+            "{links:?}"
+        );
+        assert!(
+            links.iter().any(
+                |p| p.ends_with("graphical-session.target.wants/abs-pgo@linux-cachyos.service")
+            ),
+            "{links:?}"
+        );
+    }
+
+    #[test]
+    fn unlinking_auto_resume_links_removes_installed_wants() {
+        let dir = std::env::temp_dir().join(format!("abs-pgo-wants-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for link in super::pgo_auto_resume_enable_links(&dir, "linux-cachyos") {
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            fs::write(&link, "").unwrap();
+            assert!(link.exists());
+        }
+        super::unlink_pgo_auto_resume_links(&dir, "linux-cachyos");
+        for link in super::pgo_auto_resume_enable_links(&dir, "linux-cachyos") {
+            assert!(!link.exists(), "{}", link.display());
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

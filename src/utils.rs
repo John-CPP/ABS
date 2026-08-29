@@ -1243,10 +1243,14 @@ fn run_command_labeled(mut command: Command, cmd: &str, args: &[&str]) -> Result
     let stderr = child.stderr.take();
     let label_out = label.clone();
     let label_err = label.clone();
-    let out_handle =
-        stdout.map(|pipe| std::thread::spawn(move || stream_labeled_pipe(pipe, &label_out)));
-    let err_handle =
-        stderr.map(|pipe| std::thread::spawn(move || stream_labeled_pipe(pipe, &label_err)));
+    let out_handle = stdout.map(|pipe| {
+        let label = Some(label_out);
+        std::thread::spawn(move || stream_console_pipe(pipe, label))
+    });
+    let err_handle = stderr.map(|pipe| {
+        let label = Some(label_err);
+        std::thread::spawn(move || stream_console_pipe(pipe, label))
+    });
 
     let status = child
         .wait()
@@ -1272,7 +1276,7 @@ fn run_command_labeled(mut command: Command, cmd: &str, args: &[&str]) -> Result
     }
 }
 
-fn stream_labeled_pipe<R: Read>(reader: R, label: &str) {
+fn stream_console_pipe<R: Read>(reader: R, label: Option<String>) {
     let mut reader = BufReader::new(reader);
     let mut raw_buf = [0u8; 8192];
     let mut pending = String::new();
@@ -1289,12 +1293,20 @@ fn stream_labeled_pipe<R: Read>(reader: R, label: &str) {
                 continue;
             }
             last_emitted = fragment.clone();
-            console_write_line(&format_prefixed_line(label, &fragment));
+            let line = match label.as_deref() {
+                Some(label) => format_prefixed_line(label, &fragment),
+                None => fragment,
+            };
+            console_write_line(&line);
         }
     }
     let tail = sanitize_console_fragment(&pending);
     if !tail.is_empty() && tail != last_emitted {
-        console_write_line(&format_prefixed_line(label, &tail));
+        let line = match label.as_deref() {
+            Some(label) => format_prefixed_line(label, &tail),
+            None => tail,
+        };
+        console_write_line(&line);
     }
 }
 
@@ -1317,16 +1329,38 @@ fn spawn_sudo_and_wait(
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     echo_command("sudo", &refs, cwd);
 
+    if use_sudo_askpass() {
+        // sudo's default `use_pty` copies the command's output to /dev/tty, not
+        // inherited stdout. AbsGui wraps abs in `script` and nulls sudo stdin, so
+        // that tty is not the log pipe — pacman installs while the viewport stays
+        // empty. Give sudo its own pty (when `script` exists) and replay captured
+        // stdio through console_write_line (same path as blog!).
+        let mut captured = if command_exists("script") {
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push("sudo".into());
+            argv.extend(args.iter().cloned());
+            let inner = shell_quote_argv(&argv);
+            let mut wrapped = Command::new("script");
+            wrapped.args(["-q", "-f", "-c", &inner, "/dev/null"]);
+            wrapped
+        } else {
+            let mut command = Command::new("sudo");
+            command.args(args);
+            command
+        };
+        if let Some(dir) = cwd {
+            captured.current_dir(dir);
+        }
+        captured.stdin(Stdio::null());
+        return spawn_and_replay_stdio(captured, "sudo");
+    }
+
     let mut command = Command::new("sudo");
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
     command.args(args);
-    if use_sudo_askpass() {
-        command.stdin(Stdio::null());
-    } else {
-        command.stdin(Stdio::inherit());
-    }
+    command.stdin(Stdio::inherit());
 
     let mut child = command
         .spawn()
@@ -1335,6 +1369,35 @@ fn spawn_sudo_and_wait(
     let status = child
         .wait()
         .map_err(|e| format!("Failed to wait on 'sudo': {e}"))?;
+    untrack_child(child.id());
+    Ok(status)
+}
+
+fn spawn_and_replay_stdio(mut command: Command, cmd: &str) -> Result<ExitStatus, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to execute '{cmd}': {e}"))?;
+    track_child(child.id());
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let label = current_output_label();
+    let label_err = label.clone();
+    let out_handle =
+        stdout.map(|pipe| std::thread::spawn(move || stream_console_pipe(pipe, label)));
+    let err_handle =
+        stderr.map(|pipe| std::thread::spawn(move || stream_console_pipe(pipe, label_err)));
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait on '{cmd}': {e}"))?;
+    if let Some(h) = out_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = err_handle {
+        let _ = h.join();
+    }
     untrack_child(child.id());
     Ok(status)
 }
@@ -2642,6 +2705,65 @@ mod console_gate_tests {
             "[firefox] building..."
         );
         assert_eq!(format_prefixed_line("mesa", "ok\r\n"), "[mesa] ok");
+    }
+
+    #[cfg(unix)]
+    fn with_captured_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        let old = unsafe { libc::dup(1) };
+        assert!(old >= 0);
+        unsafe {
+            libc::dup2(wr, 1);
+            libc::close(wr);
+        }
+        let result = f();
+        let _ = io::stdout().flush();
+        unsafe {
+            libc::dup2(old, 1);
+            libc::close(old);
+        }
+        let mut out = String::new();
+        let mut file = unsafe { std::fs::File::from_raw_fd(rd) };
+        let _ = io::Read::read_to_string(&mut file, &mut out);
+        (result, out)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlabeled_console_pipe_replays_pacman_lines_as_is() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let input = b"resolving dependencies...\n(1/1) reinstalling linux-cachyos\n";
+        let (_, out) = with_captured_stdout(|| {
+            stream_console_pipe(input.as_slice(), None);
+        });
+        assert!(
+            out.contains("resolving dependencies..."),
+            "missing first line: {out:?}"
+        );
+        assert!(
+            out.contains("(1/1) reinstalling linux-cachyos"),
+            "missing install line: {out:?}"
+        );
+        assert!(
+            !out.contains("[sudo]"),
+            "GUI kernel install must not prefix pacman with [sudo]: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn labeled_console_pipe_still_prefixes() {
+        let _guard = CONSOLE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, out) = with_captured_stdout(|| {
+            stream_console_pipe(b"building...\n".as_slice(), Some("firefox".into()));
+        });
+        assert!(
+            out.contains("[firefox] building..."),
+            "missing prefixed line: {out:?}"
+        );
     }
 
     #[test]

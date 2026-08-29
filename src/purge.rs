@@ -167,6 +167,13 @@ fn collect_targets(config: Option<&Config>) -> Vec<PurgeTarget> {
             RemovalKind::SudoFile,
         );
     }
+    push_file(
+        &mut seen,
+        &mut out,
+        crate::pgo_priv::sudoers_dropin_path(crate::utils::build_uid_gid().0),
+        "PGO auto-resume sudoers",
+        RemovalKind::SudoFile,
+    );
 
     push_tree(
         &mut seen,
@@ -298,6 +305,7 @@ fn standard_install_files() -> Vec<PathBuf> {
         PathBuf::from("/usr/bin/abs"),
         PathBuf::from("/usr/bin/absgui"),
         PathBuf::from("/usr/share/abs/pgo-benchmark.sh"),
+        PathBuf::from("/usr/share/abs/build-generate-propeller-profiles.sh"),
         PathBuf::from("/usr/share/applications/absgui.desktop"),
     ];
     out.extend(
@@ -423,9 +431,13 @@ fn is_safe_install_path(path: &Path) -> bool {
         "/usr/bin/abs",
         "/usr/bin/absgui",
         "/usr/share/abs/pgo-benchmark.sh",
+        "/usr/share/abs/build-generate-propeller-profiles.sh",
         "/usr/share/applications/absgui.desktop",
     ];
     if WHITELIST.iter().any(|p| path == Path::new(p)) {
+        return true;
+    }
+    if crate::pgo_priv::is_sudoers_dropin_path(path) {
         return true;
     }
     if ABSGUI_ICON_SIZES
@@ -456,7 +468,20 @@ mod tests {
         assert!(is_safe_install_path(Path::new(
             "/usr/share/icons/hicolor/512x512/apps/absgui.png"
         )));
+        assert!(is_safe_install_path(Path::new(
+            "/usr/share/abs/pgo-benchmark.sh"
+        )));
+        assert!(is_safe_install_path(Path::new(
+            "/usr/share/abs/build-generate-propeller-profiles.sh"
+        )));
         assert!(!is_safe_install_path(Path::new("/usr/bin/pacman")));
+        assert!(is_safe_install_path(Path::new(
+            "/etc/sudoers.d/abs-pgo-1000"
+        )));
+        assert!(!is_safe_install_path(Path::new(
+            "/etc/sudoers.d/abs-pgo-1000.bak"
+        )));
+        assert!(!is_safe_install_path(Path::new("/etc/sudoers")));
     }
 
     #[test]

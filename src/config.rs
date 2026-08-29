@@ -487,6 +487,11 @@ pub struct PgoConfig {
     pub profile_scratch_dir: String,
     #[serde(default = "default_true")]
     pub perf_data_on_ram: bool,
+    /// Keep stage-3 propeller.data and converted cc/ld profiles on ramdisk scratch.
+    /// Skip copying them to `profiles_archive_dir`. The final Propeller kernel build
+    /// runs in the same boot, so a persistent HDD archive is not required.
+    #[serde(default = "default_true")]
+    pub propeller_profiles_on_ram: bool,
     /// Optional override for the bundled PGO benchmark script (`assets/pgo-benchmark.sh`).
     pub benchmark_command: Option<String>,
     /// Profiling workload: `fast` (sysbench + stress-ng) or `cachyos` (full cachyos-benchmarker).
@@ -510,7 +515,8 @@ pub struct PgoConfig {
     pub vmlinux: String,
     #[serde(default = "default_afdo_tool")]
     pub afdo_tool: String,
-    /// Stage 3 converter. `auto` prefers `generate_propeller_profiles` (LLVM 22+ BB_ADDR_MAP),
+    /// Stage 3 converter. `auto` prefers `generate_propeller_profiles` (PATH or ABS cache;
+    /// built from llvm-propeller against system LLVM when the kernel has BB_ADDR_MAP v5),
     /// then `create_llvm_prof`. Pin a binary name or path to force one tool.
     #[serde(default = "default_propeller_tool")]
     pub propeller_tool: String,
@@ -518,9 +524,44 @@ pub struct PgoConfig {
     pub afdo_profile_name: String,
     #[serde(default = "default_true")]
     pub verify_boot: bool,
-    /// When true, abs reboots at PGO wait stages and resumes via a user systemd unit until done.
+    /// One-shot next boot to the kernel this PGO stage installed (does not change the default).
+    #[serde(default = "default_true")]
+    pub select_boot_kernel: bool,
+    /// When true, abs reboots at PGO wait stages and resumes in a visible terminal until done.
     #[serde(default)]
     pub auto_restart: bool,
+    /// Reboot into the already-installed kernel before the first comparison (same cold-boot
+    /// setup as later stages).
+    #[serde(default)]
+    pub reboot_before_start: bool,
+    /// Skip AutoFDO collection (and the debug kernel unless a debug no-perf bench is requested)
+    /// when a suitable archived AutoFDO profile exists.
+    #[serde(default)]
+    pub reuse_afdo_profile: bool,
+    /// Skip Propeller collection (and the AutoFDO kernel unless an AutoFDO no-perf bench is
+    /// requested) when suitable archived Propeller profiles exist.
+    #[serde(default)]
+    pub reuse_propeller_profile: bool,
+    /// Clean cachyos-benchmarker runs for comparison charts
+    /// in `{profiles_archive_dir}/compare-benchmarks`.
+    /// `compare_current`: kernel already booted, before the debug PGO build (no perf).
+    #[serde(default)]
+    pub compare_current: bool,
+    /// Kept for old configs; profiling logs join with-overhead whenever any comparison is on.
+    #[serde(default)]
+    pub compare_debug: bool,
+    /// Extra clean cachyos-benchmarker run of the debug kernel (no perf) after AutoFDO collection.
+    #[serde(default)]
+    pub compare_debug_clean: bool,
+    /// Kept for old configs; profiling logs join with-overhead whenever any comparison is on.
+    #[serde(default)]
+    pub compare_autofdo: bool,
+    /// Extra clean cachyos-benchmarker run of the AutoFDO kernel (no perf) after Propeller collection.
+    #[serde(default)]
+    pub compare_autofdo_clean: bool,
+    /// Clean run of the final Propeller kernel after the last reboot (no perf).
+    #[serde(default)]
+    pub compare_final: bool,
     pub state_file: Option<String>,
 }
 
@@ -559,6 +600,25 @@ impl PgoConfig {
         dirs::cache_dir()
             .map(|d| d.join("abs").join("pgo-benchmark").join(package))
             .unwrap_or_else(|| PathBuf::from(format!("/tmp/abs-pgo-benchmark-{package}")))
+    }
+
+    pub fn compare_any(&self) -> bool {
+        self.compare_current
+            || self.compare_debug
+            || self.compare_debug_clean
+            || self.compare_autofdo
+            || self.compare_autofdo_clean
+            || self.compare_final
+    }
+
+    /// Logs and comparison PNGs/HTML from comparison cachyos-benchmarker runs.
+    /// Current and final are clean (no perf). Debug and AutoFDO reuse the profiling pass.
+    pub fn resolved_compare_dir(&self, package: &str) -> PathBuf {
+        if let Some(archive) = self.resolved_archive_dir() {
+            return archive.join("compare-benchmarks");
+        }
+        self.resolved_benchmark_workdir(package)
+            .join("compare-benchmarks")
     }
 }
 

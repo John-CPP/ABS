@@ -68,6 +68,61 @@ run_fast_benchmark() {
     echo "==> fast profiling workload finished"
 }
 
+# Persistent workdirs keep .abs-bin/cachyos-benchmarker from the last run.
+# The wget wrapper prepends that directory to PATH, so `command -v` must
+# skip the leftover ABS shim and keep the real CachyOS script.
+find_real_cachyos_benchmarker() {
+    local bindir="${WORKDIR}/.abs-bin"
+    local dir candidate resolved
+    local -a dirs
+    IFS=':' read -ra dirs <<< "${PATH}"
+    for dir in "${dirs[@]}"; do
+        [[ -n "${dir}" ]] || continue
+        candidate="${dir}/cachyos-benchmarker"
+        [[ -x "${candidate}" && ! -d "${candidate}" ]] || continue
+        resolved="$(readlink -f "${candidate}")"
+        [[ "${resolved}" != "${bindir}/cachyos-benchmarker" ]] || continue
+        printf '%s\n' "${resolved}"
+        return 0
+    done
+    return 1
+}
+
+# CachyOS ends every run by invoking benchmark_scraper.py (matplotlib). That
+# script crashes when the persistent ABS workdir mixes logs with different
+# test counts. ABS writes charts in Rust — patch the scraper call out of a
+# copy of cachyos-benchmarker. Do not put python on PATH.
+install_skip_scraper_wrapper() {
+    local bindir="${WORKDIR}/.abs-bin"
+    mkdir -p "${bindir}"
+    local real="${1:-}"
+    if [[ -z "${real}" ]]; then
+        real="$(find_real_cachyos_benchmarker)" || return 1
+    fi
+    real="$(readlink -f "${real}")"
+    if [[ "${real}" == "${bindir}/cachyos-benchmarker" ]]; then
+        echo "error: refusing to wrap the ABS cachyos-benchmarker shim" >&2
+        return 1
+    fi
+    cat > "${bindir}/cachyos-benchmarker" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real="${ABS_CACHYOS_BENCHMARKER_REAL:?}"
+patched="$(mktemp)"
+trap 'rm -f "${patched}"' EXIT
+scriptdir="$(dirname "${real}")"
+sed -E \
+    -e "s|^SCRIPTDIR=.*|SCRIPTDIR=\"${scriptdir}\"|" \
+    -e 's|^[[:space:]]*python3?[[:space:]].*benchmark_scraper\.py.*$|echo "==> skipping CachyOS benchmark_scraper.py (ABS writes comparison charts)"; true|' \
+    "${real}" > "${patched}"
+chmod +x "${patched}"
+exec bash "${patched}" "$@"
+EOF
+    chmod +x "${bindir}/cachyos-benchmarker"
+    export ABS_CACHYOS_BENCHMARKER_REAL="${real}"
+    export PATH="${bindir}:${PATH}"
+}
+
 install_quiet_wget_wrapper() {
     local bindir="${WORKDIR}/.abs-bin"
     mkdir -p "${bindir}"
@@ -97,8 +152,10 @@ EOF
 
 # True when cachyos-benchmarker would skip its large wget/tar steps (same paths as /usr/bin/cachyos-benchmarker).
 cachyos_benchmarker_assets_cached() {
-    local w=$1 script ffmpegver kernver ycruncher_ver
-    script="$(command -v cachyos-benchmarker)" || return 1
+    local w=$1 script="${2:-}" ffmpegver kernver ycruncher_ver
+    if [[ -z "${script}" ]]; then
+        script="$(find_real_cachyos_benchmarker)" || return 1
+    fi
     ffmpegver="$(sed -n 's/^FFMPEGVER="\([^"]*\)".*/\1/p' "${script}" | head -1)"
     ycruncher_ver="$(sed -n 's/^YCRUNCHER_VER="\([^"]*\)".*/\1/p' "${script}" | head -1)"
     kernver="$(sed -n 's/^KERNVER="\([^"]*\)".*/\1/p' "${script}" | head -1)"
@@ -113,27 +170,54 @@ cachyos_benchmarker_assets_cached() {
 }
 
 run_cachyos_benchmarker() {
-    if ! command -v cachyos-benchmarker >/dev/null 2>&1; then
+    local real
+    real="$(find_real_cachyos_benchmarker)" || {
         echo "error: cachyos-benchmarker not in PATH (ABS_PGO_BENCHMARK=cachyos)" >&2
         return 127
-    fi
+    }
     install_quiet_wget_wrapper
-    if ! cachyos_benchmarker_assets_cached "${WORKDIR}"; then
+    # Hide prior logs so a leaked scraper still sees only this run.
+    mkdir -p "${WORKDIR}/.abs-benchie-prev"
+    shopt -s nullglob
+    local prev_logs=("${WORKDIR}"/benchie_*.log)
+    if ((${#prev_logs[@]} > 0)); then
+        mv -f "${prev_logs[@]}" "${WORKDIR}/.abs-benchie-prev/" || true
+    fi
+    shopt -u nullglob
+    if ! cachyos_benchmarker_assets_cached "${WORKDIR}" "${real}"; then
         echo "==> cachyos-benchmarker (opt-in): downloads + configures sources; first run is very slow"
     fi
+    install_skip_scraper_wrapper "${real}"
     local progress_pid=""
-    ( while sleep 120; do echo "==> cachyos-benchmarker still running ($(date +%H:%M:%S))…"; done ) &
+    # `wait` (builtin) is interruptible; a foreground `sleep` is not. Killing
+    # the reporter must also reap its sleep child so piped ABS logs close.
+    (
+        trap 'kill "${sp:-}" 2>/dev/null; exit 0' TERM INT
+        while true; do
+            sleep 120 &
+            sp=$!
+            wait "${sp}" || true
+            echo "==> cachyos-benchmarker still running ($(date +%H:%M:%S))…"
+        done
+    ) &
     progress_pid=$!
-    trap 'kill "${progress_pid}" 2>/dev/null || true' RETURN
-    # checksys() prompts twice; feed defaults (no page-cache drop, default run name).
-    if ! printf '\n\n' | cachyos-benchmarker "${WORKDIR}"; then
+    stop_progress() {
+        if [[ -n "${progress_pid}" ]]; then
+            kill "${progress_pid}" 2>/dev/null || true
+            wait "${progress_pid}" 2>/dev/null || true
+            progress_pid=""
+        fi
+    }
+    trap 'stop_progress' RETURN
+    # checksys() prompts twice: page-cache drop (empty = no), then run name.
+    # ABS_PGO_COMPARE_LABEL is set when this run is also the comparison chart series.
+    local label="${ABS_PGO_COMPARE_LABEL:-}"
+    if ! printf '%s\n' '' "${label}" | cachyos-benchmarker "${WORKDIR}"; then
         local status=$?
-        kill "${progress_pid}" 2>/dev/null || true
-        wait "${progress_pid}" 2>/dev/null || true
+        stop_progress
         return "${status}"
     fi
-    kill "${progress_pid}" 2>/dev/null || true
-    wait "${progress_pid}" 2>/dev/null || true
+    stop_progress
 }
 
 case "${MODE}" in

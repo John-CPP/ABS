@@ -1,9 +1,8 @@
 /target/
 .stignore
+.stfolder/
 **/*.rs.bk
 .harness/
-__pycache__/
-*.pyc
 
 # Machine-local ABS config (use abs.toml.example + `abs --config-wizard`)
 /abs.toml

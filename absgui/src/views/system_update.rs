@@ -4,13 +4,13 @@ use crate::messages::Message;
 use crate::style;
 use crate::terminal_themes::LogPalette;
 use crate::widgets::{
-    COMMAND_LOG_PAGE_HEIGHT, command_log, dense_header_cell, dense_table, dense_table_row,
+    command_log, dense_header_cell, dense_table, dense_table_row, COMMAND_LOG_PAGE_HEIGHT,
 };
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::widget::Tree;
 use iced::advanced::{Renderer as _, Widget};
-use iced::widget::{Space, button, column, container, row, text};
+use iced::widget::{button, column, container, row, text, Space};
 use iced::{
     Alignment, Background, Border, Color, Element, Font, Length, Padding, Rectangle, Size, Theme,
 };

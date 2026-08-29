@@ -1,8 +1,8 @@
+use iced::futures::channel::mpsc;
 use iced::futures::FutureExt;
 use iced::futures::SinkExt;
 use iced::futures::Stream;
 use iced::futures::StreamExt;
-use iced::futures::channel::mpsc;
 use iced::stream;
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
@@ -162,24 +162,32 @@ impl PgoRunHandle {
     }
 
     /// Stop builds then run `abs --pgo-abort` / `--ramdisk-shutdown` cleanup.
+    ///
+    /// `keep_stage` is for closing the GUI during a live run. The Abort button
+    /// passes `false` so saved stages and the reboot auto-resume unit are cleared.
+    /// `shutdown_ramdisk` is for a live compile; idle pipeline reset skips it.
     pub fn abort(
         &self,
         package: &str,
         run_pgo_abort: bool,
         external_pid_file: Option<&Path>,
+        keep_stage: bool,
+        shutdown_ramdisk: bool,
     ) -> Result<String, String> {
         self.stop_running_build(external_pid_file);
         let mut out = String::new();
         let mut errors = Vec::new();
         if run_pgo_abort {
-            match run_abs_abort(package) {
+            match run_abs_abort(package, keep_stage) {
                 Ok(msg) => out.push_str(&msg),
                 Err(e) => errors.push(e),
             }
         }
-        match run_ramdisk_shutdown() {
-            Ok(msg) => out.push_str(&msg),
-            Err(e) => errors.push(e),
+        if shutdown_ramdisk {
+            match run_ramdisk_shutdown() {
+                Ok(msg) => out.push_str(&msg),
+                Err(e) => errors.push(e),
+            }
         }
         if errors.is_empty() {
             Ok(out)
@@ -594,6 +602,14 @@ pub fn format_install_repo_updates(names: &[String]) -> String {
 pub fn format_install_aur(package: &str) -> String {
     format!(
         "{} --install-aur {} --no-wait",
+        shell_quote(&abs_binary()),
+        shell_quote(package)
+    )
+}
+
+pub fn format_install_os_package(package: &str) -> String {
+    format!(
+        "{} --install-os-package {} --no-wait",
         shell_quote(&abs_binary()),
         shell_quote(package)
     )
@@ -1616,9 +1632,17 @@ pub fn stream_abs_pgo(
     stream_abs_command(inner, handle, event_log)
 }
 
-pub fn run_abs_abort(package: &str) -> Result<String, String> {
+pub fn pgo_abort_cli_args(package: &str, keep_stage: bool) -> Vec<String> {
+    let mut args = vec!["--pgo-abort".into(), package.into(), "--no-wait".into()];
+    if keep_stage {
+        args.push("--pgo-keep-stage".into());
+    }
+    args
+}
+
+pub fn run_abs_abort(package: &str, keep_stage: bool) -> Result<String, String> {
     let mut cmd = Command::new(abs_binary());
-    cmd.args(["--pgo-abort", package, "--pgo-keep-stage"]);
+    cmd.args(pgo_abort_cli_args(package, keep_stage));
     apply_gui_sudo_env(&mut cmd);
     cmd.stdin(Stdio::null());
     let output = cmd.output().map_err(|e| format!("spawn: {e}"))?;
@@ -1631,7 +1655,7 @@ pub fn run_abs_abort(package: &str) -> Result<String, String> {
 
 pub fn run_ramdisk_shutdown() -> Result<String, String> {
     let mut cmd = Command::new(abs_binary());
-    cmd.arg("--ramdisk-shutdown");
+    cmd.arg("--ramdisk-shutdown").arg("--no-wait");
     apply_gui_sudo_env(&mut cmd);
     cmd.stdin(Stdio::null());
     let output = cmd
@@ -1745,6 +1769,39 @@ mod tests {
     }
 
     #[test]
+    fn gui_pgo_abort_resets_pipeline_instead_of_keeping_stage() {
+        let args = super::pgo_abort_cli_args("linux-cachyos", false);
+        assert_eq!(args, ["--pgo-abort", "linux-cachyos", "--no-wait"]);
+        assert!(
+            !args.iter().any(|a| a == "--pgo-keep-stage"),
+            "Abort must clear stages, not preserve them: {args:?}"
+        );
+    }
+
+    #[test]
+    fn pgo_resume_until_reboot_omits_once() {
+        let cmd = super::format_abs_pgo_command(
+            super::PgoAction::Resume,
+            "linux-cachyos",
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(!cmd.contains("--pgo-once"), "{cmd}");
+        let once = super::format_abs_pgo_command(
+            super::PgoAction::Resume,
+            "linux-cachyos",
+            None,
+            Some("stage2_profile"),
+            true,
+            false,
+        );
+        assert!(once.contains("--pgo-once"), "{once}");
+        assert!(once.contains("--pgo-stage"), "{once}");
+    }
+
+    #[test]
     fn install_repo_command_passes_package_names() {
         let cmd = super::format_install_repo_updates(&["firefox".into(), "linux".into()]);
         assert!(cmd.contains("--install-repo-updates"), "{cmd}");
@@ -1757,6 +1814,16 @@ mod tests {
         let cmd = super::format_install_aur("yay-bin");
         assert!(cmd.contains("--install-aur"), "{cmd}");
         assert!(cmd.contains("yay-bin"), "{cmd}");
+    }
+
+    #[test]
+    fn install_os_package_command_uses_selected_kernel() {
+        let cmd = super::format_install_os_package("linux-cachyos");
+        assert!(cmd.contains("--install-os-package"), "{cmd}");
+        assert!(cmd.contains("linux-cachyos"), "{cmd}");
+        assert!(cmd.contains("--no-wait"), "{cmd}");
+        let lto = super::format_install_os_package("linux-cachyos-lto");
+        assert!(lto.contains("linux-cachyos-lto"), "{lto}");
     }
 
     #[test]
@@ -1779,12 +1846,10 @@ mod tests {
             )
             .is_none()
         );
-        assert!(
-            super::sanitize_log_line(
-                "[stderr] (yad:1): Gtk-WARNING **: 00:00:00.000: cannot open display"
-            )
-            .is_none()
-        );
+        assert!(super::sanitize_log_line(
+            "[stderr] (yad:1): Gtk-WARNING **: 00:00:00.000: cannot open display"
+        )
+        .is_none());
         assert_eq!(
             super::sanitize_log_line("==> WARNING: Configured vmlinux lacks debug info").as_deref(),
             Some("==> WARNING: Configured vmlinux lacks debug info")

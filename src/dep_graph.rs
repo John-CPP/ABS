@@ -262,6 +262,7 @@ mod tests {
             pending_updates: false,
             install_repo_updates: false,
             install_aur: None,
+            install_os_package: None,
             set_default_lang: None,
         };
 
@@ -363,6 +364,7 @@ mod tests {
             pending_updates: false,
             install_repo_updates: false,
             install_aur: None,
+            install_os_package: None,
             set_default_lang: None,
         };
 
@@ -465,6 +467,7 @@ mod tests {
             pending_updates: false,
             install_repo_updates: false,
             install_aur: None,
+            install_os_package: None,
             set_default_lang: None,
         };
 

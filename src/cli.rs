@@ -134,12 +134,13 @@ pub struct Cli {
     #[arg(long, value_name = "PACKAGE")]
     pub pgo_status: Option<String>,
 
-    /// Abort kernel PGO pipeline (stops builds and marks the pipeline aborted so kernel packages
-    /// are released from system-update holds; use `--pgo-keep-stage` to preserve the saved stage)
+    /// Abort kernel PGO pipeline (stops builds, clears saved stages so the timeline
+    /// returns to empty, removes the reboot auto-resume unit, and releases kernel
+    /// packages from system-update holds; use `--pgo-keep-stage` to preserve the saved stage)
     #[arg(long, value_name = "PACKAGE")]
     pub pgo_abort: Option<String>,
 
-    /// With `--pgo-abort`: keep the saved pipeline stage for later resume (GUI stop button)
+    /// With `--pgo-abort`: keep the saved pipeline stage for later resume
     #[arg(long, action = ArgAction::SetTrue)]
     pub pgo_keep_stage: bool,
 
@@ -160,8 +161,10 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub pgo_goto: bool,
 
-    /// Unattended PGO: resume in-progress pipelines on start, reboot at wait stages, and continue
-    /// after boot via a transient user systemd unit (also enabled by `auto_restart` in abs.toml).
+    /// Unattended PGO: reboot at wait stages and continue after boot via a user systemd unit
+    /// (GUI terminal, or a console/SSH TTY when there is no desktop; also enabled by `auto_restart` in abs.toml).
+    /// Installs a narrow `/etc/sudoers.d/abs-pgo-<uid>` drop-in so resume does not ask for a password;
+    /// the drop-in is removed when the pipeline finishes or is aborted.
     #[arg(long, action = ArgAction::SetTrue)]
     pub pgo_auto: bool,
 
@@ -265,6 +268,11 @@ pub struct Cli {
     /// Install one AUR package with yay/paru/pikaur from abs.toml
     #[arg(long, value_name = "PACKAGE")]
     pub install_aur: Option<String>,
+
+    /// Install the OS/repo prebuilt package (`pacman -S PKG`), ignoring ABS skip/hold lists.
+    /// Used by AbsGui “Install OS-provided compiled version” on a kernel page.
+    #[arg(long, value_name = "PACKAGE")]
+    pub install_os_package: Option<String>,
 
     /// Set the default language for abs, and for AbsGui if AbsGui has no language of its own.
     /// Codes: en, de, es, ar, ru, zh, ja.

@@ -650,6 +650,43 @@ pub fn install_aur(config: &Config, package: &str) -> Result<(), String> {
     run_argv_command(&argv, None::<&str>)
 }
 
+/// Install the distro's prebuilt package (`pacman -S`), even if ABS holds/ignores it.
+pub fn install_os_package(package: &str) -> Result<(), String> {
+    let argv = os_package_install_argv(package.trim(), crate::system::is_root())?;
+    // Askpass only — do not prime `sudo -v` first. GUI sudo capture runs each sudo
+    // on its own pty, so a separate prime would prompt for the password twice.
+    apply_gui_nested_sudo_askpass();
+    crate::blog!("Installing OS-provided package: {}", argv.join(" "));
+    run_argv_command(&argv, None::<&str>)
+}
+
+fn valid_pacman_pkg_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.is_empty() || b.len() > 128 {
+        return false;
+    }
+    if b.iter().all(|&c| c == b'.') {
+        return false;
+    }
+    b.iter().all(|c| {
+        matches!(
+            c,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'.' | b'_' | b'+' | b'-'
+        )
+    })
+}
+
+/// `pacman -S PKG` (with `sudo` when not root). Reinstalls if already present so this
+/// can replace an ABS-built kernel with the distro binary. No ABS ignore/hold flags.
+fn os_package_install_argv(package: &str, is_root: bool) -> Result<Vec<String>, String> {
+    if !valid_pacman_pkg_name(package) {
+        return Err(format!("invalid package name: {package}"));
+    }
+    let mut v = vec!["pacman".into(), "-S".into(), "--noconfirm".into()];
+    v.push(package.to_string());
+    Ok(transform_system_update_argv(v, is_root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,5 +902,40 @@ Version         : 6.9-1
             skipped: vec![],
         };
         assert!(watched.has_work());
+    }
+
+    #[test]
+    fn os_package_install_uses_pacman_s_for_the_named_kernel() {
+        let argv = super::os_package_install_argv("linux-cachyos", true).unwrap();
+        assert_eq!(argv[0], "pacman");
+        assert!(argv.contains(&"-S".to_string()));
+        assert!(
+            argv.contains(&"--noconfirm".to_string()),
+            "one-shot OS install must not wait for [Y/n]: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--needed".to_string()),
+            "must reinstall a distro kernel that is already present: {argv:?}"
+        );
+        assert!(argv.contains(&"linux-cachyos".to_string()));
+        assert!(!argv.iter().any(|a| a == "--ignore"));
+    }
+
+    #[test]
+    fn os_package_install_adds_sudo_when_not_root() {
+        let argv = super::os_package_install_argv("linux-cachyos-lto", false).unwrap();
+        assert_eq!(argv[0], "sudo");
+        assert_eq!(argv[1], "pacman");
+        assert!(argv.contains(&"--noconfirm".to_string()), "{argv:?}");
+        assert!(!argv.contains(&"--needed".to_string()), "{argv:?}");
+        assert!(argv.contains(&"linux-cachyos-lto".to_string()));
+    }
+
+    #[test]
+    fn os_package_install_rejects_injection() {
+        assert!(super::os_package_install_argv("", true).is_err());
+        assert!(super::os_package_install_argv("linux-cachyos;id", true).is_err());
+        assert!(super::os_package_install_argv("../evil", true).is_err());
+        assert!(super::os_package_install_argv("foo bar", true).is_err());
     }
 }

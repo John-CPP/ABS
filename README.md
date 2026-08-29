@@ -70,6 +70,7 @@ cargo build --release
 sudo install -Dm755 ./target/release/abs /usr/bin/abs
 sudo install -Dm755 ./target/release/absgui /usr/bin/absgui
 sudo install -Dm755 ./assets/pgo-benchmark.sh /usr/share/abs/pgo-benchmark.sh
+sudo install -Dm755 ./assets/build-generate-propeller-profiles.sh /usr/share/abs/build-generate-propeller-profiles.sh
 for s in 32 48 64 128 256 512; do
   sudo install -Dm644 "./absgui/assets/icons/icon_${s}.png" \
     "/usr/share/icons/hicolor/${s}x${s}/apps/absgui.png"
@@ -287,6 +288,7 @@ The **System update** page lists pending pacman and AUR upgrades (`abs --pending
 | `--pending-updates` | List pending official-repo and AUR upgrades (`--json` for the GUI) |
 | `--install-repo-updates` | Install pending official-repo packages in one transaction (optional package args) |
 | `--install-aur=PKG` | Install one AUR package with yay/paru/pikaur from `command_to_perform_system_update` |
+| `--install-os-package=PKG` | Install the distro prebuilt package (`pacman -S --noconfirm PKG`), ignoring ABS hold/ignore lists. Reinstalls if that package is already present |
 | `--repo=NAME` | Default repository when the package has no `source=` / `[repo=…]` |
 | `--ramdisk=wcp\|disabled` | Ramdisk targets for every package on this run (`w` workdir, `c` chroot, `p` packages) |
 | `--install-only` | Install existing artifacts from `ready_made_packages_path` |
@@ -306,7 +308,7 @@ The **System update** page lists pending pacman and AUR upgrades (`abs --pending
 | `--check-update` / `--self-update` | Compare / install newer ABS from git HEAD. On a failed compile, offers to purge the git checkout and retry |
 | `--kernel-build=PKG` | One-shot kernel build from `[packages.PKG.kernel]` (no PGO) |
 | `--pgo` / `--pgo-resume` / `--pgo-status` / `--pgo-abort` / `--pgo-restart` | Kernel PGO pipeline |
-| `--pgo-stage` / `--pgo-once` / `--pgo-goto` / `--pgo-keep-stage` / `--pgo-auto` | PGO stage control |
+| `--pgo-stage` / `--pgo-once` / `--pgo-goto` / `--pgo-keep-stage` / `--pgo-auto` | PGO stage control. `--pgo-auto` installs a narrow `/etc/sudoers.d/abs-pgo-<uid>` drop-in so resume after reboot does not ask for a sudo password; the file is removed when the pipeline finishes or is aborted |
 | `--ramdisk-shutdown` | Unmount the configured tmpfs |
 | `--json` | Machine-readable output (PGO status / events / `--pending-updates`) |
 | `--event-log=PATH` | Append JSON-lines PGO events |
@@ -432,9 +434,13 @@ abs --pgo-resume linux-cachyos
 abs --pgo-status linux-cachyos --json
 ```
 
-`profiles_archive_dir` is required. `ramdisk = "w"` keeps sources on disk and compile I/O on tmpfs.
+`profiles_archive_dir` is required. `ramdisk = "w"` keeps sources on disk and compile I/O on tmpfs. `propeller_profiles_on_ram` (default `true`) keeps stage-3 Propeller profiles on ramdisk scratch and skips the HDD archive — the final Propeller build runs in the same boot. With `auto_restart`, abs reboots at wait gates, installs a passwordless sudo helper (`/etc/sudoers.d/abs-pgo-<uid>`, removed when the pipeline ends), and opens a terminal after login so you can watch the next profile + build. With `select_boot_kernel` (default `true`), abs sets a one-shot bootloader entry for the stage kernel before reboot (`bootctl set-oneshot` on systemd-boot/Limine, `grub-reboot` on GRUB) without changing the permanent default.
+
+Stage 3 Propeller conversion needs a tool that can read the kernel's `SHT_LLVM_BB_ADDR_MAP` section. LLVM 22+ writes version 5, which `create_llvm_prof` 0.30 cannot read. With `propeller_tool = "auto"` (the default), ABS uses `generate_propeller_profiles` when it is on `PATH` or in `~/.cache/abs/llvm-propeller/`, and otherwise builds it from [llvm-propeller](https://github.com/google/llvm-propeller) against system LLVM (`cmake`, `ninja`, `clang`, `llvm`, `git`).
 
 Profiling uses the bundled `assets/pgo-benchmark.sh` (installed to `/usr/share/abs/pgo-benchmark.sh`) unless you set `benchmark_command`. From a `cargo build` without that file, ABS writes the same script to `~/.local/share/abs/pgo-benchmark.sh`. It expects `cachyos-benchmarker`, `sysbench`, and optionally `rg` on `PATH`.
+
+Opt-in comparison benchmarks (`compare_current`, `compare_debug_clean`, `compare_autofdo_clean`, `compare_final`, all default `false`) write logs to `{profiles_archive_dir}/compare-benchmarks`. These are clean `cachyos-benchmarker` runs (no `perf`). A standalone clean run drops the page cache and does a short `fast` warm-up first; a clean run that immediately follows profiling on the same kernel skips that. Profiling logs still feed `with-overhead/` whenever any comparison is on. `reboot_before_start` reboots into the current kernel before the first comparison. `reuse_afdo_profile` / `reuse_propeller_profile` skip collection when a suitable archive exists (a debug or AutoFDO no-perf bench still builds and boots that kernel). At the end ABS builds `without-overhead/` and `with-overhead/` (if collection logs exist), plus `index.html`. Requires `cachyos-benchmarker`. Charts are generated by ABS (no Python).
 
 absgui pages: **Kernels** (list + default template; screenshot [above](#absgui)), **per-kernel** (PGO controls and build log), **System update** (pending pacman/AUR list, per-AUR install, `abs -RU`), **ABS settings** (full `abs.toml`), **App settings** (theme, window). The window app id is `absgui`, matching the installed `.desktop` file (Utility; System) and icon so Wayland taskbars show the logo.
 

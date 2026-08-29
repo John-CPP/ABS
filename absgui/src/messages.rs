@@ -188,7 +188,16 @@ pub enum KBool {
     PgoEnabled,
     PgoAutoRestart,
     PgoPerfDataOnRam,
+    PgoPropellerProfilesOnRam,
     PgoVerifyBoot,
+    PgoSelectBootKernel,
+    PgoCompareCurrent,
+    PgoCompareDebugClean,
+    PgoCompareAutofdoClean,
+    PgoCompareFinal,
+    PgoRebootBeforeStart,
+    PgoReuseAfdoProfile,
+    PgoReusePropellerProfile,
     CcHarder,
     LtoSuffix,
     GccSuffix,
@@ -332,9 +341,9 @@ pub enum Message {
     PgoSelectStage(String),
     /// Clear saved state and run stage 1 (`--pgo-restart`).
     PgoRestartFromScratch,
-    /// Run the selected phase (`--pgo-resume --pgo-stage … --pgo-once`).
+    /// Run from the selected phase until the next reboot wait (`--pgo-resume [--pgo-stage …]`).
     PgoStartFromPhase,
-    /// Continue after a reboot wait gate (`--pgo-resume --pgo-once`).
+    /// Continue after a reboot wait gate (`--pgo-resume`, runs until the next reboot wait).
     PgoContinueAfterReboot,
     PgoAbort,
     KernelBuildStart,
@@ -346,6 +355,8 @@ pub enum Message {
     FetchOverlayTick,
     InstallRepoUpdates,
     InstallAur(String),
+    /// Install the distro prebuilt kernel (`pacman -S` for the open kernel page).
+    InstallOsKernel,
     LogFlush,
     PgoRunFinished(Result<AbsRunOutput, String>),
     PgoAbortFinished(Result<String, String>),
