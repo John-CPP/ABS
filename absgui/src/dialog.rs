@@ -571,6 +571,7 @@ fn folder_dialog_title(field: PathField) -> &'static str {
         PathField::RamdiskMountPoint => abs_i18n::t("gui.dialog.ramdisk_mount"),
         PathField::RamdiskSeedChroot => abs_i18n::t("gui.dialog.ramdisk_seed"),
         PathField::PgoArchiveDir => abs_i18n::t("gui.dialog.pgo_archive"),
+        PathField::PgoSaveKernelsDir => abs_i18n::t("gui.dialog.pgo_save_kernels"),
         PathField::PgoBenchmarkWorkdir => abs_i18n::t("gui.dialog.pgo_benchmark_workdir"),
         PathField::PgoProfileScratchDir => abs_i18n::t("gui.dialog.pgo_scratch"),
         _ => abs_i18n::t("gui.dialog.folder"),

@@ -510,31 +510,42 @@ fn main() {
         || cli.pgo_restart.is_some()
         || cli.pgo_goto
     {
-        let _ramdisk_shutdown = RamdiskShutdown;
-        crate::ramdisk::install_exit_handlers();
-        let pgo_needs_sudo = cli.pgo.is_some()
-            || cli.pgo_resume.is_some()
-            || cli.pgo_restart.is_some()
-            || cli.pgo_goto
-            || cli.pgo_abort.is_some();
-        // Auto-resume from systemd has no TTY: the child terminal will prime sudo instead.
-        let handoff = pgo::should_handoff_to_visible_terminal(&cli, &config);
-        if !cli.dry_run && pgo_needs_sudo && !handoff {
-            let _ = pgo_priv::try_enable_client();
-            if !pgo_priv::client_enabled() {
-                if let Err(e) = prime_sudo_for_session() {
-                    if std::env::var_os("ABS_GUI").is_some() {
-                        die!("{}", e);
+        {
+            let _ramdisk_shutdown = RamdiskShutdown;
+            crate::ramdisk::install_exit_handlers();
+            let pgo_needs_sudo = cli.pgo.is_some()
+                || cli.pgo_resume.is_some()
+                || cli.pgo_restart.is_some()
+                || cli.pgo_goto
+                || cli.pgo_abort.is_some();
+            // Auto-resume from systemd has no TTY: the child terminal will prime sudo instead.
+            let handoff = pgo::should_handoff_to_visible_terminal(&cli, &config);
+            if !cli.dry_run && pgo_needs_sudo && !handoff {
+                let _ = pgo_priv::try_enable_client();
+                if !pgo_priv::client_enabled() {
+                    if let Err(e) = prime_sudo_for_session() {
+                        if std::env::var_os("ABS_GUI").is_some() {
+                            die!("{}", e);
+                        }
+                        ewarn!(
+                            "sudo -v failed (PGO build steps may prompt for a password again): {}",
+                            e
+                        );
                     }
-                    ewarn!(
-                        "sudo -v failed (PGO build steps may prompt for a password again): {}",
-                        e
-                    );
+                    spawn_sudo_keepalive();
                 }
-                spawn_sudo_keepalive();
             }
+            pgo::handle_cli(&cli, &config);
         }
-        pgo::handle_cli(&cli, &config);
+        // After ramdisk/zram teardown: power off if requested, else drop the sudo helper.
+        if pgo::take_shutdown_after_finish() {
+            if let Err(e) = pgo::trigger_pgo_shutdown() {
+                ewarn!("PGO shutdown after finish failed: {e}");
+                pgo_priv::maybe_remove_dropin();
+            }
+        } else {
+            pgo_priv::maybe_remove_dropin();
+        }
         return;
     }
 

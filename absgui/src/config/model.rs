@@ -516,6 +516,8 @@ pub struct PgoSection {
     pub preset: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profiles_archive_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_kernels_dir: Option<String>,
     #[serde(default = "default_auto")]
     pub profile_scratch_dir: String,
     #[serde(default = "default_true")]
@@ -560,6 +562,8 @@ pub struct PgoSection {
     pub auto_restart: bool,
     #[serde(default)]
     pub reboot_before_start: bool,
+    #[serde(default)]
+    pub shutdown_after_finish: bool,
     #[serde(default)]
     pub reuse_afdo_profile: bool,
     #[serde(default)]
@@ -636,6 +640,7 @@ impl Default for PgoSection {
             enabled: true,
             preset: default_pgo_preset(),
             profiles_archive_dir: None,
+            save_kernels_dir: None,
             profile_scratch_dir: default_auto(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
@@ -658,6 +663,7 @@ impl Default for PgoSection {
             select_boot_kernel: true,
             auto_restart: false,
             reboot_before_start: false,
+            shutdown_after_finish: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
             skip_propeller: false,

@@ -267,6 +267,7 @@ const HUGE_OPTS: &[&str] = &["always", "madvise"];
 const ENV_OPTS: &[&str] = &["local", "chroot"];
 const PACKAGE_ZRAM_OPTS: &[&str] = &["inherit", "off", "full"];
 const PGO_PROFILING_QUALITY_OPTS: &[&str] = &["short", "sweet", "long"];
+const PGO_COMPARE_PRESET_OPTS: &[&str] = &["kbench", "cachyos", "kbench+cachyos"];
 const PGO_CONVERT_RELOCATE_OPTS: &[&str] = &["force", "smart"];
 
 pub fn run() -> iced::Result {
@@ -1331,6 +1332,13 @@ impl App {
                 .and_then(|p| p.pgo.as_ref())
                 .and_then(|p| p.profiles_archive_dir.clone())
                 .unwrap_or_default(),
+            PathField::PgoSaveKernelsDir => self
+                .selected_kernel
+                .as_ref()
+                .and_then(|n| self.config.packages.get(n))
+                .and_then(|p| p.pgo.as_ref())
+                .and_then(|p| p.save_kernels_dir.clone())
+                .unwrap_or_default(),
             PathField::PgoBenchmark => self
                 .selected_kernel
                 .as_ref()
@@ -1401,6 +1409,7 @@ impl App {
             PathField::RamdiskSeedChroot => self.config.ramdisk.seed_chroot_from = opt,
             PathField::SelfUpdateInstallPath => self.config.self_update_install_path = opt,
             PathField::PgoArchiveDir
+            | PathField::PgoSaveKernelsDir
             | PathField::PgoBenchmark
             | PathField::PgoBenchmarkWorkdir
             | PathField::PgoProfileScratchDir
@@ -1412,6 +1421,7 @@ impl App {
                         let pgo = pkg.pgo.get_or_insert_with(Default::default);
                         match field {
                             PathField::PgoArchiveDir => pgo.profiles_archive_dir = opt,
+                            PathField::PgoSaveKernelsDir => pgo.save_kernels_dir = opt,
                             PathField::PgoBenchmark => pgo.benchmark_command = opt,
                             PathField::PgoBenchmarkWorkdir => pgo.benchmark_workdir = opt,
                             PathField::PgoProfileScratchDir => {
@@ -4707,6 +4717,14 @@ fn kernel_form<'a>(
             _ => "force".to_string(),
         }
     };
+    let compare_preset = {
+        let v = kstr_value(pkg, KStr::ComparePreset);
+        match v.to_ascii_lowercase().as_str() {
+            "cachyos" => "cachyos".to_string(),
+            "kbench+cachyos" => "kbench+cachyos".to_string(),
+            _ => "kbench".to_string(),
+        }
+    };
 
     let pgo = card_section(
         abs_i18n::t("gui.pgo.title"),
@@ -4746,13 +4764,22 @@ fn kernel_form<'a>(
                 ),
             ]
             .spacing(16),
-            row![field_checkbox(
-                abs_i18n::t("gui.field.pgo_reboot_before_start"),
-                Some(field_help::pgo_reboot_before_start()),
-                kbool_value(pkg, KBool::PgoRebootBeforeStart),
-                theme,
-                move |v| Message::SetKernelBool(target, KBool::PgoRebootBeforeStart, v),
-            ),]
+            row![
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_reboot_before_start"),
+                    Some(field_help::pgo_reboot_before_start()),
+                    kbool_value(pkg, KBool::PgoRebootBeforeStart),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoRebootBeforeStart, v),
+                ),
+                field_checkbox(
+                    abs_i18n::t("gui.field.pgo_shutdown_after_finish"),
+                    Some(field_help::pgo_shutdown_after_finish()),
+                    kbool_value(pkg, KBool::PgoShutdownAfterFinish),
+                    theme,
+                    move |v| Message::SetKernelBool(target, KBool::PgoShutdownAfterFinish, v),
+                ),
+            ]
             .spacing(16),
             row![field_checkbox(
                 abs_i18n::t("gui.field.pgo_perf_data_on_ram"),
@@ -4781,6 +4808,14 @@ fn kernel_form<'a>(
             text(abs_i18n::t("gui.pgo.compare_title"))
                 .size(13)
                 .color(style::muted(theme)),
+            field_pick(
+                abs_i18n::t("gui.field.pgo_compare_preset"),
+                Some(field_help::pgo_compare_preset()),
+                PGO_COMPARE_PRESET_OPTS,
+                &compare_preset,
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::ComparePreset, v),
+            ),
             row![
                 field_checkbox(
                     abs_i18n::t("gui.field.pgo_compare_current"),
@@ -4857,6 +4892,16 @@ fn kernel_form<'a>(
                 WPathKind::Folder,
                 theme,
                 move |v| Message::SetKernelStr(target, KStr::ArchiveDir, v),
+            ),
+            field_path(
+                abs_i18n::t("gui.field.pgo_save_kernels_dir"),
+                Some(field_help::pgo_save_kernels_dir()),
+                &kstr_value(pkg, KStr::SaveKernelsDir),
+                "/mnt/data/abs/pgo/kernels",
+                WPathField::PgoSaveKernelsDir,
+                WPathKind::Folder,
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::SaveKernelsDir, v),
             ),
             field_path(
                 abs_i18n::t("gui.field.pgo_profile_scratch"),
@@ -5471,9 +5516,11 @@ fn kstr_value(pkg: &PackageSection, field: KStr) -> String {
         KStr::Preempt => kernel.and_then(|k| k.preempt.clone()),
         KStr::Hugepage => kernel.and_then(|k| k.hugepage.clone()),
         KStr::ArchiveDir => pgo.and_then(|p| p.profiles_archive_dir.clone()),
+        KStr::SaveKernelsDir => pgo.and_then(|p| p.save_kernels_dir.clone()),
         KStr::Benchmark => pgo.and_then(|p| p.benchmark_command.clone()),
         KStr::BenchmarkWorkdir => pgo.and_then(|p| p.benchmark_workdir.clone()),
         KStr::ProfilingQuality => pgo.map(|p| p.profiling_quality.clone()),
+        KStr::ComparePreset => pgo.map(|p| p.compare_preset.clone()),
         KStr::ConvertRelocate => pgo.map(|p| p.convert_relocate.clone()),
         KStr::BuildUser => pgo.and_then(|p| p.build_user.clone()),
         KStr::SysctlCommand => pgo.and_then(|p| p.sysctl_command.clone()),
@@ -5504,6 +5551,15 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
             "sweet".into()
         } else {
             value.trim().to_string()
+        };
+        return;
+    }
+    if matches!(field, KStr::ComparePreset) {
+        let pgo = pkg.pgo.get_or_insert_with(Default::default);
+        pgo.compare_preset = match value.trim().to_ascii_lowercase().as_str() {
+            "cachyos" => "cachyos".into(),
+            "kbench+cachyos" => "kbench+cachyos".into(),
+            _ => "kbench".into(),
         };
         return;
     }
@@ -5612,6 +5668,11 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
                 .get_or_insert_with(Default::default)
                 .profiles_archive_dir = opt
         }
+        KStr::SaveKernelsDir => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .save_kernels_dir = opt
+        }
         KStr::Benchmark => {
             pkg.pgo
                 .get_or_insert_with(Default::default)
@@ -5623,6 +5684,9 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
                 .benchmark_workdir = opt
         }
         KStr::ProfilingQuality => {
+            unreachable!("handled above")
+        }
+        KStr::ComparePreset => {
             unreachable!("handled above")
         }
         KStr::ConvertRelocate => {
@@ -5674,6 +5738,11 @@ fn kbool_value(pkg: &PackageSection, field: KBool) -> bool {
             .pgo
             .as_ref()
             .map(|p| p.reboot_before_start)
+            .unwrap_or(false),
+        KBool::PgoShutdownAfterFinish => pkg
+            .pgo
+            .as_ref()
+            .map(|p| p.shutdown_after_finish)
             .unwrap_or(false),
         KBool::PgoReuseAfdoProfile => pkg
             .pgo
@@ -5750,6 +5819,11 @@ fn set_kbool(pkg: &mut PackageSection, field: KBool, value: bool) {
             pkg.pgo
                 .get_or_insert_with(Default::default)
                 .reboot_before_start = value
+        }
+        KBool::PgoShutdownAfterFinish => {
+            pkg.pgo
+                .get_or_insert_with(Default::default)
+                .shutdown_after_finish = value
         }
         KBool::PgoReuseAfdoProfile => {
             pkg.pgo

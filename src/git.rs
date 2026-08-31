@@ -1,4 +1,4 @@
-use crate::utils::{check_sudo_removal, run_command};
+use crate::utils::{check_sudo_removal, run_command, run_command_with_output_silent};
 use crate::{blog, die, ewarn, vlog};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -184,6 +184,68 @@ fn clone_git_repo(clone_url: &str, repo_dir: &Path) -> Result<(), String> {
     accept_clone_dest(repo_dir, crate::is_dry_run_mode())
 }
 
+fn git_stdout(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_command_with_output_silent("git", args, Some(repo_dir)).map(|s| s.trim().to_string())
+}
+
+fn origin_url(repo_dir: &Path) -> Option<String> {
+    git_stdout(repo_dir, &["remote", "get-url", "origin"])
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn current_branch(repo_dir: &Path) -> String {
+    git_stdout(repo_dir, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .filter(|s| !s.is_empty() && s != "HEAD")
+        .unwrap_or_else(|| "HEAD".into())
+}
+
+fn ensure_origin_remote(repo_dir: &Path, clone_url: &str) -> Result<(), String> {
+    if origin_url(repo_dir).is_some() {
+        return Ok(());
+    }
+    blog!(
+        "Git remote origin missing in {}; restoring from {}",
+        repo_dir.display(),
+        clone_url
+    );
+    if run_command(
+        "git",
+        &["remote", "add", "origin", clone_url],
+        Some(repo_dir),
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    run_command(
+        "git",
+        &["remote", "set-url", "origin", clone_url],
+        Some(repo_dir),
+    )
+}
+
+/// Fast-forward from `origin`. Bare `git pull` needs upstream tracking and a
+/// `[remote "origin"]` in `.git/config`; clones can lose both (missing config).
+fn git_ff_only_pull(repo_dir: &Path, clone_url: &str) -> Result<(), String> {
+    ensure_origin_remote(repo_dir, clone_url)?;
+    let branch = current_branch(repo_dir);
+    run_command(
+        "git",
+        &["pull", "--ff-only", "-q", "origin", &branch],
+        Some(repo_dir),
+    )?;
+    if branch != "HEAD" {
+        let upstream = format!("origin/{branch}");
+        let _ = git_stdout(
+            repo_dir,
+            &["branch", &format!("--set-upstream-to={upstream}"), &branch],
+        );
+    }
+    Ok(())
+}
+
 /// After `git clone`, the dest must be a usable repo. `--dry-run` only prints the clone,
 /// so a missing dest is expected rather than a corrupt clone.
 fn accept_clone_dest(repo_dir: &Path, dry_run: bool) -> Result<(), String> {
@@ -211,7 +273,6 @@ pub fn prepare_repo(
     force_update: bool,
     pkgbuild_cache: Option<&mut PkgbuildDirCache>,
 ) -> PrepareRepoResult {
-    let git_run = |c: &str, a: &[&str], d: Option<&Path>| run_command(c, a, d);
     let mut sync_action = RepoSyncAction::Unchanged;
     if is_per_package_repo(repo_name) {
         let repo_key = per_package_repo_key(repo_name);
@@ -233,8 +294,8 @@ pub fn prepare_repo(
             );
         }
 
+        let clone_url = format!("{}/{}.git", repo_url.trim_end_matches('/'), base_pkg_name);
         if !repo_dir.exists() {
-            let clone_url = format!("{}/{}.git", repo_url.trim_end_matches('/'), base_pkg_name);
             blog!(
                 "Cloning {} package repo {}...",
                 repo_key.to_uppercase(),
@@ -254,11 +315,7 @@ pub fn prepare_repo(
                 repo_key.to_uppercase(),
                 base_pkg_name
             );
-            match git_run(
-                "git",
-                &["pull", "--ff-only", "-q"],
-                Some(repo_dir.as_path()),
-            ) {
+            match git_ff_only_pull(&repo_dir, &clone_url) {
                 Ok(()) => {
                     sync_action = RepoSyncAction::Updated;
                     shared_repo_remote_note_updated(&repo_dir);
@@ -304,13 +361,7 @@ pub fn prepare_repo(
         shared_repo_remote_note_updated(&repo_dir);
     } else if force_update && !shared_repo_remote_already_updated(&repo_dir) {
         loop {
-            if git_run(
-                "git",
-                &["pull", "--ff-only", "-q"],
-                Some(repo_dir.as_path()),
-            )
-            .is_ok()
-            {
+            if git_ff_only_pull(&repo_dir, repo_url).is_ok() {
                 sync_action = RepoSyncAction::Updated;
                 shared_repo_remote_note_updated(&repo_dir);
                 break;
@@ -380,9 +431,9 @@ pub fn prepare_repo(
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_clone_dest, find_pkg_dir_in_list, is_usable_git_repo};
+    use super::{accept_clone_dest, find_pkg_dir_in_list, git_ff_only_pull, is_usable_git_repo};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     fn dirs(names: &[&str]) -> Vec<PathBuf> {
@@ -458,5 +509,104 @@ mod tests {
         let missing = PathBuf::from("/tmp/abs_missing_clone_dest_does_not_exist");
         assert!(accept_clone_dest(&missing, true).is_ok());
         assert!(accept_clone_dest(&missing, false).is_err());
+    }
+
+    struct TempGit {
+        dir: PathBuf,
+    }
+
+    impl TempGit {
+        fn new(prefix: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "{prefix}_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+    }
+
+    impl Drop for TempGit {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} in {}", dir.display());
+    }
+
+    fn commit_pkgbuild(origin: &Path, body: &str, message: &str) {
+        fs::write(origin.join("PKGBUILD"), body).unwrap();
+        git_ok(origin, &["add", "PKGBUILD"]);
+        git_ok(origin, &["commit", "-m", message]);
+    }
+
+    fn init_origin(root: &Path) -> PathBuf {
+        let origin = root.join("origin");
+        fs::create_dir_all(&origin).unwrap();
+        git_ok(&origin, &["init", "-b", "master"]);
+        git_ok(&origin, &["config", "user.email", "t@t"]);
+        git_ok(&origin, &["config", "user.name", "t"]);
+        commit_pkgbuild(&origin, "one\n", "init");
+        origin
+    }
+
+    fn clone_repo(origin: &Path, dest: &Path) {
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn head_subject(repo: &Path) -> String {
+        let out = Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn git_ff_only_pull_works_without_upstream_tracking() {
+        let tmp = TempGit::new("abs_git_no_tracking");
+        let origin = init_origin(&tmp.dir);
+        let clone = tmp.dir.join("clone");
+        clone_repo(&origin, &clone);
+        git_ok(&clone, &["branch", "--unset-upstream"]);
+        commit_pkgbuild(&origin, "two\n", "bump");
+
+        git_ff_only_pull(&clone, origin.to_str().unwrap()).unwrap();
+        assert_eq!(head_subject(&clone), "bump");
+    }
+
+    #[test]
+    fn git_ff_only_pull_restores_missing_origin_config() {
+        let tmp = TempGit::new("abs_git_no_config");
+        let origin = init_origin(&tmp.dir);
+        let clone = tmp.dir.join("clone");
+        clone_repo(&origin, &clone);
+        fs::remove_file(clone.join(".git/config")).unwrap();
+        commit_pkgbuild(&origin, "three\n", "bump2");
+
+        git_ff_only_pull(&clone, origin.to_str().unwrap()).unwrap();
+        assert_eq!(head_subject(&clone), "bump2");
+        assert!(clone.join(".git/config").is_file());
     }
 }

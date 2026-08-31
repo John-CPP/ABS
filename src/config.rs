@@ -648,13 +648,18 @@ pub fn validate_pgo_benchmark_preset(s: &str) -> Result<(), String> {
 
 pub fn validate_pgo_compare_preset(s: &str) -> Result<(), String> {
     let t = s.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("kbench") || t.eq_ignore_ascii_case("auto") {
+    if t.is_empty()
+        || t.eq_ignore_ascii_case("kbench")
+        || t.eq_ignore_ascii_case("auto")
+        || t.eq_ignore_ascii_case("cachyos")
+        || t.eq_ignore_ascii_case("kbench+cachyos")
+    {
         return Ok(());
     }
-    Err("Allowed: kbench, auto".into())
+    Err("Allowed: kbench, auto, cachyos, kbench+cachyos".into())
 }
 
-/// Scoring workload. Always `kbench` (kernel-path metrics). `auto` is an alias.
+/// Scoring workload for no-perf comparison. `auto` is an alias for `kbench`.
 fn default_compare_preset() -> String {
     "auto".to_string()
 }
@@ -691,6 +696,11 @@ pub struct PgoConfig {
     pub preset: String,
     /// Required when running PGO: persistent profile archive (HDD path is fine).
     pub profiles_archive_dir: Option<String>,
+    /// Copy each stage's kernel packages (same filenames) to
+    /// `{save_kernels_dir}/{YYYY-MM-DD}/{debug|autofdo|final}/`.
+    /// Unset = do not copy. Stages overwrite PKGDEST, so this keeps all three.
+    #[serde(default)]
+    pub save_kernels_dir: Option<String>,
     #[serde(default = "default_auto_str")]
     pub profile_scratch_dir: String,
     #[serde(default = "default_true")]
@@ -711,21 +721,22 @@ pub struct PgoConfig {
     /// are ignored at runtime.
     #[serde(default = "default_benchmark_preset")]
     pub benchmark_preset: String,
-    /// Scoring workload for comparison runs (no perf). Always `kbench`; leftover
-    /// `cachyos` / `kbench+cachyos` values are ignored. `auto` is an alias for `kbench`.
+    /// Scoring workload for comparison runs (no perf). `kbench` (default via `auto`),
+    /// `cachyos`, or `kbench+cachyos`. Never used under `perf record`.
     #[serde(default = "default_compare_preset")]
     pub compare_preset: String,
     /// Seconds for the `kernel` training workload. `0` (default) uses the quality
     /// profile: short 600, sweet 1200, long 3600. Capped at 3600.
     #[serde(default = "default_kernel_workload_seconds")]
     pub kernel_workload_seconds: u32,
-    /// `short` (~10 min train, ~3 min compare), `sweet` (default: ~20 min train,
-    /// ~6 min compare), `long` (~60 min train, ~10 min kbench).
+    /// `short` (~10 min train, ~3 min kbench), `sweet` (default: ~20 min train,
+    /// ~6 min kbench), `long` (~60 min train, ~10 min kbench). Does not shorten
+    /// a CachyOS compare suite.
     /// Aliases: standard→sweet, maximum→long.
     #[serde(default = "default_profiling_quality")]
     pub profiling_quality: String,
-    /// On-disk working directory for kbench comparison logs (separate from ephemeral
-    /// profile scratch on tmpfs).
+    /// On-disk working directory for comparison logs and CachyOS-benchmarker assets
+    /// (separate from ephemeral profile scratch on tmpfs).
     /// When unset, uses `{profiles_archive_dir}/benchmark-workdir` or `~/.cache/abs/pgo-benchmark/PKG`.
     pub benchmark_workdir: Option<String>,
     pub build_user: Option<String>,
@@ -757,6 +768,9 @@ pub struct PgoConfig {
     /// setup as later stages).
     #[serde(default)]
     pub reboot_before_start: bool,
+    /// Power off the machine after the PGO pipeline finishes successfully (not on abort).
+    #[serde(default)]
+    pub shutdown_after_finish: bool,
     /// Skip AutoFDO collection (and the debug kernel unless a debug no-perf bench is requested)
     /// when a suitable archived AutoFDO profile exists.
     #[serde(default)]
@@ -770,8 +784,7 @@ pub struct PgoConfig {
     /// kernel you keep. `compare_final`, if enabled, scores that AutoFDO kernel.
     #[serde(default)]
     pub skip_propeller: bool,
-    /// Clean kbench runs for comparison charts
-    /// in `{profiles_archive_dir}/compare-benchmarks`.
+    /// Comparison runs (no perf) for charts in `{profiles_archive_dir}/compare-benchmarks`.
     /// `compare_current`: kernel already booted, before the debug PGO build (no perf).
     #[serde(default)]
     pub compare_current: bool,
@@ -812,6 +825,18 @@ impl PgoConfig {
         self.profiles_archive_dir
             .as_ref()
             .map(|p| expand_user_path(p))
+    }
+
+    /// Directory to keep per-stage kernel packages. Empty / unset = do not copy.
+    pub fn resolved_save_kernels_dir(&self) -> Option<PathBuf> {
+        self.save_kernels_dir.as_ref().and_then(|p| {
+            let t = p.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(expand_user_path(t))
+            }
+        })
     }
 
     /// On-disk cache for kbench comparison logs (separate from ephemeral profile scratch on tmpfs).
@@ -2294,6 +2319,27 @@ compare_preset = "kbench"
         assert!(err.contains("does not exist"), "{err}");
         assert!(err.contains("cachyos"), "{err}");
         assert!(err.contains("Allowed: kernel"), "{err}");
+
+        let ok_cachyos = ok.replace(
+            "compare_preset = \"kbench\"",
+            "compare_preset = \"cachyos\"",
+        );
+        Config::from_toml_text(&ok_cachyos).unwrap();
+        let ok_both = ok.replace(
+            "compare_preset = \"kbench\"",
+            "compare_preset = \"kbench+cachyos\"",
+        );
+        Config::from_toml_text(&ok_both).unwrap();
+
+        let bad_compare = ok.replace("compare_preset = \"kbench\"", "compare_preset = \"fast\"");
+        let err = Config::from_toml_text(&bad_compare).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("fast"), "{err}");
+        assert!(err.contains("kbench+cachyos"), "{err}");
+
+        let bad_full = ok.replace("compare_preset = \"kbench\"", "compare_preset = \"full\"");
+        let err = Config::from_toml_text(&bad_full).unwrap_err();
+        assert!(err.contains("full"), "{err}");
     }
 
     #[test]

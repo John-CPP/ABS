@@ -1,6 +1,7 @@
 //! Parse `benchie_*.log` comparison files and write charts.
 //!
-//! kbench writes this format. Old CachyOS-benchmarker metric names are ignored.
+//! kbench and CachyOS-benchmarker both write this format. ABS charts replace
+//! CachyOS `benchmark_scraper.py`.
 
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -19,6 +20,24 @@ struct Cat2 {
     higher_better: bool,
     unit: &'static str,
 }
+
+const Y_CRUNCHER_SKIP: f64 = 0.01;
+const Y_CRUNCHER: &str = "y-cruncher pi 1b";
+
+const CATEGORY_1: &[&str] = &[
+    "stress-ng cpu-cache-mem",
+    "perf sched msg fork thread",
+    "perf memcpy",
+    "calculating prime numbers",
+    "namd 92K atoms",
+    "argon2 hashing",
+    "ffmpeg compilation",
+    "xz compression",
+    "kernel defconfig",
+    "blender render",
+    "x265 encoding",
+    "y-cruncher pi 1b",
+];
 
 const CATEGORY_2: &[Cat2] = &[
     Cat2 {
@@ -139,6 +158,7 @@ struct KernelSeries {
     kernel: String,
     scx_scheduler: String,
     scx_version: String,
+    yc_skipped: bool,
     averages: BTreeMap<String, f64>,
 }
 
@@ -190,6 +210,7 @@ fn parse_logs(dir: &Path) -> Result<Vec<KernelSeries>, String> {
                     kernel: parsed.kernel.clone(),
                     scx_scheduler: parsed.scx_scheduler.clone(),
                     scx_version: parsed.scx_version.clone(),
+                    yc_skipped: false,
                     averages: BTreeMap::new(),
                 },
                 HashMap::new(),
@@ -202,6 +223,10 @@ fn parse_logs(dir: &Path) -> Result<Vec<KernelSeries>, String> {
 
     let mut out = Vec::new();
     for (_, (mut series, values)) in samples {
+        let yc = values.get(Y_CRUNCHER).cloned().unwrap_or_default();
+        series.yc_skipped = !yc.is_empty()
+            && yc.iter().all(|v| *v <= Y_CRUNCHER_SKIP)
+            && series.kernel.to_ascii_lowercase().contains("infinity");
         series.averages = values
             .into_iter()
             .map(|(k, v)| (k, v.iter().sum::<f64>() / v.len() as f64))
@@ -266,7 +291,15 @@ fn capture_token(text: &str, prefix: &str) -> Option<String> {
 }
 
 fn is_known_metric(name: &str) -> bool {
-    CATEGORY_2.iter().any(|c| c.name == name) || EXTRA_METRICS.contains(&name)
+    CATEGORY_1.contains(&name)
+        || CATEGORY_2.iter().any(|c| c.name == name)
+        || EXTRA_METRICS.contains(&name)
+}
+
+fn has_category1(series: &[KernelSeries]) -> bool {
+    series
+        .iter()
+        .any(|s| CATEGORY_1.iter().any(|n| s.averages.contains_key(*n)))
 }
 
 fn ordered_metrics(series: &[KernelSeries]) -> Vec<String> {
@@ -275,9 +308,10 @@ fn ordered_metrics(series: &[KernelSeries]) -> Vec<String> {
         .flat_map(|s| s.averages.keys().map(String::as_str))
         .collect();
     let mut out = Vec::new();
-    for name in CATEGORY_2
+    for name in CATEGORY_1
         .iter()
-        .map(|c| c.name)
+        .copied()
+        .chain(CATEGORY_2.iter().map(|c| c.name))
         .chain(EXTRA_METRICS.iter().copied())
     {
         if present.contains(name) {
@@ -362,7 +396,9 @@ fn csv_export(series: &[KernelSeries]) -> String {
         out.push_str(&csv_cell(&s.scx_version));
         for name in &metrics {
             out.push(',');
-            if let Some(v) = s.averages.get(name) {
+            if name == Y_CRUNCHER && s.yc_skipped {
+                out.push_str("skipped");
+            } else if let Some(v) = s.averages.get(name) {
                 out.push_str(&format!("{v}"));
             }
         }
@@ -385,7 +421,11 @@ fn json_export(series: &[KernelSeries]) -> Vec<JsonEntry> {
         .map(|s| {
             let mut metrics = BTreeMap::new();
             for (k, v) in &s.averages {
-                metrics.insert(k.clone(), serde_json::Value::from(*v));
+                if k == Y_CRUNCHER && s.yc_skipped {
+                    metrics.insert(k.clone(), serde_json::Value::String("skipped".into()));
+                } else {
+                    metrics.insert(k.clone(), serde_json::Value::from(*v));
+                }
             }
             JsonEntry {
                 kernel: s.kernel.clone(),
@@ -398,8 +438,18 @@ fn json_export(series: &[KernelSeries]) -> Vec<JsonEntry> {
 }
 
 fn performance_html(series: &[KernelSeries], csv: &str, json: &str) -> String {
-    let wins = wins_vs_stock_line(series);
+    let wins = best_per_test_line(series);
     let table = winners_table_html(series);
+    let cat_caption = if has_category1(series) {
+        "CachyOS + kbench. Same encoding as above, grouped by workload. Longer is better in every group (including latency)."
+    } else {
+        "kbench kernel-path metrics. Longer bar is better, including latency."
+    };
+    let yc_note = if series.iter().any(|s| s.yc_skipped) {
+        " y-cruncher pi 1b skipped on Infinity Scheduler."
+    } else {
+        ""
+    };
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -409,27 +459,29 @@ fn performance_html(series: &[KernelSeries], csv: &str, json: &str) -> String {
     <title>Test Performance</title>
     <style>
       :root {{ color-scheme: dark light; }}
-      body {{ font-family: ui-sans-serif, system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1.25rem 3rem; line-height: 1.5; }}
+      body {{ font-family: ui-sans-serif, system-ui, sans-serif; max-width: 1080px; margin: 2rem auto; padding: 0 1.25rem 3rem; line-height: 1.5; }}
       table.winners {{ width: 100%; border-collapse: collapse; margin: 0.75rem 0 0.25rem; }}
       table.winners th, table.winners td {{ text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #3a4550; }}
       table.winners th {{ font-size: 0.85rem; color: #8b98a5; }}
       .winner-note {{ color: #8b98a5; font-size: 0.9rem; }}
+      .callout {{ border: 1px solid #8a6d3b; background: rgba(138, 109, 59, 0.12); border-radius: 8px; padding: 0.8rem 1rem; margin: 1rem 0; }}
+      .callout strong {{ display: block; margin-bottom: 0.25rem; }}
     </style>
 </head>
 <body>
     <h1>Test Performance</h1>
 
-    <h2>Winner vs stock</h2>
+    <h2>Ranking vs stock</h2>
     {table}
 
     <h2>Performance Comparison Between Different Kernel Versions</h2>
-    <p>{wins}. Bar length is performance relative to stock (1_current);
-       longer is better. Captions are the raw score and % vs stock.</p>
+    <p>{wins}. Longer bar is better. Captions are the raw measurement plus faster/slower
+       (or lower/higher latency) vs stock. Last group is geomean vs stock.</p>
     <img src="kernel_version_comparison_All.svg" alt="Kernel Version Comparison - All Kernels"
          style="max-width: 100%; height: auto;">
 
     <h2>Categorized Results</h2>
-    <p>kbench kernel-path metrics (↓ lower is better, ↑ higher is better).</p>
+    <p>{cat_caption}{yc_note}</p>
     <img src="categorized_comparison_All.svg" alt="Categorized Comparison - All Kernels"
          style="max-width: 100%; height: auto;">
 
@@ -473,63 +525,182 @@ fn svg_rect(x: f64, y: f64, w: f64, h: f64, fill: &str, extra: &str) -> String {
     format!(r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="{fill}"{extra}/>"#)
 }
 
-fn categorized_svg(series: &[KernelSeries]) -> String {
-    let row_h = 22.0;
-    let label_w = 220.0;
-    let chart_w = 640.0;
-    let pad = 16.0;
-    let mut y = 40.0;
-    let mut body = String::new();
+fn paint_compare_bars(
+    body: &mut String,
+    series: &[KernelSeries],
+    name: &str,
+    base_y: f64,
+    pad: f64,
+    label_w: f64,
+    chart_w: f64,
+    bar_h: f64,
+    group_h: f64,
+) {
+    let bars = compare_bars(series, name);
     body.push_str(&svg_text(
         pad,
-        24.0,
-        16,
-        true,
+        base_y + group_h / 2.0,
+        11,
+        false,
         "",
-        "kbench — Kernel path metrics",
+        &metric_axis_label(name),
     ));
-    for s in series.iter().rev() {
-        let cat2: Vec<(&Cat2, f64)> = CATEGORY_2
-            .iter()
-            .filter_map(|c| s.averages.get(c.name).map(|v| (c, *v)))
-            .collect();
-        y += 28.0;
-        let _ = write!(
-            body,
-            "{}",
-            svg_text(pad, y, 13, true, "", &format!("{} — Kernel path", s.label))
-        );
-        y += 8.0;
-        let max2 = cat2
-            .iter()
-            .map(|(_, v)| *v)
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        for (c, val) in cat2.iter().rev() {
-            y += row_h;
-            let w = (*val / max2) * chart_w;
-            let fill = if c.higher_better {
-                "#59a14f"
+    for (ki, bar) in bars.iter().enumerate() {
+        let by = base_y + ki as f64 * bar_h;
+        let w = bar.bar_frac * chart_w;
+        let color = PALETTE[ki % PALETTE.len()];
+        if bar.skipped {
+            body.push_str(&svg_rect(
+                pad + label_w,
+                by,
+                w.max(4.0),
+                bar_h - 2.0,
+                "url(#hatch)",
+                r##" stroke="#999""##,
+            ));
+            body.push_str(&svg_text(
+                pad + label_w + 4.0,
+                by + bar_h - 4.0,
+                10,
+                false,
+                "#cc3333",
+                "SKIPPED*",
+            ));
+        } else {
+            let extra = if bar.is_best {
+                r##" stroke="#222" stroke-width="1.2""##
             } else {
-                "#e15759"
+                ""
             };
-            let dir = if c.higher_better { "↑" } else { "↓" };
-            body.push_str(&svg_text(pad, y, 11, false, "", c.name));
-            body.push_str(&svg_rect(pad + label_w, y - 14.0, w, 16.0, fill, ""));
+            body.push_str(&svg_rect(
+                pad + label_w,
+                by,
+                w.max(0.0),
+                bar_h - 2.0,
+                color,
+                extra,
+            ));
             body.push_str(&svg_text(
                 pad + label_w + w + 6.0,
-                y,
-                11,
-                false,
+                by + bar_h - 4.0,
+                10,
+                bar.is_best,
                 "",
-                &format!("{val:.2} {} {dir}", c.unit),
+                &bar.caption,
             ));
         }
-        y += 16.0;
     }
-    let height = y + pad;
-    let width = pad + label_w + chart_w + 120.0;
-    format!("{}{body}</svg>", svg_open(width, height))
+}
+
+fn categorized_svg(series: &[KernelSeries]) -> String {
+    let metrics = ordered_metrics(series);
+    let n_k = series.len().max(1);
+    let bar_h = 16.0;
+    let group_h = bar_h * n_k as f64 + 14.0;
+    let label_w = 220.0;
+    let chart_w = 520.0;
+    let pad = 16.0;
+    let sections: [(&str, Vec<String>); 3] = [
+        (
+            "Throughput & compile — raw is seconds; longer bar = faster",
+            metrics
+                .iter()
+                .filter(|m| CATEGORY_1.contains(&m.as_str()))
+                .cloned()
+                .collect(),
+        ),
+        (
+            "Scheduler & kernel path — longer bar = better (lower latency / higher rate)",
+            metrics
+                .iter()
+                .filter(|m| CATEGORY_2.iter().any(|c| c.name == m.as_str()))
+                .cloned()
+                .collect(),
+        ),
+        (
+            "Suite totals — Total score is golf (lower pts is better)",
+            metrics
+                .iter()
+                .filter(|m| EXTRA_METRICS.contains(&m.as_str()))
+                .cloned()
+                .collect(),
+        ),
+    ];
+    let mut height = 72.0;
+    for (_, names) in &sections {
+        if names.is_empty() {
+            continue;
+        }
+        height += 32.0 + names.len() as f64 * group_h + 8.0;
+    }
+    if series.iter().any(|s| s.yc_skipped) {
+        height += 20.0;
+    }
+    height += 48.0;
+    let width = pad + label_w + chart_w + 280.0;
+    let title = if has_category1(series) {
+        "CachyOS + kbench — Categorized results"
+    } else {
+        "kbench — Kernel path metrics"
+    };
+    let mut body = String::new();
+    body.push_str(&svg_text(pad, 22.0, 15, true, "", title));
+    body.push_str(&svg_text(
+        pad,
+        40.0,
+        11,
+        false,
+        "#666666",
+        "Same encoding as the kernel chart. Long bar + small µs = lower latency (the win).",
+    ));
+    body.push_str(&svg_text(
+        pad,
+        56.0,
+        11,
+        false,
+        "#666666",
+        "Latency captions are lower/higher µs vs stock. Total score is golf (lower pts is better).",
+    ));
+    let mut y = 72.0;
+    for (heading, names) in &sections {
+        if names.is_empty() {
+            continue;
+        }
+        y += 22.0;
+        body.push_str(&svg_text(pad, y, 13, true, "", heading));
+        y += 10.0;
+        for name in names {
+            paint_compare_bars(
+                &mut body, series, name, y, pad, label_w, chart_w, bar_h, group_h,
+            );
+            y += group_h;
+        }
+        y += 8.0;
+    }
+    if series.iter().any(|s| s.yc_skipped) {
+        y += 16.0;
+        body.push_str(&svg_text(
+            pad,
+            y,
+            10,
+            false,
+            "#666666",
+            "* y-cruncher pi 1b skipped on Infinity Scheduler",
+        ));
+    }
+    for (ki, s) in series.iter().enumerate() {
+        let x = pad + ki as f64 * 180.0;
+        body.push_str(&svg_rect(
+            x,
+            y + 16.0,
+            12.0,
+            12.0,
+            PALETTE[ki % PALETTE.len()],
+            "",
+        ));
+        body.push_str(&svg_text(x + 16.0, y + 27.0, 11, false, "", &s.label));
+    }
+    format!("{}{body}</svg>", svg_open(width, height.max(y + 48.0)))
 }
 
 fn is_stock_kernel(s: &KernelSeries) -> bool {
@@ -537,13 +708,93 @@ fn is_stock_kernel(s: &KernelSeries) -> bool {
 }
 
 fn metric_higher_better(name: &str) -> bool {
-    if name == "Total time (s)" {
+    if name == "Total time (s)" || name == "Total score" {
         return false;
     }
     if let Some(c) = CATEGORY_2.iter().find(|c| c.name == name) {
         return c.higher_better;
     }
-    name == "Total score"
+    false
+}
+
+fn metric_unit(name: &str) -> &'static str {
+    if let Some(c) = CATEGORY_2.iter().find(|c| c.name == name) {
+        return c.unit;
+    }
+    if name == "Total score" { "pts" } else { "s" }
+}
+
+fn metric_is_latency(name: &str) -> bool {
+    metric_unit(name) == "us" || name.contains("latency")
+}
+
+fn format_raw(metric: &str, val: f64) -> String {
+    match metric_unit(metric) {
+        "us" => format!("{val:.0} µs"),
+        "rps" => format!("{val:.0} rps"),
+        "pts" => format!("{val:.2} pts"),
+        "s" => {
+            if val >= 100.0 {
+                format!("{val:.0} s")
+            } else if val >= 10.0 {
+                format!("{val:.2} s")
+            } else {
+                format!("{val:.3} s")
+            }
+        }
+        unit => format!("{val:.2} {unit}"),
+    }
+}
+
+fn metric_axis_label(name: &str) -> String {
+    let dir = if metric_higher_better(name) {
+        "↑"
+    } else {
+        "↓"
+    };
+    format!("{name}  {dir}")
+}
+
+fn stock_value(series: &[KernelSeries], metric: &str) -> Option<f64> {
+    series
+        .iter()
+        .find(|s| is_stock_kernel(s))
+        .and_then(|s| s.averages.get(metric).copied())
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Phrase vs stock for captions/tables. Latency uses the raw µs change.
+fn vs_stock_phrase(metric: &str, value: f64, stock: f64) -> Option<String> {
+    if !(stock > 0.0 && value.is_finite()) {
+        return None;
+    }
+    if metric_is_latency(metric) {
+        let pct = (value / stock - 1.0) * 100.0;
+        if pct.abs() < 0.5 {
+            return Some("same latency".into());
+        }
+        if pct < 0.0 {
+            return Some(format!("{:.0}% lower latency", -pct));
+        }
+        return Some(format!("{:.0}% higher latency", pct));
+    }
+    let rel = relative_performance(value, stock, metric_higher_better(metric))?;
+    let d = rel - 100.0;
+    if d.abs() < 0.05 {
+        return Some("even".into());
+    }
+    let (pos, neg) = if metric == "Total score" {
+        ("better", "worse")
+    } else if metric_higher_better(metric) {
+        ("higher", "lower")
+    } else {
+        ("faster", "slower")
+    };
+    if d > 0.0 {
+        Some(format!("{:.1}% {pos}", d))
+    } else {
+        Some(format!("{:.1}% {neg}", -d))
+    }
 }
 
 /// Performance vs baseline as a percent (100 = equal). Higher is always better.
@@ -565,21 +816,69 @@ struct CompareBar {
     bar_frac: f64,
     skipped: bool,
     is_best: bool,
+    rel: Option<f64>,
+}
+
+fn format_delta(rel: f64) -> String {
+    let d = rel - 100.0;
+    if d.abs() < 0.05 {
+        "0%".into()
+    } else {
+        format!("{:+.1}%", d)
+    }
+}
+
+fn ordinal(n: usize) -> String {
+    match n {
+        1 => "1st".into(),
+        2 => "2nd".into(),
+        3 => "3rd".into(),
+        n if (11..=13).contains(&(n % 100)) => format!("{n}th"),
+        n if n % 10 == 1 => format!("{n}st"),
+        n if n % 10 == 2 => format!("{n}nd"),
+        n if n % 10 == 3 => format!("{n}rd"),
+        n => format!("{n}th"),
+    }
+}
+
+fn metric_worst_baseline(series: &[KernelSeries], metric: &str) -> Option<f64> {
+    let higher = metric_higher_better(metric);
+    let mut worst: Option<f64> = None;
+    for s in series {
+        if metric == Y_CRUNCHER && s.yc_skipped {
+            continue;
+        }
+        let val = s.averages.get(metric).copied().unwrap_or(0.0);
+        if !val.is_finite() || val <= 0.0 {
+            continue;
+        }
+        worst = Some(match worst {
+            None => val,
+            Some(w) => {
+                if higher {
+                    w.min(val)
+                } else {
+                    w.max(val)
+                }
+            }
+        });
+    }
+    worst
 }
 
 fn compare_bars(series: &[KernelSeries], metric: &str) -> Vec<CompareBar> {
     let higher = metric_higher_better(metric);
-    let baseline = series
-        .iter()
-        .find(|s| is_stock_kernel(s))
-        .and_then(|s| s.averages.get(metric).copied())
-        .filter(|v| *v > 0.0 && v.is_finite());
+    let stock = stock_value(series, metric);
+    let baseline = stock.or_else(|| metric_worst_baseline(series, metric));
 
     let scores: Vec<Option<f64>> = series
         .iter()
         .map(|s| {
+            let skipped = metric == Y_CRUNCHER && s.yc_skipped;
             let val = s.averages.get(metric).copied().unwrap_or(0.0);
-            if let Some(b) = baseline {
+            if skipped {
+                None
+            } else if let Some(b) = baseline {
                 relative_performance(val, b, higher)
             } else if higher && val.is_finite() && val > 0.0 {
                 Some(val)
@@ -602,30 +901,44 @@ fn compare_bars(series: &[KernelSeries], metric: &str) -> Vec<CompareBar> {
         .flatten()
         .copied()
         .fold(f64::NEG_INFINITY, f64::max);
+    let worst_score = scores
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
 
     series
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let skipped = false;
+            let skipped = metric == Y_CRUNCHER && s.yc_skipped;
             let val = s.averages.get(metric).copied().unwrap_or(0.0);
-            let is_baseline = is_stock_kernel(s);
             let score = scores[i];
             let is_best =
                 !skipped && score.is_some_and(|sc| (sc - best).abs() <= best.abs() * 1e-9 + 1e-6);
+            let is_worst = !skipped
+                && score
+                    .is_some_and(|sc| (sc - worst_score).abs() <= worst_score.abs() * 1e-9 + 1e-6);
             let bar_frac = score
                 .map(|sc| (sc / max_score).clamp(0.0, 1.0))
                 .unwrap_or(0.0);
             let caption = if skipped {
                 "SKIPPED*".into()
             } else {
-                let mut c = format!("{val:.2}");
-                if is_baseline {
+                let mut c = format_raw(metric, val);
+                if is_stock_kernel(s) {
                     c.push_str("  stock");
-                } else if baseline.is_some()
-                    && let Some(rel) = score
-                {
-                    c.push_str(&format!("  {:+.1}%", rel - 100.0));
+                } else if let Some(st) = stock {
+                    if let Some(phrase) = vs_stock_phrase(metric, val, st) {
+                        c.push(' ');
+                        c.push(' ');
+                        c.push_str(&phrase);
+                    }
+                } else if let Some(rel) = score {
+                    c.push_str(&format!("  {}", format_delta(rel)));
+                }
+                if is_worst {
+                    c.push_str("  worst");
                 }
                 if is_best {
                     c.push_str("  best");
@@ -637,12 +950,13 @@ fn compare_bars(series: &[KernelSeries], metric: &str) -> Vec<CompareBar> {
                 bar_frac,
                 skipped,
                 is_best,
+                rel: score,
             }
         })
         .collect()
 }
 
-fn wins_vs_stock_line(series: &[KernelSeries]) -> String {
+fn best_per_test_line(series: &[KernelSeries]) -> String {
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
     for metric in ordered_metrics(series) {
         for (s, bar) in series.iter().zip(compare_bars(series, &metric)) {
@@ -655,7 +969,99 @@ fn wins_vs_stock_line(series: &[KernelSeries]) -> String {
         .iter()
         .map(|s| format!("{} {}", s.label, counts.get(&s.label).copied().unwrap_or(0)))
         .collect();
-    format!("Wins vs stock: {}", parts.join(" · "))
+    format!("Best per test: {}", parts.join(" · "))
+}
+
+fn kernel_geomean_vs_stock(series: &[KernelSeries]) -> Vec<Option<f64>> {
+    let metrics = ordered_metrics(series);
+    let stock = series.iter().find(|s| is_stock_kernel(s));
+    series
+        .iter()
+        .map(|s| {
+            if is_stock_kernel(s) {
+                return Some(100.0);
+            }
+            let stock = stock?;
+            let mut logs = Vec::new();
+            for m in &metrics {
+                if m == Y_CRUNCHER && (s.yc_skipped || stock.yc_skipped) {
+                    continue;
+                }
+                let Some(bv) = stock
+                    .averages
+                    .get(m)
+                    .copied()
+                    .filter(|v| *v > 0.0 && v.is_finite())
+                else {
+                    continue;
+                };
+                let Some(v) = s
+                    .averages
+                    .get(m)
+                    .copied()
+                    .filter(|v| *v > 0.0 && v.is_finite())
+                else {
+                    continue;
+                };
+                if let Some(rel) = relative_performance(v, bv, metric_higher_better(m))
+                    && rel > 0.0
+                {
+                    logs.push(rel.ln());
+                }
+            }
+            if logs.is_empty() {
+                None
+            } else {
+                Some((logs.iter().sum::<f64>() / logs.len() as f64).exp())
+            }
+        })
+        .collect()
+}
+
+fn geomean_compare_bars(series: &[KernelSeries]) -> Vec<CompareBar> {
+    let geos = kernel_geomean_vs_stock(series);
+    let max_score = geos
+        .iter()
+        .flatten()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1e-9);
+    let best = geos
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    series
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let rel = geos[i];
+            let skipped = rel.is_none();
+            let is_best = rel.is_some_and(|sc| (sc - best).abs() <= best.abs() * 1e-9 + 1e-6);
+            let bar_frac = rel
+                .map(|sc| (sc / max_score).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            let caption = if skipped {
+                "—".into()
+            } else {
+                let mut c = format_delta(rel.unwrap());
+                if is_stock_kernel(s) {
+                    c.push_str("  stock");
+                }
+                if is_best {
+                    c.push_str("  best");
+                }
+                c
+            };
+            CompareBar {
+                caption,
+                bar_frac,
+                skipped,
+                is_best,
+                rel,
+            }
+        })
+        .collect()
 }
 
 fn winner_short_name(s: &KernelSeries) -> String {
@@ -681,65 +1087,160 @@ fn winner_short_name(s: &KernelSeries) -> String {
     }
 }
 
-fn vs_stock_cell(series: &[KernelSeries], metric: &str, winners: &[&KernelSeries]) -> String {
-    if winners.iter().any(|s| is_stock_kernel(s)) {
-        return "0%".into();
+fn podium_cell(metric: &str, s: &KernelSeries, stock: Option<f64>) -> String {
+    let val = s.averages.get(metric).copied().unwrap_or(0.0);
+    let raw = format_raw(metric, val);
+    let name = winner_short_name(s);
+    if is_stock_kernel(s) {
+        format!("{name} {raw}")
+    } else if let Some(st) = stock {
+        match vs_stock_phrase(metric, val, st) {
+            Some(p) => format!("{name} {raw} ({p})"),
+            None => format!("{name} {raw}"),
+        }
+    } else {
+        format!("{name} {raw}")
     }
-    let Some(baseline) = series
+}
+
+fn latency_explainer_html(series: &[KernelSeries]) -> String {
+    const COLS: &[(&str, &str)] = &[
+        ("cyclictest max latency (us)", "cyclictest max ↓µs"),
+        ("schbench p99 latency (us)", "schbench p99 ↓µs"),
+        ("schbench avg rps", "schbench avg ↑rps"),
+    ];
+    let has_latency = COLS
         .iter()
-        .find(|s| is_stock_kernel(s))
-        .and_then(|s| s.averages.get(metric).copied())
-    else {
-        return "—".into();
-    };
-    let Some(val) = winners
-        .first()
-        .and_then(|s| s.averages.get(metric).copied())
-    else {
-        return "—".into();
-    };
-    relative_performance(val, baseline, metric_higher_better(metric))
-        .map(|rel| format!("{:+.1}%", rel - 100.0))
-        .unwrap_or_else(|| "—".into())
+        .any(|(n, _)| n.contains("latency") && series.iter().any(|s| s.averages.contains_key(*n)));
+    if !has_latency {
+        return String::new();
+    }
+    let mut head = String::from("<tr><th>Kernel</th>");
+    let mut used: Vec<&str> = Vec::new();
+    for (name, label) in COLS {
+        if series.iter().any(|s| s.averages.contains_key(*name)) {
+            let _ = write!(head, "<th>{}</th>", xml_escape(label));
+            used.push(*name);
+        }
+    }
+    head.push_str("</tr>");
+    let mut body = String::new();
+    for s in series {
+        let _ = write!(body, "<tr><td>{}</td>", xml_escape(&winner_short_name(s)));
+        for name in &used {
+            let bars = compare_bars(series, name);
+            let is_best = series
+                .iter()
+                .zip(&bars)
+                .find(|(k, _)| k.label == s.label)
+                .is_some_and(|(_, b)| b.is_best);
+            let val = s.averages.get(*name).copied().unwrap_or(0.0);
+            let mut cell = format_raw(name, val);
+            if is_best {
+                cell.push_str(" *");
+            }
+            let _ = write!(body, "<td>{}</td>", xml_escape(&cell));
+        }
+        body.push_str("</tr>");
+    }
+    format!(
+        r#"<h3>How to read latency</h3>
+  <div class="callout">
+    <strong>Lower microseconds win. A long bar next to a small µs number is the good result.</strong>
+    Captions say “lower latency” / “higher latency” vs stock, not an inverted percent.
+  </div>
+  <table class="winners">
+    <thead>{head}</thead>
+    <tbody>{body}</tbody>
+  </table>
+  <p class="winner-note">* best (lowest µs / highest rps). Single-run max latency is noisy.</p>
+"#
+    )
 }
 
 fn winners_table_html(series: &[KernelSeries]) -> String {
     let mut rows = String::new();
     for metric in ordered_metrics(series) {
         let bars = compare_bars(series, &metric);
-        let winners: Vec<&KernelSeries> = series
-            .iter()
-            .zip(&bars)
-            .filter(|(_, bar)| bar.is_best && !bar.skipped)
-            .map(|(s, _)| s)
-            .collect();
-        if winners.is_empty() {
+        if bars.iter().all(|b| b.skipped) {
             continue;
         }
-        let names = winners
+        let stock = stock_value(series, &metric);
+        let mut ranked: Vec<(&KernelSeries, f64)> = series
             .iter()
-            .map(|s| winner_short_name(s))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let vs = vs_stock_cell(series, &metric, &winners);
+            .zip(&bars)
+            .filter(|(_, bar)| !bar.skipped)
+            .filter_map(|(s, bar)| bar.rel.map(|rel| (s, rel)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let cell = |i: usize| -> String {
+            ranked
+                .get(i)
+                .map(|(s, _)| xml_escape(&podium_cell(&metric, s, stock)))
+                .unwrap_or_else(|| "—".into())
+        };
         let _ = writeln!(
             rows,
-            "      <tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-            xml_escape(&metric),
-            xml_escape(&names),
-            xml_escape(&vs)
+            "      <tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            xml_escape(&metric_axis_label(&metric)),
+            cell(0),
+            cell(1),
+            cell(2),
         );
     }
     format!(
-        r#"<table class="winners">
+        r#"{latency}<table class="winners">
     <thead>
-      <tr><th>Test</th><th>Winner</th><th>vs stock</th></tr>
+      <tr><th>Test</th><th>1st</th><th>2nd</th><th>3rd</th></tr>
     </thead>
     <tbody>
 {rows}    </tbody>
   </table>
-  <p class="winner-note">vs stock is how much better the winner is than <code>1_current</code>.
-     Positive is faster / higher throughput. Stock winning a test is 0%.</p>"#
+  <p class="winner-note">The number with a unit is the raw measurement. Phrases in parentheses
+     are vs stock. For latency that is lower/higher microseconds, not an inverted “faster”
+     percent. 4th place is omitted. ↓ in the test name means a smaller raw value is better.</p>
+{geo}"#,
+        latency = latency_explainer_html(series),
+        geo = geomean_table_html(series)
+    )
+}
+
+fn geomean_table_html(series: &[KernelSeries]) -> String {
+    let geos = kernel_geomean_vs_stock(series);
+    let mut ranked: Vec<(usize, &KernelSeries, f64)> = series
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| geos[i].map(|g| (i, s, g)))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    if ranked.is_empty() {
+        return String::new();
+    }
+    let mut rows = String::new();
+    for (place, (_i, s, geo)) in ranked.iter().enumerate() {
+        let _ = writeln!(
+            rows,
+            "      <tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            xml_escape(&ordinal(place + 1)),
+            xml_escape(&winner_short_name(s)),
+            xml_escape(&format_delta(*geo)),
+        );
+    }
+    format!(
+        r#"  <h3>Geomean vs stock</h3>
+  <table class="winners">
+    <thead>
+      <tr><th>Place</th><th>Kernel</th><th>vs stock</th></tr>
+    </thead>
+    <tbody>
+{rows}    </tbody>
+  </table>
+  <p class="winner-note">Geometric mean of per-test performance vs <code>1_current</code>.
+     All kernels are listed (including stock at 0%). Total score is golf (lower pts = better).</p>"#
     )
 }
 
@@ -758,7 +1259,6 @@ fn kernel_comparison_svg(series: &[KernelSeries]) -> String {
     let label_w = 220.0;
     let chart_w = 520.0;
     let pad = 16.0;
-    let y = 72.0;
     let mut body = String::new();
     body.push_str(&svg_text(
         pad,
@@ -774,67 +1274,72 @@ fn kernel_comparison_svg(series: &[KernelSeries]) -> String {
         11,
         false,
         "#666666",
-        "Bar length is performance vs stock (1_current). Captions: raw score and % vs stock.",
+        "↓ tests: smaller raw number is better. Last group: geomean vs stock.",
     ));
     body.push_str(&svg_text(
         pad,
-        60.0,
+        58.0,
+        11,
+        false,
+        "#666666",
+        "First number is raw. Latency says lower/higher µs vs stock. Longest bar = best — not the largest µs.",
+    ));
+    body.push_str(&svg_text(
+        pad,
+        72.0,
         11,
         false,
         "",
-        &wins_vs_stock_line(series),
+        &best_per_test_line(series),
     ));
+    let y = 86.0;
     for (mi, name) in metrics.iter().enumerate() {
-        let bars = compare_bars(series, name);
         let base_y = y + mi as f64 * group_h;
-        body.push_str(&svg_text(pad, base_y + group_h / 2.0, 11, false, "", name));
-        for (ki, bar) in bars.iter().enumerate() {
+        paint_compare_bars(
+            &mut body, series, name, base_y, pad, label_w, chart_w, bar_h, group_h,
+        );
+    }
+    let geo_bars = geomean_compare_bars(series);
+    let has_geomean = geo_bars.iter().any(|b| b.rel.is_some());
+    let extra_groups = if has_geomean { 1.0 } else { 0.0 };
+    if has_geomean {
+        let base_y = y + metrics.len() as f64 * group_h;
+        body.push_str(&svg_text(
+            pad,
+            base_y + group_h / 2.0,
+            11,
+            true,
+            "",
+            "Geomean vs stock",
+        ));
+        for (ki, bar) in geo_bars.iter().enumerate() {
             let by = base_y + ki as f64 * bar_h;
             let w = bar.bar_frac * chart_w;
             let color = PALETTE[ki % PALETTE.len()];
-            if bar.skipped {
-                body.push_str(&svg_rect(
-                    pad + label_w,
-                    by,
-                    w.max(4.0),
-                    bar_h - 2.0,
-                    "url(#hatch)",
-                    r##" stroke="#999""##,
-                ));
-                body.push_str(&svg_text(
-                    pad + label_w + 4.0,
-                    by + bar_h - 4.0,
-                    10,
-                    false,
-                    "#cc3333",
-                    "SKIPPED*",
-                ));
+            let extra = if bar.is_best {
+                r##" stroke="#222" stroke-width="1.2""##
             } else {
-                let extra = if bar.is_best {
-                    r##" stroke="#222" stroke-width="1.2""##
-                } else {
-                    ""
-                };
-                body.push_str(&svg_rect(
-                    pad + label_w,
-                    by,
-                    w.max(0.0),
-                    bar_h - 2.0,
-                    color,
-                    extra,
-                ));
-                body.push_str(&svg_text(
-                    pad + label_w + w + 6.0,
-                    by + bar_h - 4.0,
-                    10,
-                    bar.is_best,
-                    "",
-                    &bar.caption,
-                ));
-            }
+                ""
+            };
+            body.push_str(&svg_rect(
+                pad + label_w,
+                by,
+                w.max(0.0),
+                bar_h - 2.0,
+                color,
+                extra,
+            ));
+            body.push_str(&svg_text(
+                pad + label_w + w + 6.0,
+                by + bar_h - 4.0,
+                10,
+                bar.is_best,
+                "",
+                &bar.caption,
+            ));
         }
     }
-    let legend_y = y + metrics.len() as f64 * group_h + 24.0;
+    let legend_y = y + (metrics.len() as f64 + extra_groups) * group_h + 24.0;
     for (ki, s) in series.iter().enumerate() {
         let x = pad + ki as f64 * 180.0;
         let color = PALETTE[ki % PALETTE.len()];
@@ -849,7 +1354,7 @@ fn kernel_comparison_svg(series: &[KernelSeries]) -> String {
         ));
     }
     let height = legend_y + 36.0;
-    let width = pad + label_w + chart_w + 200.0;
+    let width = pad + label_w + chart_w + 280.0;
     format!("{}{body}</svg>", svg_open(width, height))
 }
 
@@ -1009,7 +1514,7 @@ schbench avg rps: 1
     }
 
     #[test]
-    fn old_cachyos_metrics_are_ignored() {
+    fn cachyos_metrics_are_charted() {
         let dir = unique_dir();
         fs::write(
             dir.join("benchie_abs-current_a.log"),
@@ -1024,9 +1529,74 @@ schbench avg rps: 800
         )
         .unwrap();
         let series = parse_logs(&dir).unwrap();
-        assert!(!series[0].averages.contains_key("blender render"));
-        assert!(!series[0].averages.contains_key("y-cruncher pi 1b"));
+        assert_eq!(series[0].averages["blender render"], 10.0);
+        assert_eq!(series[0].averages["y-cruncher pi 1b"], 12.5);
         assert_eq!(series[0].averages["schbench avg rps"], 800.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn combined_cachyos_and_kbench_log_charts_both() {
+        let dir = unique_dir();
+        fs::write(
+            dir.join("benchie_abs-current.log"),
+            "\
+Kernel: 1_current
+SCX Scheduler: none
+SCX Version: none
+blender render: 10.0
+hackbench pipes (s): 1.50
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_abs-final.log"),
+            "\
+Kernel: 4_final
+SCX Scheduler: none
+SCX Version: none
+blender render: 9.0
+hackbench pipes (s): 1.20
+",
+        )
+        .unwrap();
+        assert!(scrape_benchie_dir(&dir).unwrap());
+        let svg = fs::read_to_string(dir.join("categorized_comparison_All.svg")).unwrap();
+        assert!(svg.contains("blender render"), "{svg}");
+        assert!(svg.contains("hackbench pipes (s)"), "{svg}");
+        assert!(svg.contains("CachyOS + kbench"), "{svg}");
+        let html = fs::read_to_string(dir.join("test_performance.html")).unwrap();
+        assert!(html.contains("CachyOS + kbench"), "{html}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn y_cruncher_skip_hatches_on_infinity() {
+        let dir = unique_dir();
+        fs::write(
+            dir.join("benchie_abs-current.log"),
+            "\
+Kernel: 1_current
+SCX Scheduler: none
+SCX Version: none
+y-cruncher pi 1b: 12.5
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_infinity.log"),
+            "\
+Kernel: 4_final_infinity
+SCX Scheduler: none
+SCX Version: none
+y-cruncher pi 1b: 0.01
+",
+        )
+        .unwrap();
+        assert!(scrape_benchie_dir(&dir).unwrap());
+        let svg = fs::read_to_string(dir.join("categorized_comparison_All.svg")).unwrap();
+        assert!(svg.contains("SKIPPED*"), "{svg}");
+        assert!(svg.contains("url(#hatch)"), "{svg}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1101,9 +1671,9 @@ Total score: 1.1
     }
 
     /// Pipe throughput is ~1000× syscall rate. A global max makes syscall bars vanish
-    /// (~0.4px). Each test must scale on its own, and captions must say % vs stock.
+    /// (~0.4px). Each test scales on its own. Captions are vs stock; geomean is vs stock.
     #[test]
-    fn kernel_comparison_scales_per_metric_and_shows_delta_vs_stock() {
+    fn kernel_comparison_scales_per_metric_and_ranks_vs_worst() {
         let dir = unique_dir();
         fs::write(
             dir.join("benchie_abs-current.log"),
@@ -1145,65 +1715,293 @@ hackbench pipes (s): 1.20
             "stock syscall must stay visible, got {syscall_w:?}"
         );
 
-        assert!(svg.contains("stock"), "baseline caption missing:\n{svg}");
+        assert!(svg.contains("stock"), "stock caption missing:\n{svg}");
+        assert!(svg.contains("worst"), "worst caption missing:\n{svg}");
         assert!(
-            svg.contains("+10.0%"),
-            "syscall 33 vs 30 is +10% vs stock:\n{svg}"
+            svg.contains("10.0% higher"),
+            "syscall 33 vs stock 30 is 10% higher:\n{svg}"
         );
         assert!(
-            svg.contains("-10.0%"),
-            "pipe 36000 vs 40000 is −10% vs stock:\n{svg}"
+            svg.contains("10.0% lower"),
+            "pipe 36000 vs stock 40000 is 10% lower:\n{svg}"
         );
         assert!(
-            svg.contains("+25.0%"),
-            "hackbench 1.20 vs 1.50 is +25% (lower-is-better):\n{svg}"
+            svg.contains("25.0% faster"),
+            "hackbench 1.20 vs stock 1.50 is 25% faster:\n{svg}"
         );
         assert!(svg.contains("best"), "winner mark missing:\n{svg}");
+        assert!(
+            svg.contains("Geomean vs stock"),
+            "geomean group missing:\n{svg}"
+        );
+        assert!(
+            svg.contains("+7.4%"),
+            "geomean of 110%, 90%, 125% vs stock is +7.4%:\n{svg}"
+        );
 
         let html = fs::read_to_string(dir.join("test_performance.html")).unwrap();
         assert!(
-            html.contains("Wins vs stock"),
+            html.contains("Best per test"),
             "per-test page should summarise winners:\n{html}"
         );
         assert!(
             html.contains("<th>Test</th>"),
-            "winner table needs a Test column:\n{html}"
+            "ranking table needs a Test column:\n{html}"
         );
         assert!(
-            html.contains("<th>Winner</th>"),
-            "winner table needs a Winner column:\n{html}"
+            html.contains("<th>1st</th>"),
+            "ranking table needs a 1st column:\n{html}"
         );
         assert!(
-            html.contains("<th>vs stock</th>"),
-            "winner table needs a vs stock column:\n{html}"
+            html.contains("<th>2nd</th>"),
+            "ranking table needs a 2nd column:\n{html}"
         );
         assert!(
-            html.contains("<td>syscall getppid (Mops/s)</td>"),
+            html.contains("<th>3rd</th>"),
+            "ranking table needs a 3rd column:\n{html}"
+        );
+        assert!(
+            html.contains("<td>syscall getppid (Mops/s)  ↑</td>"),
             "table must name the test:\n{html}"
         );
         assert!(
-            html.contains("<td>Propeller</td>"),
-            "4_final is the Propeller kernel:\n{html}"
+            html.contains("Propeller 33.00 Mops/s (10.0% higher)"),
+            "syscall 1st is Propeller vs stock:\n{html}"
         );
         assert!(
-            html.contains("<td>+10.0%</td>"),
-            "syscall winner is +10% vs stock:\n{html}"
-        );
-        assert!(
-            html.contains("<td>hackbench pipes (s)</td>"),
+            html.contains("hackbench pipes (s)"),
             "hackbench row missing:\n{html}"
         );
         assert!(
-            html.contains("<td>+25.0%</td>"),
-            "hackbench winner is +25% vs stock:\n{html}"
+            html.contains("Propeller 1.200 s (25.0% faster)"),
+            "hackbench 1st is Propeller vs stock:\n{html}"
         );
         assert!(
-            html.contains("<td>stock</td>"),
-            "pipe winner is stock:\n{html}"
+            html.contains("stock 40000.00 Kops/s"),
+            "pipe 1st is stock:\n{html}"
         );
         assert!(
-            html.contains("<td>0%</td>"),
-            "stock winning a test is 0% vs stock:\n{html}"
+            html.contains("<h3>Geomean vs stock</h3>"),
+            "geomean table missing:\n{html}"
+        );
+        assert!(
+            html.contains("<td>1st</td>"),
+            "geomean must rank 1st:\n{html}"
+        );
+        assert!(
+            html.contains("<td>2nd</td>"),
+            "geomean must rank 2nd:\n{html}"
+        );
+        assert!(
+            html.contains("Propeller") && html.contains("+7.4%"),
+            "geomean 1st is Propeller +7.4% vs stock:\n{html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ranking_table_shows_podium_and_all_geomean_places() {
+        let dir = unique_dir();
+        fs::write(
+            dir.join("benchie_abs-current.log"),
+            "\
+Kernel: 1_current
+syscall getppid (Mops/s): 10.0
+pipe throughput (Kops/s): 10.0
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_abs-debug_clean.log"),
+            "\
+Kernel: 2_debug_clean
+syscall getppid (Mops/s): 11.0
+pipe throughput (Kops/s): 9.0
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_abs-autofdo_clean.log"),
+            "\
+Kernel: 3_autofdo_clean
+syscall getppid (Mops/s): 12.0
+pipe throughput (Kops/s): 10.0
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_abs-final.log"),
+            "\
+Kernel: 4_final
+syscall getppid (Mops/s): 13.0
+pipe throughput (Kops/s): 11.0
+",
+        )
+        .unwrap();
+        assert!(scrape_benchie_dir(&dir).unwrap());
+        let html = fs::read_to_string(dir.join("test_performance.html")).unwrap();
+        assert!(
+            html.contains("<th>1st</th>")
+                && html.contains("<th>2nd</th>")
+                && html.contains("<th>3rd</th>"),
+            "podium columns missing:\n{html}"
+        );
+        assert!(
+            html.contains("Propeller 13.00 Mops/s (30.0% higher)"),
+            "syscall 1st vs stock is Propeller +30%:\n{html}"
+        );
+        assert!(
+            html.contains("AutoFDO 12.00 Mops/s (20.0% higher)"),
+            "syscall 2nd is AutoFDO +20%:\n{html}"
+        );
+        assert!(
+            html.contains("debug 11.00 Mops/s (10.0% higher)"),
+            "syscall 3rd is debug +10%:\n{html}"
+        );
+        assert!(
+            html.contains("<td>1st</td>")
+                && html.contains("<td>2nd</td>")
+                && html.contains("<td>3rd</td>")
+                && html.contains("<td>4th</td>"),
+            "geomean must list all four places:\n{html}"
+        );
+        assert!(
+            html.contains("+19.6%"),
+            "Propeller geomean sqrt(1.3*1.1) is +19.6% vs stock:\n{html}"
+        );
+        assert!(
+            html.contains("+9.5%"),
+            "AutoFDO geomean sqrt(1.2*1.0) is +9.5% vs stock:\n{html}"
+        );
+        assert!(
+            html.contains("-0.5%"),
+            "debug geomean sqrt(1.1*0.9) is −0.5% vs stock:\n{html}"
+        );
+        let geo_idx = html
+            .find("<h3>Geomean vs stock</h3>")
+            .expect("geomean heading");
+        let geo = &html[geo_idx..];
+        assert!(
+            geo.contains("<td>stock</td>") && geo.contains("<td>0%</td>"),
+            "stock is geomean baseline at 0%:\n{geo}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_score_is_golf() {
+        assert!(
+            !metric_higher_better("Total score"),
+            "Total score is golf (lower pts is better)"
+        );
+    }
+
+    #[test]
+    fn latency_captions_use_raw_us_and_lower_higher() {
+        let dir = unique_dir();
+        fs::write(
+            dir.join("benchie_abs-current.log"),
+            "\
+Kernel: 1_current
+cyclictest max latency (us): 911
+schbench p99 latency (us): 494
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_abs-final.log"),
+            "\
+Kernel: 4_final
+cyclictest max latency (us): 427
+schbench p99 latency (us): 655
+",
+        )
+        .unwrap();
+        assert!(scrape_benchie_dir(&dir).unwrap());
+        let svg = fs::read_to_string(dir.join("kernel_version_comparison_All.svg")).unwrap();
+        assert!(svg.contains("427 µs"), "raw winner missing:\n{svg}");
+        assert!(svg.contains("911 µs"), "raw stock missing:\n{svg}");
+        assert!(
+            svg.contains("53% lower latency"),
+            "cyclictest must say lower latency, not an inverted +113%:\n{svg}"
+        );
+        assert!(
+            !svg.contains("+113"),
+            "inverted +113% caption is misleading:\n{svg}"
+        );
+        assert!(svg.contains("655 µs"), "{svg}");
+        assert!(
+            svg.contains("33% higher latency"),
+            "schbench p99 Propeller is higher latency:\n{svg}"
+        );
+        let cat = fs::read_to_string(dir.join("categorized_comparison_All.svg")).unwrap();
+        let kernel_w = svg_bar_widths(&svg, "cyclictest max latency (us)");
+        let cat_w = svg_bar_widths(&cat, "cyclictest max latency (us)");
+        assert!(
+            kernel_w.len() >= 2,
+            "{kernel_w:?}\n{svg}"
+        );
+        assert!(
+            cat_w.len() >= 2,
+            "{cat_w:?}\n{cat}"
+        );
+        assert!(
+            kernel_w[1] > kernel_w[0],
+            "Propeller (lower µs) must get the longer bar:\n{kernel_w:?}\n{svg}"
+        );
+        assert!(
+            cat_w[1] > cat_w[0],
+            "categorized chart must use the same encoding:\n{cat_w:?}\n{cat}"
+        );
+        let html = fs::read_to_string(dir.join("test_performance.html")).unwrap();
+        assert!(
+            html.contains("53% lower latency"),
+            "winners table must not use inverted +113%:\n{html}"
+        );
+        assert!(
+            html.contains("How to read latency") || html.contains("lower microseconds"),
+            "report must explain latency bars:\n{html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_score_lower_pts_is_best() {
+        let dir = unique_dir();
+        fs::write(
+            dir.join("benchie_abs-current.log"),
+            "\
+Kernel: 1_current
+Total score: 67.74
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("benchie_abs-final.log"),
+            "\
+Kernel: 4_final
+Total score: 64.85
+",
+        )
+        .unwrap();
+        assert!(scrape_benchie_dir(&dir).unwrap());
+        let svg = fs::read_to_string(dir.join("kernel_version_comparison_All.svg")).unwrap();
+        assert!(svg.contains("64.85 pts"), "{svg}");
+        assert!(svg.contains("4.5% better"), "golf win vs stock:\n{svg}");
+        let widths = svg_bar_widths(&svg, "Total score");
+        assert_eq!(widths.len(), 2, "{widths:?}\n{svg}");
+        assert!(
+            widths[1] > widths[0],
+            "lower Total score must get the longer bar:\n{widths:?}\n{svg}"
+        );
+        let html = fs::read_to_string(dir.join("winners_table.html")).unwrap();
+        assert!(
+            html.contains("Propeller") && html.contains("64.85 pts"),
+            "Propeller must win Total score:\n{html}"
+        );
+        assert!(
+            !html.contains("stock") || !html.contains("1st") || html.contains("Propeller"),
+            "{html}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

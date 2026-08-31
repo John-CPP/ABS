@@ -6,8 +6,10 @@
 # cold. Only `kernel` is supported — it drives those paths.
 #   ABS_PGO_BENCHMARK=kernel  (default)
 #
-# Scoring (no perf; comparison charts). Keep this shorter than training:
+# Scoring (no perf; comparison charts):
 #   ABS_PGO_BENCHMARK=kbench            kernel micro-benchmarks → benchie_*.log
+#   ABS_PGO_BENCHMARK=cachyos           system cachyos-benchmarker (opt-in, 30–60+ min)
+#   ABS_PGO_BENCHMARK=kbench+cachyos    CachyOS first, then kbench appended to that log
 #   ABS_PGO_BENCHMARK=warmup            CPU turbo warm-up before a scored run
 #
 # ABS_PGO_PROFILE=short|sweet|long  (sweet default) sets the budget when
@@ -665,12 +667,203 @@ run_kbench() {
     echo "==> kernel metrics written to ${log##*/}"
 }
 
+# Persistent workdirs keep .abs-bin/cachyos-benchmarker from the last run.
+# The wget wrapper prepends that directory to PATH, so `command -v` must
+# skip the leftover ABS shim and keep the real CachyOS script.
+find_real_cachyos_benchmarker() {
+    local bindir="${WORKDIR}/.abs-bin"
+    local dir candidate resolved
+    local -a dirs
+    IFS=':' read -ra dirs <<< "${PATH}"
+    for dir in "${dirs[@]}"; do
+        [[ -n "${dir}" ]] || continue
+        candidate="${dir}/cachyos-benchmarker"
+        [[ -x "${candidate}" && ! -d "${candidate}" ]] || continue
+        resolved="$(readlink -f "${candidate}")"
+        [[ "${resolved}" != "${bindir}/cachyos-benchmarker" ]] || continue
+        printf '%s\n' "${resolved}"
+        return 0
+    done
+    return 1
+}
+
+# CachyOS ends every run by invoking benchmark_scraper.py (matplotlib). That
+# script crashes when the persistent ABS workdir mixes logs with different
+# test counts. ABS writes charts in Rust — patch the scraper call out of a
+# copy of cachyos-benchmarker. Do not put python on PATH.
+install_skip_scraper_wrapper() {
+    local bindir="${WORKDIR}/.abs-bin"
+    mkdir -p "${bindir}"
+    local real="${1:-}"
+    if [[ -z "${real}" ]]; then
+        real="$(find_real_cachyos_benchmarker)" || return 1
+    fi
+    real="$(readlink -f "${real}")"
+    if [[ "${real}" == "${bindir}/cachyos-benchmarker" ]]; then
+        echo "error: refusing to wrap the ABS cachyos-benchmarker shim" >&2
+        return 1
+    fi
+    cat > "${bindir}/cachyos-benchmarker" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real="${ABS_CACHYOS_BENCHMARKER_REAL:?}"
+patched="$(mktemp)"
+trap 'rm -f "${patched}"' EXIT
+scriptdir="$(dirname "${real}")"
+sed -E \
+    -e "s|^SCRIPTDIR=.*|SCRIPTDIR=\"${scriptdir}\"|" \
+    -e 's|^[[:space:]]*python3?[[:space:]].*benchmark_scraper\.py.*$|echo "==> skipping CachyOS benchmark_scraper.py (ABS writes comparison charts)"; true|' \
+    "${real}" > "${patched}"
+chmod +x "${patched}"
+exec bash "${patched}" "$@"
+EOF
+    chmod +x "${bindir}/cachyos-benchmarker"
+    export ABS_CACHYOS_BENCHMARKER_REAL="${real}"
+    export PATH="${bindir}:${PATH}"
+}
+
+install_quiet_wget_wrapper() {
+    local bindir="${WORKDIR}/.abs-bin"
+    mkdir -p "${bindir}"
+    cat > "${bindir}/wget" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real=/usr/bin/wget
+[[ -x "${real}" ]] || real="$(command -v wget 2>/dev/null || true)"
+[[ -n "${real}" && -x "${real}" ]] || { echo "wget not found" >&2; exit 127; }
+args=()
+dest=""
+prev=""
+for a in "$@"; do
+    case "$a" in
+        --show-progress|--progress=bar*|--progress=dot*) continue ;;
+    esac
+    if [[ "${prev}" == "-O" || "${prev}" == "-qO" ]]; then dest="$a"; fi
+    prev="$a"
+    args+=("$a")
+done
+echo "==> wget: ${dest##*/} ($(date +%H:%M:%S))"
+exec "${real}" -q "${args[@]}"
+EOF
+    chmod +x "${bindir}/wget"
+    export PATH="${bindir}:${PATH}"
+}
+
+# True when cachyos-benchmarker would skip its large wget/tar steps (same paths as /usr/bin/cachyos-benchmarker).
+cachyos_benchmarker_assets_cached() {
+    local w=$1 script="${2:-}" ffmpegver kernver ycruncher_ver
+    if [[ -z "${script}" ]]; then
+        script="$(find_real_cachyos_benchmarker)" || return 1
+    fi
+    ffmpegver="$(sed -n 's/^FFMPEGVER="\([^"]*\)".*/\1/p' "${script}" | head -1)"
+    ycruncher_ver="$(sed -n 's/^YCRUNCHER_VER="\([^"]*\)".*/\1/p' "${script}" | head -1)"
+    kernver="$(sed -n 's/^KERNVER="\([^"]*\)".*/\1/p' "${script}" | head -1)"
+    [[ -n "${ffmpegver}" && -n "${ycruncher_ver}" && -n "${kernver}" ]] || return 1
+    [[ -d "${w}/ffmpeg-${ffmpegver}" ]] \
+        && [[ -d "${w}/linux-${kernver}" ]] \
+        && [[ -d "${w}/y-cruncher v${ycruncher_ver}-static" ]] \
+        && [[ -d "${w}/namd" ]] \
+        && [[ -f "${w}/bosphorus_hd.y4m" ]] \
+        && [[ -f "${w}/bmw_cpu_mod.blend" ]] \
+        && [[ -f "${w}/firefox102.tar" ]]
+}
+
+run_cachyos_benchmarker() {
+    if ((DRY_RUN)); then
+        echo "    [dry run] cachyos-benchmarker ${WORKDIR}"
+        return 0
+    fi
+    local real
+    real="$(find_real_cachyos_benchmarker)" || {
+        echo "error: cachyos-benchmarker not in PATH (ABS_PGO_BENCHMARK=cachyos)" >&2
+        return 127
+    }
+    install_quiet_wget_wrapper
+    # Hide prior logs so a leaked scraper still sees only this run.
+    mkdir -p "${WORKDIR}/.abs-benchie-prev"
+    shopt -s nullglob
+    local prev_logs=("${WORKDIR}"/benchie_*.log)
+    if ((${#prev_logs[@]} > 0)); then
+        mv -f "${prev_logs[@]}" "${WORKDIR}/.abs-benchie-prev/" || true
+    fi
+    shopt -u nullglob
+    if ! cachyos_benchmarker_assets_cached "${WORKDIR}" "${real}"; then
+        echo "==> cachyos-benchmarker (opt-in): downloads + configures sources; first run is very slow"
+    fi
+    install_skip_scraper_wrapper "${real}"
+    local progress_pid=""
+    # `wait` (builtin) is interruptible; a foreground `sleep` is not. Killing
+    # the reporter must also reap its sleep child so piped ABS logs close.
+    (
+        trap 'kill "${sp:-}" 2>/dev/null; exit 0' TERM INT
+        while true; do
+            sleep 120 &
+            sp=$!
+            wait "${sp}" || true
+            echo "==> cachyos-benchmarker still running ($(date +%H:%M:%S))…"
+        done
+    ) &
+    progress_pid=$!
+    stop_progress() {
+        if [[ -n "${progress_pid}" ]]; then
+            kill "${progress_pid}" 2>/dev/null || true
+            wait "${progress_pid}" 2>/dev/null || true
+            progress_pid=""
+        fi
+    }
+    trap 'stop_progress' RETURN
+    # checksys() prompts twice: page-cache drop (empty = no), then run name.
+    # ABS_PGO_COMPARE_LABEL is set when this run is also the comparison chart series.
+    local label="${ABS_PGO_COMPARE_LABEL:-}"
+    if ! printf '%s\n' '' "${label}" | cachyos-benchmarker "${WORKDIR}"; then
+        local status=$?
+        stop_progress
+        return "${status}"
+    fi
+    stop_progress
+}
+
+append_kernel_metrics_to_latest_benchie() {
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    KB_OUT="${WORKDIR}/.abs-kbench-append-${stamp}.txt"
+    : > "${KB_OUT}"
+    collect_kernel_metrics
+    if ((DRY_RUN)); then
+        echo "    [dry run] append kbench metrics to latest benchie_*.log"
+        rm -f "${KB_OUT}"
+        return 0
+    fi
+    local latest
+    latest="$(ls -1t "${WORKDIR}"/benchie_*.log 2>/dev/null | head -1 || true)"
+    if [[ -z "${latest}" ]]; then
+        echo "error: kbench+cachyos: no benchie log from cachyos-benchmarker" >&2
+        rm -f "${KB_OUT}"
+        return 1
+    fi
+    if [[ ! -s "${KB_OUT}" ]]; then
+        echo "error: no kernel metrics collected (need perf and/or stress-ng)" >&2
+        rm -f "${KB_OUT}"
+        return 1
+    fi
+    cat "${KB_OUT}" >> "${latest}"
+    rm -f "${KB_OUT}" "${SNG_TMP}"/kb-*.yaml 2>/dev/null || true
+    echo "==> kernel metrics appended to ${latest##*/}"
+}
+
+run_kbench_plus_cachyos() {
+    run_cachyos_benchmarker || return $?
+    append_kernel_metrics_to_latest_benchie
+}
+
 case "${MODE}" in
     kernel|"") run_kernel_benchmark ;;
     kbench) run_kbench ;;
+    cachyos|full) run_cachyos_benchmarker ;;
+    kbench+cachyos) run_kbench_plus_cachyos ;;
     warmup) run_cpu_warmup ;;
     *)
-        echo "error: unknown ABS_PGO_BENCHMARK='${MODE}' (use kernel, kbench, or warmup)" >&2
+        echo "error: unknown ABS_PGO_BENCHMARK='${MODE}' (use kernel, kbench, cachyos, kbench+cachyos, or warmup)" >&2
         exit 2
         ;;
 esac

@@ -159,6 +159,16 @@ fn makepkg_env_pairs(env: &HashMap<String, String>) -> Vec<(String, String)> {
     pairs
 }
 
+/// Packages produced by this PGO stage (`pkgbase` + split packages such as `-headers` / `-dbg`).
+pub fn list_pgo_stage_packages(
+    repo_dir: &Path,
+    pkgbase: &str,
+    ready_packages_path: &str,
+    makepkg_env: &HashMap<String, String>,
+) -> Vec<PathBuf> {
+    collect_pgo_candidate_files(repo_dir, pkgbase, ready_packages_path, makepkg_env)
+}
+
 fn collect_pgo_candidate_files(
     repo_dir: &Path,
     pkgbase: &str,

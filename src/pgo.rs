@@ -12,6 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,8 @@ const SHT_LLVM_BB_ADDR_MAP: u32 = 0x6fff_4c0a;
 /// Legacy BB_ADDR_MAP type (SHT_LLVM_BB_ADDR_MAP_V0).
 const SHT_LLVM_BB_ADDR_MAP_V0: u32 = 0x6fff_4c08;
 const PROPELLER_BUILD_SCRIPT: &str = include_str!("../assets/build-generate-propeller-profiles.sh");
+
+static SHUTDOWN_AFTER_FINISH: AtomicBool = AtomicBool::new(false);
 
 /// Pipeline stage identifiers persisted in state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +147,89 @@ pub fn compare_run_stamp(unix_secs: i64) -> String {
 
 pub fn pipeline_compare_dir(compare_root: &Path, stamp: &str) -> PathBuf {
     compare_root.join(stamp)
+}
+
+/// Calendar date (`YYYY-MM-DD`) for `{save_kernels_dir}/{date}/{stage}/`.
+pub fn pipeline_date_stamp(unix_secs: i64) -> String {
+    let stamp = compare_run_stamp(unix_secs);
+    if stamp.starts_with("unix-") || stamp.len() < 10 {
+        stamp
+    } else {
+        stamp[..10].to_string()
+    }
+}
+
+pub fn stage_kernel_save_dir(base: &Path, date: &str, stage: &str) -> PathBuf {
+    base.join(date).join(stage)
+}
+
+const STAGE_KERNEL_DEBUG: &str = "debug";
+const STAGE_KERNEL_AUTOFDO: &str = "autofdo";
+const STAGE_KERNEL_FINAL: &str = "final";
+
+fn copy_files_keep_names(files: &[PathBuf], dest_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    fs::create_dir_all(dest_dir).map_err(|e| format!("create {}: {e}", dest_dir.display()))?;
+    let mut copied = Vec::new();
+    for src in files {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        if !src.is_file() {
+            continue;
+        }
+        let dest = dest_dir.join(name);
+        if src == &dest {
+            copied.push(dest);
+            continue;
+        }
+        fs::copy(src, &dest)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dest.display()))?;
+        copied.push(dest);
+    }
+    Ok(copied)
+}
+
+fn save_stage_kernel_packages(
+    pgo: &PgoConfig,
+    state: &PgoState,
+    stage: &str,
+    pkgbase: &str,
+    config: &Config,
+    makepkg_env: &HashMap<String, String>,
+) {
+    let Some(base) = pgo.resolved_save_kernels_dir() else {
+        return;
+    };
+    let date = pipeline_date_stamp(state.started_at as i64);
+    let dest = stage_kernel_save_dir(&base, &date, stage);
+    let files = crate::install::list_pgo_stage_packages(
+        Path::new(&state.repo_dir),
+        pkgbase,
+        &config.paths.ready_made_packages_path,
+        makepkg_env,
+    );
+    if files.is_empty() {
+        ewarn!(
+            "No PGO packages to save for {pkgbase} into {}",
+            dest.display()
+        );
+        return;
+    }
+    match copy_files_keep_names(&files, &dest) {
+        Ok(copied) => {
+            blog!(
+                "Saved {} kernel package(s) to {}",
+                copied.len(),
+                dest.display()
+            );
+            for p in &copied {
+                vlog!("  {}", p.display());
+            }
+        }
+        Err(e) => {
+            ewarn!("Failed to save stage kernel packages: {e}");
+        }
+    }
 }
 
 fn ensure_compare_run_dir(state: &mut PgoState, pgo: &PgoConfig, package: &str) -> PathBuf {
@@ -544,15 +630,18 @@ fn install_pgo_auto_resume_service(package: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn pgo_auto_resume_disable_argv(instance: &str) -> Vec<&str> {
+    vec!["--user", "disable", instance]
+}
+
 pub fn remove_pgo_auto_resume_service(package: &str) {
     let instance = pgo_auto_systemd_unit(package);
     let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", instance.as_str()])
+        .args(pgo_auto_resume_disable_argv(&instance))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     unlink_pgo_auto_resume_links(&pgo_auto_systemd_dir(), package);
-    crate::pgo_priv::maybe_remove_dropin();
 }
 
 fn pgo_auto_unit_text(abs_bin: &str) -> String {
@@ -599,11 +688,40 @@ fn complete_pgo_pipeline(
 ) {
     transition(state, PgoStageId::Done);
     crate::pkgbuild::restore_pkgbuild(Path::new(&state.repo_dir));
-    remove_pgo_auto_resume_service(package);
     save_state(state_path, state);
     blog!("PGO pipeline complete for {}", package);
     if cli.json {
         print_json_status(state, pgo);
+    }
+    remove_pgo_auto_resume_service(package);
+    if pgo.shutdown_after_finish {
+        SHUTDOWN_AFTER_FINISH.store(true, Ordering::Relaxed);
+    }
+}
+
+/// After ramdisk/zram teardown: power off if `shutdown_after_finish` completed this run.
+pub fn take_shutdown_after_finish() -> bool {
+    SHUTDOWN_AFTER_FINISH.swap(false, Ordering::Relaxed)
+}
+
+pub fn trigger_pgo_shutdown() -> Result<(), String> {
+    if crate::is_dry_run_mode() {
+        println!("[DRY RUN] systemctl poweroff");
+        return Ok(());
+    }
+    blog!("PGO: shutting down in 5 seconds…");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    // Keep the passwordless helper until poweroff so unattended auto-resume can
+    // halt without a sudo prompt. pgo-priv removes the drop-in first.
+    if !crate::pgo_priv::client_enabled() {
+        let _ = crate::pgo_priv::remove_dropin();
+    }
+    match run_command("sudo", &["systemctl", "poweroff"], None::<&str>) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            ewarn!("systemctl poweroff failed ({e}); trying poweroff");
+            run_command("sudo", &["poweroff"], None::<&str>).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -1206,7 +1324,13 @@ fn preflight(pgo: &PgoConfig, package: &str, config: &Config) {
         die!("PGO preset does not exist: packages.{package}.pgo.compare_preset = {cmp:?}\n{e}");
     }
     if pgo.compare_any() {
-        blog!("Comparison benches use kbench (kernel-path metrics)");
+        let preset = resolved_compare_preset(pgo);
+        blog!("Comparison benches use {preset} (no perf record)");
+        if let Err(e) =
+            require_cachyos_benchmarker_for_compare(pgo, which("cachyos-benchmarker").is_some())
+        {
+            die!("{e}");
+        }
     }
     if let Some(pc) = config.packages.get(package)
         && let Ok(targets) = crate::ramdisk::resolve_ramdisk_targets(config, Some(pc), None, None)
@@ -1309,7 +1433,7 @@ fn should_run_standalone_compare(pgo: &PgoConfig, stage: CompareStage) -> bool {
 fn profile_compare_stage(_pgo: &PgoConfig, _stage: CompareStage) -> Option<CompareStage> {
     // Training must not share a `perf record` window with a scored comparison.
     // Appending a scoring pass to collection dilutes AutoFDO with extra samples.
-    // Comparison is always a standalone no-perf kbench run.
+    // Comparison is always a standalone no-perf run (kbench and/or CachyOS).
     None
 }
 
@@ -1420,7 +1544,7 @@ fn drop_page_cache() {
     }
 }
 
-/// Clean kbench run (no perf record) plus comparison charts.
+/// Clean comparison run (no perf record) plus comparison charts.
 /// Always drops caches and CPU-warms first, including right after a profiling
 /// pass on the same kernel — otherwise debug/AutoFDO scores a hot page cache.
 fn maybe_run_compare_benchmark(
@@ -1784,6 +1908,14 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 run_pgo_build(package, cli, config, &build_ctx, events);
                 let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
                 record_installed_kernel(state, &pkgbase);
+                save_stage_kernel_packages(
+                    pgo,
+                    state,
+                    STAGE_KERNEL_DEBUG,
+                    &pkgbase,
+                    config,
+                    &build_ctx.env_vars,
+                );
                 transition(state, PgoStageId::WaitReboot1);
             }
             PgoStageId::Stage2Profile => {
@@ -1823,6 +1955,14 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 run_pgo_build(package, cli, config, &build_ctx, events);
                 let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
                 record_installed_kernel(state, &pkgbase);
+                save_stage_kernel_packages(
+                    pgo,
+                    state,
+                    STAGE_KERNEL_AUTOFDO,
+                    &pkgbase,
+                    config,
+                    &build_ctx.env_vars,
+                );
                 transition(state, after_stage2_build_stage(pgo, plan));
             }
             PgoStageId::Stage3Profile => {
@@ -1865,6 +2005,14 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
                 run_pgo_build(package, cli, config, &build_ctx, events);
                 let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
                 record_installed_kernel(state, &pkgbase);
+                save_stage_kernel_packages(
+                    pgo,
+                    state,
+                    STAGE_KERNEL_FINAL,
+                    &pkgbase,
+                    config,
+                    &build_ctx.env_vars,
+                );
                 transition(state, PgoStageId::WaitReboot3);
             }
             PgoStageId::WaitReboot0
@@ -3895,8 +4043,37 @@ fn resolved_benchmark_preset(_pgo: &PgoConfig) -> String {
 }
 
 /// Scoring workload for a standalone comparison run (never under `perf record`).
-fn resolved_compare_preset(_pgo: &PgoConfig) -> String {
-    "kbench".to_string()
+fn resolved_compare_preset(pgo: &PgoConfig) -> String {
+    match pgo.compare_preset.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" | "kbench" => "kbench".into(),
+        "cachyos" => "cachyos".into(),
+        "kbench+cachyos" => "kbench+cachyos".into(),
+        other => other.to_string(),
+    }
+}
+
+fn compare_preset_needs_cachyos(pgo: &PgoConfig) -> bool {
+    matches!(
+        resolved_compare_preset(pgo).as_str(),
+        "cachyos" | "kbench+cachyos"
+    )
+}
+
+fn require_cachyos_benchmarker_for_compare(
+    pgo: &PgoConfig,
+    cachyos_on_path: bool,
+) -> Result<(), String> {
+    if !pgo.compare_any() || !compare_preset_needs_cachyos(pgo) {
+        return Ok(());
+    }
+    if cachyos_on_path {
+        return Ok(());
+    }
+    Err(
+        "compare_preset includes cachyos but cachyos-benchmarker is not in PATH. \
+         Install the cachyos-benchmarker package, or set compare_preset = \"kbench\"."
+            .into(),
+    )
 }
 
 fn resolved_kernel_workload_seconds(pgo: &PgoConfig) -> u32 {
@@ -4488,6 +4665,7 @@ mod tests {
             enabled: true,
             preset: "cachyos-kernel".into(),
             profiles_archive_dir: Some("/tmp/abs-pgo-test".into()),
+            save_kernels_dir: None,
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
@@ -4510,6 +4688,7 @@ mod tests {
             select_boot_kernel: true,
             auto_restart: false,
             reboot_before_start: false,
+            shutdown_after_finish: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
             skip_propeller: false,
@@ -4567,6 +4746,100 @@ mod tests {
         assert!(
             !unit.contains("WantedBy=graphical-session.target"),
             "graphical-session never starts on a console-only machine: {unit}"
+        );
+    }
+
+    #[test]
+    fn disabling_auto_resume_does_not_stop_the_running_oneshot() {
+        let argv = super::pgo_auto_resume_disable_argv("abs-pgo@linux-cachyos.service");
+        assert!(
+            argv.iter().any(|a| *a == "disable"),
+            "must disable the unit so it does not start on the next boot: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| *a == "--now"),
+            "disable --now SIGTERMs the completing abs process (same unit) before it can write done: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn complete_pgo_pipeline_persists_done_before_disabling_auto_resume() {
+        let src = include_str!("pgo.rs");
+        let start = src
+            .find("fn complete_pgo_pipeline(")
+            .expect("complete_pgo_pipeline");
+        let rest = &src[start..];
+        let body_end = ["\npub fn ", "\nfn "]
+            .iter()
+            .filter_map(|pat| rest[1..].find(pat))
+            .min()
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..body_end];
+        let save = body.find("save_state(").expect("save_state in complete");
+        let disable = body
+            .find("remove_pgo_auto_resume_service(")
+            .expect("remove_pgo_auto_resume_service in complete");
+        assert!(
+            save < disable,
+            "writing done after systemctl disable --now loses the complete mark when the unit kills this process:\n{body}"
+        );
+        assert!(
+            body.contains("shutdown_after_finish"),
+            "complete must honor shutdown_after_finish:\n{body}"
+        );
+        assert!(
+            !body.contains("trigger_pgo_shutdown("),
+            "poweroff before ramdisk teardown drops the sudo helper needed to unmount:\n{body}"
+        );
+        assert!(
+            body.contains("SHUTDOWN_AFTER_FINISH"),
+            "complete must defer poweroff until after ramdisk teardown:\n{body}"
+        );
+    }
+
+    #[test]
+    fn trigger_pgo_shutdown_skips_dry_run_and_uses_poweroff() {
+        let src = include_str!("pgo.rs");
+        let start = src
+            .find("fn trigger_pgo_shutdown(")
+            .expect("trigger_pgo_shutdown");
+        let rest = &src[start..];
+        let body_end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..body_end];
+        assert!(
+            body.contains("is_dry_run_mode"),
+            "must not power off during dry-run:\n{body}"
+        );
+        assert!(body.contains("poweroff"), "must invoke poweroff:\n{body}");
+    }
+
+    #[test]
+    fn take_shutdown_after_finish_is_one_shot() {
+        assert!(!take_shutdown_after_finish(), "flag starts clear");
+        SHUTDOWN_AFTER_FINISH.store(true, Ordering::Relaxed);
+        assert!(take_shutdown_after_finish());
+        assert!(
+            !take_shutdown_after_finish(),
+            "must not power off again on a later status/abort in the same process"
+        );
+    }
+
+    #[test]
+    fn main_powers_off_after_ramdisk_teardown() {
+        let src = include_str!("main.rs");
+        let handle = src
+            .find("pgo::handle_cli(")
+            .expect("pgo::handle_cli in main");
+        let take = src
+            .find("pgo::take_shutdown_after_finish()")
+            .expect("take_shutdown_after_finish in main");
+        let trigger = src
+            .find("pgo::trigger_pgo_shutdown()")
+            .expect("trigger_pgo_shutdown in main");
+        assert!(
+            handle < take && take < trigger,
+            "must tear down ramdisk (end of handle_cli scope) before poweroff"
         );
     }
 
@@ -4858,6 +5131,7 @@ mod tests {
     fn new_pipeline_flags_default_off() {
         let pgo: PgoConfig = toml::from_str("").unwrap();
         assert!(!pgo.reboot_before_start);
+        assert!(!pgo.shutdown_after_finish);
         assert!(!pgo.reuse_afdo_profile);
         assert!(!pgo.reuse_propeller_profile);
         assert!(!pgo.skip_propeller);
@@ -4865,6 +5139,61 @@ mod tests {
         assert!(!pgo.compare_debug_clean);
         assert!(!pgo.compare_autofdo_clean);
         assert!(!pgo.compare_final);
+        assert!(pgo.save_kernels_dir.is_none());
+        assert!(pgo.resolved_save_kernels_dir().is_none());
+    }
+
+    #[test]
+    fn pipeline_date_stamp_is_yyyy_mm_dd() {
+        let stamp = pipeline_date_stamp(1_767_225_600); // 2026-01-01 00:00 UTC-ish
+        if !stamp.starts_with("unix-") {
+            assert!(
+                stamp.len() == 10 && stamp.as_bytes()[4] == b'-' && stamp.as_bytes()[7] == b'-',
+                "{stamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_kernel_save_dir_uses_date_and_stage() {
+        let d = stage_kernel_save_dir(Path::new("/kernels"), "2026-08-31", "debug");
+        assert_eq!(d, PathBuf::from("/kernels/2026-08-31/debug"));
+        let a = stage_kernel_save_dir(Path::new("/kernels"), "2026-08-31", "autofdo");
+        let f = stage_kernel_save_dir(Path::new("/kernels"), "2026-08-31", "final");
+        assert_eq!(a.file_name().unwrap(), "autofdo");
+        assert_eq!(f.file_name().unwrap(), "final");
+        assert_eq!(d.file_name().unwrap(), "debug");
+        assert_ne!(a, f);
+    }
+
+    #[test]
+    fn copy_files_keep_names_preserves_filename() {
+        let root = std::env::temp_dir().join(format!(
+            "abs-save-kernels-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = root.join("pkgdest");
+        let dest = stage_kernel_save_dir(&root.join("save"), "2026-08-31", "debug");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("linux-cachyos-6.16-1-x86_64.pkg.tar.zst");
+        fs::write(&src, b"pkg").unwrap();
+        let copied = copy_files_keep_names(std::slice::from_ref(&src), &dest).unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(
+            copied[0].file_name().unwrap(),
+            "linux-cachyos-6.16-1-x86_64.pkg.tar.zst"
+        );
+        assert_eq!(fs::read(&copied[0]).unwrap(), b"pkg");
+        let autofdo = stage_kernel_save_dir(&root.join("save"), "2026-08-31", "autofdo");
+        fs::write(&src, b"pkg2").unwrap();
+        let copied2 = copy_files_keep_names(std::slice::from_ref(&src), &autofdo).unwrap();
+        assert_eq!(fs::read(&copied2[0]).unwrap(), b"pkg2");
+        assert_eq!(fs::read(&copied[0]).unwrap(), b"pkg");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Training is always the kernel workload. Leftover fast/cachyos config is ignored.
@@ -4897,15 +5226,32 @@ mod tests {
     }
 
     #[test]
-    fn compare_preset_is_always_kbench() {
+    fn compare_preset_honors_config() {
         let mut pgo = test_pgo();
         assert_eq!(resolved_compare_preset(&pgo), "kbench");
         pgo.compare_preset = "  ".into();
         assert_eq!(resolved_compare_preset(&pgo), "kbench");
+        pgo.compare_preset = "auto".into();
+        assert_eq!(resolved_compare_preset(&pgo), "kbench");
         pgo.compare_preset = "cachyos".into();
-        assert_eq!(resolved_compare_preset(&pgo), "kbench");
+        assert_eq!(resolved_compare_preset(&pgo), "cachyos");
         pgo.compare_preset = "kbench+cachyos".into();
-        assert_eq!(resolved_compare_preset(&pgo), "kbench");
+        assert_eq!(resolved_compare_preset(&pgo), "kbench+cachyos");
+    }
+
+    #[test]
+    fn cachyos_compare_requires_binary_only_when_compare_is_on() {
+        let mut pgo = test_pgo();
+        pgo.compare_preset = "cachyos".into();
+        assert!(require_cachyos_benchmarker_for_compare(&pgo, false).is_ok());
+        pgo.compare_current = true;
+        let err = require_cachyos_benchmarker_for_compare(&pgo, false).unwrap_err();
+        assert!(err.contains("cachyos-benchmarker"), "{err}");
+        assert!(require_cachyos_benchmarker_for_compare(&pgo, true).is_ok());
+        pgo.compare_preset = "kbench+cachyos".into();
+        assert!(require_cachyos_benchmarker_for_compare(&pgo, false).is_err());
+        pgo.compare_preset = "kbench".into();
+        assert!(require_cachyos_benchmarker_for_compare(&pgo, false).is_ok());
     }
 
     #[test]
@@ -6167,6 +6513,7 @@ default = "aur"
             enabled: false,
             preset: "cachyos-kernel".into(),
             profiles_archive_dir: Some(dir.to_string_lossy().into_owned()),
+            save_kernels_dir: None,
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
@@ -6189,6 +6536,7 @@ default = "aur"
             select_boot_kernel: true,
             auto_restart: false,
             reboot_before_start: false,
+            shutdown_after_finish: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
             skip_propeller: false,

@@ -176,6 +176,7 @@ default = "arch"
 # [packages.linux-cachyos.pgo]
 # enabled = true
 # profiles_archive_dir = "/mnt/data/abs/pgo/profiles"
+# save_kernels_dir = "/mnt/data/abs/pgo/kernels"  # optional; copies each stage to {dir}/{YYYY-MM-DD}/{debug|autofdo|final}/
 # propeller_profiles_on_ram = true  # skip HDD archive; final Propeller build is same boot
 # convert_relocate = "force"  # force | smart — move tmpfs capture to disk before convert (avoids OOM)
 # benchmark_command = "/path/to/custom-benchmark.sh"  # optional; default is bundled assets/pgo-benchmark.sh
@@ -186,13 +187,16 @@ default = "arch"
 # path suite (syscall, scheduler, VFS, network). Leftover fast/cachyos values are ignored.
 # kernel_workload_seconds = 0  # 0 = from profiling_quality (short 10 min, sweet 20 min, long 60 min)
 #
-# Duration profile. Training (under perf) and comparison (no perf, kbench):
-#   short  ~10 min train,  ~3 min compare
-#   sweet  ~20 min train,  ~6 min compare   (default)
-#   long   ~60 min train, ~10 min compare
+# Duration profile. Training (under perf) and kbench comparison (no perf):
+#   short  ~10 min train,  ~3 min kbench
+#   sweet  ~20 min train,  ~6 min kbench   (default)
+#   long   ~60 min train, ~10 min kbench
 # profiling_quality = "sweet"  # short | sweet | long  (aliases: standard→sweet, maximum→long)
+# Does not shorten CachyOS-benchmarker (always the full suite).
 #
-# Scoring is always kbench (kernel-path metrics; never under perf).
+# Scoring (no perf). kbench (default via auto), cachyos, or kbench+cachyos.
+# compare_preset = "kbench"  # kbench | auto | cachyos | kbench+cachyos
+# cachyos needs cachyos-benchmarker on PATH (~30–60 min; first run downloads).
 # propeller_tool = "auto"  # generate_propeller_profiles (built if needed for LLVM 22+) or create_llvm_prof
 # perf_extra_args = "--mmap-pages 4096 -a -N -b -c 400009"  # override auto quality; mmap-pages is per CPU
 # build_user = "builder"
@@ -200,12 +204,14 @@ default = "arch"
 # auto_restart = false  # reboot + resume in a visible terminal until PGO completes (--pgo-auto)
 # select_boot_kernel = true  # oneshot next boot to this stage's kernel (bootctl / grub-reboot); does not change the default
 # reboot_before_start = false  # reboot into the current kernel before the first comparison (same cold-boot as later stages)
+# shutdown_after_finish = false  # power off the PC after the pipeline completes (not on abort)
 # reuse_afdo_profile = false  # skip AutoFDO collection when a suitable archived profile exists
 # reuse_propeller_profile = false  # skip Propeller collection when suitable archived profiles exist
 # skip_propeller = false  # stop after AutoFDO (no Propeller collect/compile); that kernel is production
 # Comparison charts: {profiles_archive_dir}/compare-benchmarks.
-# Checkboxes are no-perf kbench runs. Profiling (with perf) still feeds with-overhead charts
-# whenever any comparison is on. Every scored clean run drops page cache (echo 3) and CPU-warms first.
+# Checkboxes are no-perf scored runs (workload = compare_preset). Profiling (with perf)
+# still feeds with-overhead charts whenever any comparison is on. Every scored clean run
+# drops page cache (echo 3) and CPU-warms first.
 # compare_current = false   # kernel already booted, before the debug PGO build
 # compare_debug_clean = false  # debug kernel, no perf
 # compare_autofdo_clean = false  # AutoFDO kernel, no perf

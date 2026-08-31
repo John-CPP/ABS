@@ -3,8 +3,9 @@
 //! Auto-restart installs `/etc/sudoers.d/abs-pgo-<uid>` so this user may run
 //! `abs --pgo-priv -- CMD…` without a password. The helper (this module) is the
 //! only NOPASSWD target; it rejects anything outside a PGO-oriented allowlist.
-//! The drop-in is removed when no auto-resume unit remains (pipeline done or abort
-//! via `remove_pgo_auto_resume_service`, or `--purge`). Unrelated abs commands
+//! The drop-in is removed when no auto-resume unit remains (pipeline done or abort),
+//! after ramdisk/zram teardown so passwordless sudo still works for that cleanup, on
+//! poweroff after `shutdown_after_finish`, or via `--purge`. Unrelated abs commands
 //! such as `-R` must not touch it.
 
 use crate::blog;
@@ -190,7 +191,8 @@ pub fn install_dropin() -> Result<(), String> {
 }
 
 /// Remove the drop-in when no `abs-pgo@` auto-resume unit is still enabled.
-/// Call from PGO auto-resume teardown only — not from generic process exit.
+/// Call after ramdisk/zram teardown on the PGO CLI path — not from generic process
+/// exit, and not while the completing resume still needs passwordless sudo.
 pub fn maybe_remove_dropin() {
     if resume_unit_enabled() {
         return;
@@ -272,6 +274,9 @@ fn run_validated(args: &[String]) -> Result<i32, String> {
     let parsed = validate_priv_argv(args)?;
     if parsed.argv.is_empty() {
         return Ok(0);
+    }
+    if parsed.user.is_none() && is_poweroff_argv(&parsed.argv) {
+        return run_privileged_poweroff();
     }
     let mut command = Command::new(&parsed.argv[0]);
     command.args(&parsed.argv[1..]);
@@ -389,6 +394,7 @@ fn validate_command(argv: &[String]) -> Result<(), String> {
         "bootctl" => validate_bootctl(&argv[1..]),
         "systemctl" => validate_systemctl(&argv[1..]),
         "reboot" => validate_reboot(&argv[1..]),
+        "poweroff" => validate_reboot(&argv[1..]),
         "grub-reboot" | "grub2-reboot" => validate_grub_reboot(&argv[1..]),
         "modprobe" => validate_modprobe(&argv[1..]),
         "zramctl" => validate_zramctl(&argv[1..]),
@@ -717,19 +723,60 @@ fn validate_bootctl(args: &[String]) -> Result<(), String> {
 }
 
 fn validate_systemctl(args: &[String]) -> Result<(), String> {
-    if args.first().map(String::as_str) != Some("reboot") {
-        return Err("abs --pgo-priv only allows `systemctl reboot`".into());
-    }
-    for a in &args[1..] {
-        if let Some(id) = a.strip_prefix("--boot-loader-entry=") {
-            if !boot_id_ok(id) {
-                return Err(format!("abs --pgo-priv rejected boot entry {id}"));
+    match args.first().map(String::as_str) {
+        Some("reboot") => {
+            for a in &args[1..] {
+                if let Some(id) = a.strip_prefix("--boot-loader-entry=") {
+                    if !boot_id_ok(id) {
+                        return Err(format!("abs --pgo-priv rejected boot entry {id}"));
+                    }
+                    continue;
+                }
+                return Err(format!("abs --pgo-priv rejected systemctl flag {a}"));
             }
-            continue;
+            Ok(())
         }
-        return Err(format!("abs --pgo-priv rejected systemctl flag {a}"));
+        Some("poweroff") if args.len() == 1 => Ok(()),
+        _ => Err("abs --pgo-priv only allows `systemctl reboot` or `systemctl poweroff`".into()),
     }
-    Ok(())
+}
+
+fn is_poweroff_argv(argv: &[String]) -> bool {
+    match argv {
+        [cmd, action] if cmd == "systemctl" && action == "poweroff" => true,
+        [cmd] if cmd == "poweroff" => true,
+        _ => false,
+    }
+}
+
+/// Remove the auto-resume sudoers drop-in, then power off. One root invocation so
+/// unattended PGO can halt after the helper is gone.
+fn run_privileged_poweroff() -> Result<i32, String> {
+    let dest = sudoers_dropin_path(invoking_uid());
+    match std::fs::remove_file(&dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("==> WARNING: could not remove {}: {e}", dest.display());
+        }
+    }
+    let status = Command::new("systemctl")
+        .arg("poweroff")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to execute systemctl poweroff: {e}"))?;
+    if status.success() {
+        return Ok(0);
+    }
+    let fallback = Command::new("poweroff")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to execute poweroff: {e}"))?;
+    Ok(fallback.code().unwrap_or(1))
 }
 
 fn validate_reboot(args: &[String]) -> Result<(), String> {
@@ -1299,6 +1346,17 @@ mod tests {
         v(&["systemctl", "reboot", "--boot-loader-entry=linux-cachyos"]).unwrap();
         v(&["reboot"]).unwrap();
         v(&["grub-reboot", "1"]).unwrap();
+        v(&["systemctl", "poweroff"]).unwrap();
+        v(&["poweroff"]).unwrap();
+        assert!(v(&["systemctl", "halt"]).is_err());
+        assert!(v(&["systemctl", "poweroff", "--firmware-setup"]).is_err());
+    }
+
+    #[test]
+    fn poweroff_argv_matches_systemctl_and_bare_poweroff() {
+        assert!(is_poweroff_argv(&["systemctl".into(), "poweroff".into()]));
+        assert!(is_poweroff_argv(&["poweroff".into()]));
+        assert!(!is_poweroff_argv(&["systemctl".into(), "reboot".into()]));
     }
 
     #[test]
@@ -1511,8 +1569,13 @@ mod tests {
             .unwrap_or(rest.len());
         let body = &rest[..body_end];
         assert!(
-            body.contains("maybe_remove_dropin") || body.contains("remove_dropin"),
-            "remove_pgo_auto_resume_service must drop the sudoers helper when no resume unit remains"
+            !body.contains("maybe_remove_dropin") && !body.contains("remove_dropin"),
+            "dropping sudoers while the resume process is still exiting breaks zram teardown: {body}"
+        );
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("pgo_priv::maybe_remove_dropin"),
+            "PGO CLI must drop /etc/sudoers.d/abs-pgo-* after ramdisk/zram shutdown, when no resume unit remains"
         );
     }
 }

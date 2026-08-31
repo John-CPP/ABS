@@ -356,7 +356,7 @@ pub fn compare_index_html(
   :root {{ color-scheme: dark light; }}
   body {{
     font-family: ui-sans-serif, system-ui, sans-serif;
-    max-width: 960px;
+    max-width: 1080px;
     margin: 2rem auto;
     padding: 0 1.25rem 3rem;
     line-height: 1.5;
@@ -377,19 +377,30 @@ pub fn compare_index_html(
   table.winners th, table.winners td {{ text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #3a4550; }}
   table.winners th {{ font-size: 0.85rem; color: #8b98a5; }}
   .winner-note {{ color: #8b98a5; font-size: 0.9rem; }}
+  .callout {{
+    border: 1px solid #8a6d3b;
+    background: rgba(138, 109, 59, 0.12);
+    border-radius: 8px;
+    padding: 0.8rem 1rem;
+    margin: 1rem 0;
+  }}
+  .callout strong {{ display: block; margin-bottom: 0.25rem; }}
 </style>
 </head>
 <body>
 <h1>ABS PGO kernel comparison</h1>
-<p class="lead">Two chart sets from the same pipeline. The chart below is per-test:
-bar length is performance relative to stock (<code>1_current</code>); longer is
-better. Captions show the raw score and % vs stock. Debug and AutoFDO collection
+<p class="lead">Two chart sets from the same pipeline. Bar length is performance:
+<strong>longer is better</strong>. The first number on each bar is the raw
+measurement. Latency captions say lower/higher microseconds vs stock — a long
+bar next to a <em>small</em> µs value is the win. The last group is geomean
+vs stock (<code>1_current</code>). Debug and AutoFDO collection
 runs sample under <code>perf record</code>; extra clean checkboxes add matching
 scores without that overhead.</p>
 <section>
   <h2>Without overhead</h2>
   <p>Fair kernel-to-kernel comparison: only runs that did <em>not</em> record
-  with perf. Missing debug/AutoFDO clean logs mean those stages were not
+  with perf. Total score is golf (lower pts is better), matching Total time.
+  Missing debug/AutoFDO clean logs mean those stages were not
   requested.</p>
   <ul>
 {without}  </ul>
@@ -444,8 +455,9 @@ mod tests {
         assert!(BENCHMARK_SCRIPT.contains("kbench) run_kbench"));
         assert!(BENCHMARK_SCRIPT.contains("collect_kernel_metrics"));
         assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_COMPARE_LABEL"));
-        assert!(!BENCHMARK_SCRIPT.contains("kbench+cachyos)"));
-        assert!(!BENCHMARK_SCRIPT.contains("append_kernel_metrics_to_latest_benchie"));
+        assert!(BENCHMARK_SCRIPT.contains("kbench+cachyos) run_kbench_plus_cachyos"));
+        assert!(BENCHMARK_SCRIPT.contains("append_kernel_metrics_to_latest_benchie"));
+        assert!(BENCHMARK_SCRIPT.contains("cachyos|full) run_cachyos_benchmarker"));
     }
 
     /// Collect just the `SNG_*=( ... )` array bodies, so a stressor named in the
@@ -620,6 +632,46 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_cachyos_compare_does_not_need_the_binary() {
+        let dir = unique_temp_dir("abs-pgo-cachyos-dry");
+        let workdir = dir.join("wd");
+        fs::create_dir_all(&workdir).unwrap();
+        let script = dir.join("pgo-benchmark.sh");
+        fs::write(&script, BENCHMARK_SCRIPT).unwrap();
+        chmod_755(&script);
+
+        for mode in ["cachyos", "kbench+cachyos"] {
+            let out = std::process::Command::new("bash")
+                .arg(&script)
+                .env("ABS_PGO_DRY_RUN", "1")
+                .env("ABS_PGO_BENCHMARK", mode)
+                .env("ABS_PGO_BENCHMARK_DIR", &workdir)
+                .env("ABS_PGO_PROFILE_DIR", &workdir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{mode} status={:?} stdout={stdout} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                stdout.contains("[dry run] cachyos-benchmarker"),
+                "{mode} missing cachyos dry-run line: {stdout}"
+            );
+            if mode == "kbench+cachyos" {
+                assert!(
+                    stdout.contains("append kbench metrics"),
+                    "{mode} missing kbench append dry-run: {stdout}"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn embedded_benchmark_has_shebang() {
         assert!(BENCHMARK_SCRIPT.starts_with("#!/"));
@@ -627,12 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn embedded_benchmark_rejects_userspace_presets() {
+    fn embedded_benchmark_rejects_userspace_training_presets() {
         assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_BENCHMARK"));
         assert!(!BENCHMARK_SCRIPT.contains("run_fast_benchmark"));
         assert!(!BENCHMARK_SCRIPT.contains("fast) run_fast_benchmark"));
-        assert!(!BENCHMARK_SCRIPT.contains("run_cachyos_benchmarker"));
-        assert!(!BENCHMARK_SCRIPT.contains("cachyos|full)"));
+        assert!(BENCHMARK_SCRIPT.contains("run_cachyos_benchmarker"));
+        assert!(BENCHMARK_SCRIPT.contains("cachyos|full)"));
+        assert!(BENCHMARK_SCRIPT.contains("kernel|\"\") run_kernel_benchmark"));
     }
 
     #[test]
@@ -757,7 +810,7 @@ mod tests {
             true,
             &["1_current", "4_final"],
             &["1_current", "2_debug_perf", "4_final"],
-            "<table class=\"winners\"><thead><tr><th>Test</th><th>Winner</th><th>vs stock</th></tr></thead></table>",
+            "<table class=\"winners\"><thead><tr><th>Test</th><th>1st</th><th>2nd</th><th>3rd</th></tr></thead></table>",
             "",
         );
         assert!(html.contains("without-overhead"));
@@ -778,10 +831,11 @@ mod tests {
             "index must lead with the per-test comparison, not the per-kernel dump"
         );
         assert!(
-            html.contains("<th>Winner</th>"),
-            "index must include the winner vs stock table:\n{html}"
+            html.contains("<th>1st</th>"),
+            "index must include the ranking table:\n{html}"
         );
-        assert!(html.contains("vs stock"), "{html}");
+        assert!(html.contains("<th>2nd</th>"), "{html}");
+        assert!(html.contains("<th>3rd</th>"), "{html}");
     }
 
     #[cfg(unix)]
@@ -815,10 +869,10 @@ mod tests {
             "ABS must not exec python"
         );
         assert!(
-            !BENCHMARK_SCRIPT.contains("cat > \"${bindir}/cachyos-benchmarker\""),
-            "cachyos-benchmarker wrapper must be gone"
+            BENCHMARK_SCRIPT.contains("install_skip_scraper_wrapper"),
+            "cachyos-benchmarker wrapper must skip matplotlib scraper"
         );
-        assert!(!BENCHMARK_SCRIPT.contains("find_real_cachyos_benchmarker"));
+        assert!(BENCHMARK_SCRIPT.contains("find_real_cachyos_benchmarker"));
     }
 
     #[test]
@@ -834,9 +888,13 @@ mod tests {
         assert!(cmd.contains("ABS_PGO_PROFILE='sweet'"), "{cmd}");
         assert!(cmd.contains("ABS_PGO_COMPARE_LABEL="), "{cmd}");
         assert!(cmd.contains("pgo-benchmark.sh"), "{cmd}");
-        assert!(
-            !cmd.contains("| cachyos-benchmarker"),
-            "compare must not invoke cachyos-benchmarker: {cmd}"
+        let cachyos = standalone_compare_command(
+            Path::new("/tmp/wd"),
+            "abs-current",
+            Path::new("/tmp/pgo-benchmark.sh"),
+            "cachyos",
+            "sweet",
         );
+        assert!(cachyos.contains("ABS_PGO_BENCHMARK='cachyos'"), "{cachyos}");
     }
 }
