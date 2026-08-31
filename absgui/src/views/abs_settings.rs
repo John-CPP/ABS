@@ -13,6 +13,7 @@ use iced::{Alignment, Element, Length};
 const ENV_OPTS: &[&str] = &["local", "chroot"];
 const CPU_THREADS_MODE_OPTS: &[&str] = &["strict", "flexible"];
 const RAMDISK_MODE_OPTS: &[&str] = &["0755", "0775", "0700"];
+const ZRAM_OPTS: &[&str] = &["off", "full"];
 
 pub fn view<'a>(
     config: &'a ConfigDocument,
@@ -353,6 +354,21 @@ pub fn view<'a>(
                 Message::SysUpdateNoRefreshCmd,
             ),
             field_text(
+                "auto_refresh_delay",
+                Some(field_help::sys_auto_refresh_delay()),
+                &config.system_update.auto_refresh_delay.to_string(),
+                "0",
+                app_theme,
+                Message::SysUpdateAutoRefreshDelay,
+            ),
+            field_checkbox(
+                "remember_sudo",
+                Some(field_help::sys_remember_sudo()),
+                config.system_update.remember_sudo,
+                app_theme,
+                Message::SysUpdateRememberSudo,
+            ),
+            field_text(
                 "ignore_flag",
                 Some(field_help::sys_ignore_flag()),
                 &config.system_update.ignore_flag,
@@ -456,6 +472,14 @@ pub fn view<'a>(
                 config.ramdisk.sync_chroot_on_exit,
                 app_theme,
                 Message::RamdiskSyncOnExit,
+            ),
+            field_pick(
+                "zram",
+                Some(field_help::ramdisk_zram()),
+                ZRAM_OPTS,
+                &config.ramdisk.zram,
+                app_theme,
+                Message::RamdiskZram,
             ),
             row![
                 field_number(

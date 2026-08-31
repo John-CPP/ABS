@@ -1078,6 +1078,13 @@ pub fn process_package(
     if let Err(e) = ramdisk::ensure_for_targets(config, &ramdisk_targets) {
         die!("Ramdisk setup failed for {}: {}", pkg, e);
     }
+    crate::zram::require_headroom(
+        "package compile",
+        config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+        config
+            .zram_mode_for(pkg_config)
+            .unwrap_or_else(|e| die!("{e}")),
+    );
     ramdisk::warn_if_packages_on_ram(config, pkg, &ramdisk_targets);
     let packages_path = ramdisk::download_packages_path(config, &ramdisk_targets);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
@@ -1949,7 +1956,7 @@ default_environment = "local"
 ignore_already_made_packages = {global}
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
+command_to_update_repositories = "pacman -Sy"
 command_to_perform_system_update = "pacman -Syu"
 ignore_flag = "--ignore"
 ignore_packages = []

@@ -186,25 +186,35 @@ pub fn relabel_compare_log(text: &str, stage: &str, uname: &str) -> String {
     out
 }
 
-/// File name prefix used by cachyos-benchmarker: `benchie_<label>_<date>.log`.
+/// File name prefix for comparison logs: `benchie_<label>_<date>.log`.
 pub fn compare_run_label(stage: &str) -> String {
     format!("abs-{stage}")
 }
 
-/// Fast sysbench/stress-ng warm-up before a standalone (no-perf) comparison.
+/// CPU-only warm-up before a scored comparison so turbo is up and page cache stays cold.
 pub fn warmup_compare_command(workdir: &Path, script: &Path) -> String {
     let dir = crate::utils::sh_single_quote(&workdir.to_string_lossy());
     format!(
-        "env ABS_PGO_PROFILE_DIR={dir} ABS_PGO_BENCHMARK_DIR={dir} ABS_PGO_BENCHMARK=fast {runner}",
+        "env ABS_PGO_PROFILE_DIR={dir} ABS_PGO_BENCHMARK_DIR={dir} ABS_PGO_BENCHMARK=warmup {runner}",
         runner = shell_benchmark_runner(script),
     )
 }
 
 /// Clean comparison run: same bundled script as profiling so PATH wrappers apply.
-pub fn standalone_compare_command(workdir: &Path, label: &str, script: &Path) -> String {
+/// `preset` is the scoring workload; `profile` is short|sweet|long (kbench length).
+pub fn standalone_compare_command(
+    workdir: &Path,
+    label: &str,
+    script: &Path,
+    preset: &str,
+    profile: &str,
+) -> String {
     let dir = crate::utils::sh_single_quote(&workdir.to_string_lossy());
     format!(
-        "env ABS_PGO_PROFILE_DIR={dir} ABS_PGO_BENCHMARK_DIR={dir} ABS_PGO_BENCHMARK=cachyos ABS_PGO_COMPARE_LABEL={label} {runner}",
+        "env ABS_PGO_PROFILE_DIR={dir} ABS_PGO_BENCHMARK_DIR={dir} ABS_PGO_BENCHMARK={preset} \
+         ABS_PGO_PROFILE={profile} ABS_PGO_COMPARE_LABEL={label} {runner}",
+        preset = crate::utils::sh_single_quote(preset),
+        profile = crate::utils::sh_single_quote(profile),
         label = crate::utils::sh_single_quote(label),
         runner = shell_benchmark_runner(script),
     )
@@ -279,6 +289,8 @@ pub fn compare_index_html(
     has_overhead: bool,
     without_tokens: &[&str],
     with_tokens: &[&str],
+    without_table: &str,
+    with_table: &str,
 ) -> String {
     fn series_list(tokens: &[&str]) -> String {
         if tokens.is_empty() {
@@ -310,15 +322,17 @@ pub fn compare_index_html(
   profiling-pass cost and the full pipeline.</p>
   <ul>
 {series}  </ul>
+  {table}
   <p class="charts">
-    <a href="with-overhead/categorized_comparison_All.svg">Categorized comparison</a>
-    · <a href="with-overhead/kernel_version_comparison_All.svg">Kernel comparison</a>
+    <a href="with-overhead/kernel_version_comparison_All.svg">Kernel comparison</a>
+    · <a href="with-overhead/categorized_comparison_All.svg">Categorized comparison</a>
     · <a href="with-overhead/test_performance.html">Per-test table</a>
   </p>
-  <p><img src="with-overhead/categorized_comparison_All.svg" alt="With-overhead categorized comparison"></p>
+  <p><img src="with-overhead/kernel_version_comparison_All.svg" alt="With-overhead kernel comparison"></p>
 </section>
 "#,
-            series = series_list(with_tokens)
+            series = series_list(with_tokens),
+            table = with_table
         )
     } else {
         r#"<section>
@@ -359,14 +373,19 @@ pub fn compare_index_html(
   code {{ font-size: 0.92em; }}
   img {{ max-width: 100%; height: auto; border-radius: 6px; margin-top: 0.75rem; }}
   .charts a {{ margin-right: 0.4rem; }}
+  table.winners {{ width: 100%; border-collapse: collapse; margin: 0.75rem 0 0.25rem; }}
+  table.winners th, table.winners td {{ text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #3a4550; }}
+  table.winners th {{ font-size: 0.85rem; color: #8b98a5; }}
+  .winner-note {{ color: #8b98a5; font-size: 0.9rem; }}
 </style>
 </head>
 <body>
 <h1>ABS PGO kernel comparison</h1>
-<p class="lead">Two chart sets from the same pipeline. Debug and AutoFDO
-collection runs sample under <code>perf record</code>; extra clean checkboxes
-add matching scores without that overhead. Stock and final runs are always
-clean.</p>
+<p class="lead">Two chart sets from the same pipeline. The chart below is per-test:
+bar length is performance relative to stock (<code>1_current</code>); longer is
+better. Captions show the raw score and % vs stock. Debug and AutoFDO collection
+runs sample under <code>perf record</code>; extra clean checkboxes add matching
+scores without that overhead.</p>
 <section>
   <h2>Without overhead</h2>
   <p>Fair kernel-to-kernel comparison: only runs that did <em>not</em> record
@@ -374,18 +393,20 @@ clean.</p>
   requested.</p>
   <ul>
 {without}  </ul>
+  {without_table}
   <p class="charts">
-    <a href="without-overhead/categorized_comparison_All.svg">Categorized comparison</a>
-    · <a href="without-overhead/kernel_version_comparison_All.svg">Kernel comparison</a>
+    <a href="without-overhead/kernel_version_comparison_All.svg">Kernel comparison</a>
+    · <a href="without-overhead/categorized_comparison_All.svg">Categorized comparison</a>
     · <a href="without-overhead/test_performance.html">Per-test table</a>
   </p>
-  <p><img src="without-overhead/categorized_comparison_All.svg" alt="Without-overhead categorized comparison"></p>
+  <p><img src="without-overhead/kernel_version_comparison_All.svg" alt="Without-overhead kernel comparison"></p>
 </section>
 {overhead}
 </body>
 </html>
 "#,
         without = series_list(without_tokens),
+        without_table = without_table,
         overhead = overhead_section
     )
 }
@@ -395,28 +416,230 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_benchmark_has_cpu_warmup_mode() {
+        assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_BENCHMARK=warmup"));
+        assert!(BENCHMARK_SCRIPT.contains("warmup) run_cpu_warmup"));
+        assert!(BENCHMARK_SCRIPT.contains("run_cpu_warmup"));
+        assert!(!BENCHMARK_SCRIPT.contains("Skipping warm-up"));
+    }
+
+    /// perf samples kernel branches only, so the training workload must drive kernel
+    /// code. A userspace-bound default leaves the syscall/VFS/net surface unsampled,
+    /// which AutoFDO then treats as cold.
+    #[test]
+    fn embedded_benchmark_defaults_to_kernel_training_workload() {
+        assert!(BENCHMARK_SCRIPT.contains("MODE=\"${ABS_PGO_BENCHMARK:-kernel}\""));
+        assert!(BENCHMARK_SCRIPT.contains("kernel|\"\") run_kernel_benchmark"));
+        assert!(BENCHMARK_SCRIPT.contains("run_kernel_benchmark"));
+        assert!(BENCHMARK_SCRIPT.contains("kernel_profile_budget"));
+        assert!(BENCHMARK_SCRIPT.contains("short|quick) echo 600"));
+        assert!(BENCHMARK_SCRIPT.contains("echo 1200"));
+        assert!(BENCHMARK_SCRIPT.contains("KERNEL_TRAIN_CAP_SECS=3600"));
+        assert!(BENCHMARK_SCRIPT.contains("short|quick) secs=8"));
+        assert!(BENCHMARK_SCRIPT.contains("secs=12"));
+    }
+
+    #[test]
+    fn embedded_benchmark_has_kernel_scoring_mode() {
+        assert!(BENCHMARK_SCRIPT.contains("kbench) run_kbench"));
+        assert!(BENCHMARK_SCRIPT.contains("collect_kernel_metrics"));
+        assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_COMPARE_LABEL"));
+        assert!(!BENCHMARK_SCRIPT.contains("kbench+cachyos)"));
+        assert!(!BENCHMARK_SCRIPT.contains("append_kernel_metrics_to_latest_benchie"));
+    }
+
+    /// Collect just the `SNG_*=( ... )` array bodies, so a stressor named in the
+    /// surrounding prose does not read as one that actually runs.
+    fn stressor_list_body(script: &str) -> String {
+        let mut out = String::new();
+        let mut in_list = false;
+        for line in script.lines() {
+            if !in_list && line.starts_with("SNG_") && line.contains("=(") {
+                in_list = true;
+            }
+            if in_list {
+                out.push_str(line);
+                out.push('\n');
+                if line.trim_end().ends_with(')') {
+                    in_list = false;
+                }
+            }
+        }
+        out
+    }
+
+    /// stress-ng forks workers per stressor, so batching is what keeps a full
+    /// stressor list from spawning hundreds of tasks and livelocking the machine.
+    #[test]
+    fn embedded_benchmark_bounds_stressor_concurrency() {
+        assert!(BENCHMARK_SCRIPT.contains("SNG_BATCH"));
+        assert!(BENCHMARK_SCRIPT.contains("SNG_WORKER_CAP"));
+        assert!(BENCHMARK_SCRIPT.contains("nice -n \"${SNG_NICE}\""));
+
+        let lists = stressor_list_body(BENCHMARK_SCRIPT);
+        assert!(lists.contains("SNG_SYSCALL=("), "stressor lists not found");
+        assert!(lists.contains("switch"), "sched stressors missing");
+        assert!(lists.contains("stat"), "VFS metadata stressors missing");
+        assert!(lists.contains("mprotect"), "mm mprotect missing");
+        assert!(lists.contains("dup"), "syscall dup missing");
+        assert!(lists.contains("eventfd"), "ipc eventfd missing");
+        assert!(
+            BENCHMARK_SCRIPT.contains("composite_compile_loop"),
+            "sweet/long composite must exec a real compiler, not only tar/fio"
+        );
+        for dangerous in [
+            "tlb-shootdown",
+            "loadavg",
+            "forkheavy",
+            "sockmany",
+            "epollmany",
+            "dirmany",
+            "malloc",
+            "resources",
+            "schedmix",
+            "zombie",
+            "daemon",
+        ] {
+            assert!(
+                !lists.contains(dangerous),
+                "{dangerous} destabilises an interactive system"
+            );
+        }
+    }
+
+    /// sockpair/udp at nproc/2 fills unreclaimable kernel skbuffs (not process RSS)
+    /// until the OOM killer fires. Cap those workers and ask stress-ng to back off.
+    #[test]
+    fn embedded_benchmark_caps_socket_workers_to_avoid_skbuff_oom() {
+        assert!(
+            BENCHMARK_SCRIPT.contains("SNG_NET_WORKERS"),
+            "ipc-net/kbench socket workers need an explicit cap"
+        );
+        assert!(
+            !BENCHMARK_SCRIPT.contains("kb_sng \"unix socket (Kops/s)\" sockpair \"${half}\""),
+            "kbench sockpair must not run nproc/2 workers"
+        );
+        assert!(
+            !BENCHMARK_SCRIPT.contains("kb_sng \"udp loopback (Kops/s)\" udp \"${half}\""),
+            "kbench udp must not run nproc/2 workers"
+        );
+        assert!(
+            !BENCHMARK_SCRIPT
+                .contains("sng_group ipc-net \"$((sng_budget * 20 / 100))\" \"${half}\""),
+            "training ipc-net must not use nproc/2 workers"
+        );
+        assert!(
+            BENCHMARK_SCRIPT.contains("--oom-avoid"),
+            "stress-ng must stop before kernel slab exhausts RAM"
+        );
+        assert!(
+            BENCHMARK_SCRIPT.contains(
+                "sng_group ipc-net \"$((sng_budget * 20 / 100))\" \"${SNG_NET_WORKERS}\""
+            ),
+            "training ipc-net must use SNG_NET_WORKERS"
+        );
+        assert!(
+            BENCHMARK_SCRIPT.contains("kb_sng \"unix socket (Kops/s)\" sockpair \"${net}\""),
+            "kbench sockpair must use the net worker cap"
+        );
+    }
+
+    #[test]
+    fn embedded_benchmark_supports_dry_run() {
+        assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_DRY_RUN"));
+        assert!(BENCHMARK_SCRIPT.contains("DRY RUN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_short_sweet_long_print_expected_budgets() {
+        let dir = unique_temp_dir("abs-pgo-profiles");
+        let workdir = dir.join("wd");
+        fs::create_dir_all(&workdir).unwrap();
+        let script = dir.join("pgo-benchmark.sh");
+        fs::write(&script, BENCHMARK_SCRIPT).unwrap();
+        chmod_755(&script);
+
+        for (profile, train, kbench) in [
+            ("short", "budget 600s", "8s × 1 run(s)"),
+            ("sweet", "budget 1200s", "8s × 3 run(s)"),
+            ("long", "budget 3600s", "12s × 3 run(s)"),
+        ] {
+            let train_out = std::process::Command::new("bash")
+                .arg(&script)
+                .env("ABS_PGO_DRY_RUN", "1")
+                .env("ABS_PGO_BENCHMARK", "kernel")
+                .env("ABS_PGO_PROFILE", profile)
+                .env("ABS_PGO_BENCHMARK_DIR", &workdir)
+                .env("ABS_PGO_PROFILE_DIR", &workdir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&train_out.stdout);
+            assert!(
+                train_out.status.success(),
+                "{profile} train status={:?} stdout={stdout} stderr={}",
+                train_out.status,
+                String::from_utf8_lossy(&train_out.stderr)
+            );
+            assert!(
+                stdout.contains(train),
+                "{profile} train missing {train}: {stdout}"
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|l| l.contains("kernel group ipc-net:") && l.contains("x 1 workers")),
+                "{profile} ipc-net must stay at 1 worker per stressor (skbuff cap): {stdout}"
+            );
+
+            let score_out = std::process::Command::new("bash")
+                .arg(&script)
+                .env("ABS_PGO_DRY_RUN", "1")
+                .env("ABS_PGO_BENCHMARK", "kbench")
+                .env("ABS_PGO_PROFILE", profile)
+                .env("ABS_PGO_BENCHMARK_DIR", &workdir)
+                .env("ABS_PGO_PROFILE_DIR", &workdir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&score_out.stdout);
+            assert!(
+                score_out.status.success(),
+                "{profile} kbench status={:?} stdout={stdout} stderr={}",
+                score_out.status,
+                String::from_utf8_lossy(&score_out.stderr)
+            );
+            assert!(
+                stdout.contains(kbench),
+                "{profile} kbench missing {kbench}: {stdout}"
+            );
+            assert!(
+                stdout.contains("sockpair/udp workers: 4"),
+                "{profile} kbench must cap sockpair/udp workers: {stdout}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn embedded_benchmark_has_shebang() {
         assert!(BENCHMARK_SCRIPT.starts_with("#!/"));
         assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_PROFILE_DIR"));
     }
 
     #[test]
-    fn embedded_benchmark_defaults_to_fast_mode() {
+    fn embedded_benchmark_rejects_userspace_presets() {
         assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_BENCHMARK"));
-        assert!(BENCHMARK_SCRIPT.contains("run_fast_benchmark"));
-        assert!(BENCHMARK_SCRIPT.contains("fast|\"\") run_fast_benchmark"));
+        assert!(!BENCHMARK_SCRIPT.contains("run_fast_benchmark"));
+        assert!(!BENCHMARK_SCRIPT.contains("fast) run_fast_benchmark"));
+        assert!(!BENCHMARK_SCRIPT.contains("run_cachyos_benchmarker"));
+        assert!(!BENCHMARK_SCRIPT.contains("cachyos|full)"));
     }
 
     #[test]
-    fn embedded_benchmark_cachyos_is_opt_in() {
-        assert!(BENCHMARK_SCRIPT.contains("cachyos|full) run_cachyos_benchmarker"));
-    }
-
-    #[test]
-    fn resolve_uses_embedded_fast_benchmark() {
+    fn resolve_uses_embedded_benchmark() {
         let path = resolve_benchmark_command(&None).unwrap();
         let body = fs::read_to_string(&path).unwrap();
-        assert!(body.contains("run_fast_benchmark"));
+        assert!(body.contains("run_kernel_benchmark"));
         assert!(body.contains("ABS_PGO_BENCHMARK"));
     }
 
@@ -448,10 +671,11 @@ mod tests {
     }
 
     #[test]
-    fn warmup_compare_command_uses_fast_preset() {
+    fn warmup_compare_command_uses_cpu_only_preset() {
         let cmd =
             warmup_compare_command(Path::new("/tmp/bench"), Path::new("/tmp/pgo-benchmark.sh"));
-        assert!(cmd.contains("ABS_PGO_BENCHMARK=fast"), "{cmd}");
+        assert!(cmd.contains("ABS_PGO_BENCHMARK=warmup"), "{cmd}");
+        assert!(!cmd.contains("ABS_PGO_BENCHMARK=fast"), "{cmd}");
         assert!(!cmd.contains("ABS_PGO_BENCHMARK=cachyos"), "{cmd}");
         assert!(!cmd.contains("ABS_PGO_COMPARE_LABEL"), "{cmd}");
     }
@@ -533,13 +757,31 @@ mod tests {
             true,
             &["1_current", "4_final"],
             &["1_current", "2_debug_perf", "4_final"],
+            "<table class=\"winners\"><thead><tr><th>Test</th><th>Winner</th><th>vs stock</th></tr></thead></table>",
+            "",
         );
         assert!(html.contains("without-overhead"));
         assert!(html.contains("with-overhead"));
         assert!(html.contains("2_debug_perf"));
         assert!(html.contains("perf record"));
         assert!(html.contains("categorized_comparison_All.svg"));
+        assert!(html.contains("kernel_version_comparison_All.svg"));
         assert!(!html.contains("categorized_comparison_All.png"));
+        let without_img = html
+            .split("<h2>Without overhead</h2>")
+            .nth(1)
+            .and_then(|s| s.split("<img src=\"").nth(1))
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("");
+        assert_eq!(
+            without_img, "without-overhead/kernel_version_comparison_All.svg",
+            "index must lead with the per-test comparison, not the per-kernel dump"
+        );
+        assert!(
+            html.contains("<th>Winner</th>"),
+            "index must include the winner vs stock table:\n{html}"
+        );
+        assert!(html.contains("vs stock"), "{html}");
     }
 
     #[cfg(unix)]
@@ -562,130 +804,6 @@ mod tests {
         dir
     }
 
-    /// Persistent PGO workdirs keep `.abs-bin/cachyos-benchmarker` from the last run.
-    /// The wget wrapper prepends that directory to PATH, so lookup must skip the leftover
-    /// shim instead of treating it as the real CachyOS script.
-    #[cfg(unix)]
-    #[test]
-    fn leftover_abs_shim_does_not_block_cachyos_mode() {
-        let dir = unique_temp_dir("abs-cb-leftover");
-        let workdir = dir.join("wd");
-        let bindir = workdir.join(".abs-bin");
-        fs::create_dir_all(&bindir).unwrap();
-        let leftover = bindir.join("cachyos-benchmarker");
-        fs::write(
-            &leftover,
-            "#!/usr/bin/env bash\necho leftover-shim\nexit 0\n",
-        )
-        .unwrap();
-        chmod_755(&leftover);
-
-        let realdir = dir.join("realbin");
-        fs::create_dir_all(&realdir).unwrap();
-        let real = realdir.join("cachyos-benchmarker");
-        fs::write(&real, "#!/usr/bin/env bash\necho fake-real-ran\nexit 0\n").unwrap();
-        chmod_755(&real);
-
-        let script = dir.join("pgo-benchmark.sh");
-        fs::write(&script, BENCHMARK_SCRIPT).unwrap();
-        chmod_755(&script);
-
-        let path = format!("{}:/usr/bin:/bin", realdir.display());
-        let out = std::process::Command::new("bash")
-            .arg(&script)
-            .env("ABS_PGO_BENCHMARK", "cachyos")
-            .env("ABS_PGO_BENCHMARK_DIR", &workdir)
-            .env("ABS_PGO_PROFILE_DIR", &workdir)
-            .env("PATH", path)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "status={:?} stdout={stdout} stderr={stderr}",
-            out.status
-        );
-        assert!(
-            !stderr.contains("refusing to wrap the ABS cachyos-benchmarker shim"),
-            "stderr={stderr}"
-        );
-        assert!(stdout.contains("fake-real-ran"), "{stdout}");
-        assert!(!stdout.contains("leftover-shim"), "{stdout}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn skip_scraper_wrapper_patches_cachyos_benchmarker_not_python() {
-        let start = BENCHMARK_SCRIPT
-            .find("cat > \"${bindir}/cachyos-benchmarker\" << 'EOF'\n")
-            .expect("cachyos-benchmarker wrapper heredoc");
-        let body = BENCHMARK_SCRIPT[start..]
-            .split_once("<< 'EOF'\n")
-            .unwrap()
-            .1
-            .split_once("\nEOF\n")
-            .unwrap()
-            .0;
-        let dir = std::env::temp_dir().join(format!(
-            "abs-cbwrap-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("cachyos-benchmarker-real");
-        fs::write(
-            &fake,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-SCRIPTDIR=$(dirname "$(readlink -f "$0")")
-echo scored
-if [[ -f "$SCRIPTDIR/benchmark_scraper.py" ]]; then
-	python "$SCRIPTDIR/benchmark_scraper.py"
-else
-	python /usr/bin/benchmark_scraper.py
-fi
-echo after-scraper
-"#,
-        )
-        .unwrap();
-        let wrap = dir.join("cachyos-benchmarker");
-        fs::write(&wrap, format!("{body}\n")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-            fs::set_permissions(&wrap, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let out = std::process::Command::new(&wrap)
-            .env("ABS_CACHYOS_BENCHMARKER_REAL", &fake)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "status={:?} stdout={stdout} stderr={stderr}",
-            out.status
-        );
-        assert!(stdout.contains("scored"), "{stdout}");
-        assert!(
-            stdout.contains("skipping CachyOS benchmark_scraper.py"),
-            "{stdout}"
-        );
-        assert!(stdout.contains("after-scraper"), "{stdout}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn embedded_benchmark_feeds_compare_label_to_cachyos_benchmarker() {
-        assert!(BENCHMARK_SCRIPT.contains("ABS_PGO_COMPARE_LABEL"));
-        assert!(BENCHMARK_SCRIPT.contains("printf '%s\\n' '' \"${label}\""));
-    }
-
     #[test]
     fn embedded_benchmark_does_not_wrap_python() {
         assert!(
@@ -696,22 +814,11 @@ echo after-scraper
             !BENCHMARK_SCRIPT.contains("exec /usr/bin/python"),
             "ABS must not exec python"
         );
-    }
-
-    #[test]
-    fn embedded_benchmark_skips_cachyos_python_scraper() {
         assert!(
-            BENCHMARK_SCRIPT.contains("cat > \"${bindir}/cachyos-benchmarker\""),
-            "wrapper must patch CachyOS's matplotlib scraper out of cachyos-benchmarker"
+            !BENCHMARK_SCRIPT.contains("cat > \"${bindir}/cachyos-benchmarker\""),
+            "cachyos-benchmarker wrapper must be gone"
         );
-        assert!(
-            BENCHMARK_SCRIPT.contains("skipping CachyOS benchmark_scraper.py"),
-            "wrapper should log that ABS charts replace the Python scraper"
-        );
-        assert!(
-            BENCHMARK_SCRIPT.contains("find_real_cachyos_benchmarker"),
-            "PATH lookup must skip a leftover ABS shim in the persistent workdir"
-        );
+        assert!(!BENCHMARK_SCRIPT.contains("find_real_cachyos_benchmarker"));
     }
 
     #[test]
@@ -720,13 +827,16 @@ echo after-scraper
             Path::new("/tmp/wd"),
             "abs-current",
             Path::new("/tmp/pgo-benchmark.sh"),
+            "kbench",
+            "sweet",
         );
-        assert!(cmd.contains("ABS_PGO_BENCHMARK=cachyos"), "{cmd}");
+        assert!(cmd.contains("ABS_PGO_BENCHMARK='kbench'"), "{cmd}");
+        assert!(cmd.contains("ABS_PGO_PROFILE='sweet'"), "{cmd}");
         assert!(cmd.contains("ABS_PGO_COMPARE_LABEL="), "{cmd}");
         assert!(cmd.contains("pgo-benchmark.sh"), "{cmd}");
         assert!(
             !cmd.contains("| cachyos-benchmarker"),
-            "direct cachyos-benchmarker skips the no-scraper wrapper: {cmd}"
+            "compare must not invoke cachyos-benchmarker: {cmd}"
         );
     }
 }

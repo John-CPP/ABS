@@ -87,6 +87,10 @@ packages = false
 sync_chroot_on_exit = false
 # Refuse to mount tmpfs when MemAvailable in /proc/meminfo is below this value (MiB).
 min_free_ram_mb = 4096
+# Temporary ABS-owned compressed swap (independent of the RAM disk).
+# full (default): max remaining RAM as the compressed-RAM cap, disksize 4× that.
+# off: do not bring up ABS zram. Used for compiles and system update, not only PGO convert.
+zram = "full"
 # Print a warning when packages = true because full-repo-on-RAM can consume many gigabytes.
 warn_packages_ram = true
 # Unmount mount_point before mounting when it is already mounted (cleans up after a crashed ABS run).
@@ -120,6 +124,12 @@ global_cpu_threads_mode = "strict"
 command_to_update_repositories = "sudo pacman -Sy"
 command_to_perform_system_update = "sudo pacman -Syu"
 command_to_perform_system_update_no_refresh = "sudo pacman -Su"
+# Minutes between automatic pending-update fetches in AbsGui. 0 = only the Refresh button
+# (first visit still loads the list). Integer or string is accepted.
+auto_refresh_delay = 0
+# true: type sudo once; AbsGui keeps it in a private runtime file until you quit.
+# false: ask on every privileged command (same as before).
+remember_sudo = false
 ignore_flag = "--ignore"
 ignore_packages = []
 
@@ -167,10 +177,24 @@ default = "arch"
 # enabled = true
 # profiles_archive_dir = "/mnt/data/abs/pgo/profiles"
 # propeller_profiles_on_ram = true  # skip HDD archive; final Propeller build is same boot
+# convert_relocate = "force"  # force | smart — move tmpfs capture to disk before convert (avoids OOM)
 # benchmark_command = "/path/to/custom-benchmark.sh"  # optional; default is bundled assets/pgo-benchmark.sh
-# profiling_quality = "maximum"  # standard | maximum (default: maximum)
+#
+# Training workload. perf samples kernel branches only (`:k`), so this decides which
+# kernel code AutoFDO and Propeller can see. Functions with no samples are treated as
+# cold: they lose inlining and move to .text.unlikely. Training is always the kernel
+# path suite (syscall, scheduler, VFS, network). Leftover fast/cachyos values are ignored.
+# kernel_workload_seconds = 0  # 0 = from profiling_quality (short 10 min, sweet 20 min, long 60 min)
+#
+# Duration profile. Training (under perf) and comparison (no perf, kbench):
+#   short  ~10 min train,  ~3 min compare
+#   sweet  ~20 min train,  ~6 min compare   (default)
+#   long   ~60 min train, ~10 min compare
+# profiling_quality = "sweet"  # short | sweet | long  (aliases: standard→sweet, maximum→long)
+#
+# Scoring is always kbench (kernel-path metrics; never under perf).
 # propeller_tool = "auto"  # generate_propeller_profiles (built if needed for LLVM 22+) or create_llvm_prof
-# perf_extra_args = "--mmap-pages 131072 -a -N -b -c 48000"  # override auto quality tuning
+# perf_extra_args = "--mmap-pages 4096 -a -N -b -c 400009"  # override auto quality; mmap-pages is per CPU
 # build_user = "builder"
 # sysctl_command = "cachyos-perf-sysctl"
 # auto_restart = false  # reboot + resume in a visible terminal until PGO completes (--pgo-auto)
@@ -178,12 +202,12 @@ default = "arch"
 # reboot_before_start = false  # reboot into the current kernel before the first comparison (same cold-boot as later stages)
 # reuse_afdo_profile = false  # skip AutoFDO collection when a suitable archived profile exists
 # reuse_propeller_profile = false  # skip Propeller collection when suitable archived profiles exist
+# skip_propeller = false  # stop after AutoFDO (no Propeller collect/compile); that kernel is production
 # Comparison charts: {profiles_archive_dir}/compare-benchmarks.
-# Checkboxes are no-perf cachyos-benchmarker runs. Profiling (with perf) still feeds with-overhead charts
-# whenever any comparison is on. A standalone clean run drops page cache and does a short fast warm-up;
-# a clean run right after profiling on the same kernel skips that.
+# Checkboxes are no-perf kbench runs. Profiling (with perf) still feeds with-overhead charts
+# whenever any comparison is on. Every scored clean run drops page cache (echo 3) and CPU-warms first.
 # compare_current = false   # kernel already booted, before the debug PGO build
 # compare_debug_clean = false  # debug kernel, no perf
 # compare_autofdo_clean = false  # AutoFDO kernel, no perf
-# compare_final = false     # Propeller kernel after the last reboot
+# compare_final = false     # last kernel after the last reboot (Propeller, or AutoFDO if skip_propeller)
 # compare_debug / compare_autofdo remain valid in old configs (with-overhead is automatic now)

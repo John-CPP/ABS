@@ -8,7 +8,7 @@
 
 pkgbase=abs
 pkgname=(abs absgui abs-full)
-pkgver=2.0.4
+pkgver=2.1.0
 pkgrel=1
 pkgdesc='Arch/CachyOS package builder with kernel PGO support'
 arch=('x86_64' 'aarch64')
@@ -37,8 +37,7 @@ optdepends_abs=(
   'llvm: AutoFDO / Propeller profile conversion'
   'cmake: build generate_propeller_profiles for LLVM 22+ kernel PGO'
   'ninja: build generate_propeller_profiles for LLVM 22+ kernel PGO'
-  'cachyos-benchmarker: bundled PGO benchmark workload'
-  'sysbench: bundled PGO benchmark workload'
+  'sysbench: bundled PGO benchmark warmup'
 )
 
 depends_absgui=(

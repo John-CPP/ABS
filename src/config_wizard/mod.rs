@@ -849,6 +849,7 @@ fn prompt_catalog_field(
             let prefix = match field.id {
                 "build.default_environment" => "wizard.choice.env",
                 "build.global_cpu_threads_mode" => "wizard.choice.cpu",
+                "ramdisk.zram" => "wizard.choice.zram",
                 _ => "wizard.choice",
             };
             let opts = choices_from_def(prefix, field.choices);
@@ -1884,10 +1885,14 @@ pub(super) fn get_bool(table: &dyn TableLike, key: &str, default: bool) -> bool 
 }
 
 pub(super) fn get_usize(table: &dyn TableLike, key: &str, default: usize) -> usize {
-    table
-        .get(key)
-        .and_then(|i| i.as_integer())
-        .and_then(|n| usize::try_from(n).ok())
+    let Some(item) = table.get(key) else {
+        return default;
+    };
+    if let Some(n) = item.as_integer().and_then(|n| usize::try_from(n).ok()) {
+        return n;
+    }
+    item.as_str()
+        .and_then(|s| s.trim().parse().ok())
         .unwrap_or(default)
 }
 
@@ -2271,10 +2276,10 @@ default = "arch"
             "{missing:?}"
         );
         assert!(
-            !missing
-                .iter()
-                .any(|k| k.starts_with("ramdisk.") && k != "ramdisk.enabled"),
-            "disabled/absent ramdisk must not flag child keys: {missing:?}"
+            !missing.iter().any(|k| k.starts_with("ramdisk.")
+                && k != "ramdisk.enabled"
+                && k != "ramdisk.zram"),
+            "disabled/absent ramdisk must not flag tmpfs child keys: {missing:?}"
         );
     }
 
@@ -2315,7 +2320,9 @@ enabled = false
         let doc: DocumentMut = text.parse().unwrap();
         let missing = missing_required_keys(&doc);
         assert!(
-            !missing.iter().any(|k| k.starts_with("ramdisk.")),
+            !missing
+                .iter()
+                .any(|k| k.starts_with("ramdisk.") && k != "ramdisk.zram"),
             "{missing:?}"
         );
     }
@@ -2521,7 +2528,7 @@ self_update_use_pacman = true
 self_update_at_updates = false
 install_absgui = true
 paths= { packages_path = "/media/storage/packages/abs/packages", chroot_base_path = "/media/storage/packages/abs/chroot", ready_made_packages_path = "/media/storage/packages/abs/ready" }
-ramdisk= { enabled = true, mount_point = "/run/abs-ram", size = "69G", mode = "0755", build_workdir = true, chroot = true, packages = true, sync_chroot_on_exit = false, min_free_ram_mb = 4096, warn_packages_ram = false, reclaim_mount_on_startup = true }
+ramdisk= { enabled = true, mount_point = "/run/abs-ram", size = "69G", mode = "0755", build_workdir = true, chroot = true, packages = true, sync_chroot_on_exit = false, min_free_ram_mb = 4096, zram = "full", warn_packages_ram = false, reclaim_mount_on_startup = true }
 build= { default_environment = "local", ignore_compilation_failures = true, compile_first_install_after = true, clean_install_by_default = true, ignore_already_made_packages = false, concurrent_repos_downloads_limit = 10, concurrent_compilations_limit = 2, fast_aur_rpc_update_checks = true, system_update_first = true, clean_chroot_after_compilation = true, global_cpu_threads_mode = "strict" }
 system_update= { command_to_update_repositories = "yay -Sy --quiet", command_to_perform_system_update = "yay -Syu --quiet", ignore_flag = "--ignore", ignore_packages = [] }
 repositories= { default = "arch", venomo = "https://github.com/Ven0m0/PKG.git", arch = "https://gitlab.archlinux.org/archlinux/packaging/packages", aur = "https://aur.archlinux.org" }

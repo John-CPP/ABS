@@ -7,7 +7,7 @@ use crate::system::{
 };
 use crate::utils::{
     apply_gui_nested_sudo_askpass, command_exists, pacman_query_version, pacman_sync_version,
-    parse_command_argv, prime_sudo_for_session, run_argv_command, spawn_sudo_keepalive, vercmp,
+    parse_command_argv, run_argv_command, vercmp,
 };
 use crate::{die, vlog};
 use colored::Colorize;
@@ -58,6 +58,12 @@ pub struct SkippedPkg {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgoPipelineHold {
+    pub package: String,
+    pub stage_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingUpdates {
     pub helper: String,
     pub repo: Vec<PendingPkg>,
@@ -66,6 +72,9 @@ pub struct PendingUpdates {
     #[serde(default)]
     pub manual: Vec<PendingPkg>,
     pub skipped: Vec<SkippedPkg>,
+    /// In-progress kernel PGO pipelines (not `Done` / `Aborted`). Empty means none.
+    #[serde(default)]
+    pub pgo_pipelines: Vec<PgoPipelineHold>,
 }
 
 #[cfg(test)]
@@ -207,7 +216,14 @@ fn apply_si_repositories(pkgs: &mut [PendingPkg], si_output: &str) {
     }
 }
 
-fn fill_missing_sync_repositories(pkgs: &mut [PendingPkg]) {
+fn repo_pending_query(helper: UpdateHelper) -> (&'static str, &'static [&'static str]) {
+    match helper {
+        UpdateHelper::Pacman => ("pacman", &["-Qu"]),
+        other => (other.as_str(), &["-Qu", "--repo"]),
+    }
+}
+
+fn fill_missing_sync_repositories(pkgs: &mut [PendingPkg], helper: UpdateHelper) {
     let names: Vec<String> = pkgs
         .iter()
         .filter(|p| p.repository.as_deref().is_none_or(str::is_empty))
@@ -216,11 +232,12 @@ fn fill_missing_sync_repositories(pkgs: &mut [PendingPkg]) {
     if names.is_empty() {
         return;
     }
+    let bin = helper.as_str();
     for chunk in names.chunks(64) {
         let mut args = Vec::with_capacity(1 + chunk.len());
         args.push("-Si");
         args.extend(chunk.iter().map(String::as_str));
-        let Ok(out) = capture_stdout("pacman", &args) else {
+        let Ok(out) = capture_stdout(bin, &args) else {
             continue;
         };
         apply_si_repositories(pkgs, &out);
@@ -364,11 +381,10 @@ fn append_ignore_flags(argv: &mut Vec<String>, config: &Config) {
 }
 
 fn prepare_privileged_update() -> Result<(), String> {
+    // Askpass only — do not prime `sudo -v` first. GUI sudo capture runs each sudo
+    // on its own pty, so a separate prime would prompt for the password twice.
+    // Optional session cache (`ABS_SUDO_CACHE`) is filled by the first askpass.
     apply_gui_nested_sudo_askpass();
-    if gui_mode() {
-        prime_sudo_for_session()?;
-        spawn_sudo_keepalive();
-    }
     Ok(())
 }
 
@@ -403,9 +419,11 @@ pub fn print_pending(config: &Config, json: bool) {
 
 pub fn gather(config: &Config) -> Result<PendingUpdates, String> {
     let helper = helper_from_update_command(&config.system_update.command_to_perform_system_update);
-    let repo_raw = gather_repo(config)?;
+    let repos_helper =
+        helper_from_update_command(&config.system_update.command_to_update_repositories);
+    let repo_raw = gather_repo(config, repos_helper)?;
     let (mut repo, mut skipped) = classify_pending(repo_raw, config);
-    fill_missing_sync_repositories(&mut repo);
+    fill_missing_sync_repositories(&mut repo, repos_helper);
     let repo_names: HashSet<String> = repo.iter().map(|p| p.name.clone()).collect();
     let aur_raw = gather_aur(helper, &repo_names)?;
     let (mut aur, skipped_aur) = classify_pending(aur_raw, config);
@@ -421,25 +439,36 @@ pub fn gather(config: &Config) -> Result<PendingUpdates, String> {
             pkg.repository = abs_package_source(config, &pkg.name);
         }
     }
-    fill_missing_sync_repositories(&mut manual);
-    Ok(PendingUpdates {
-        helper: helper.as_str().to_string(),
-        repo,
-        aur,
-        manual,
-        skipped,
-    })
+    fill_missing_sync_repositories(&mut manual, repos_helper);
+    Ok(attach_pgo_pipelines(
+        PendingUpdates {
+            helper: helper.as_str().to_string(),
+            repo,
+            aur,
+            manual,
+            skipped,
+            pgo_pipelines: vec![],
+        },
+        config,
+    ))
 }
 
-fn gather_repo(config: &Config) -> Result<Vec<PendingPkg>, String> {
-    if command_exists("checkupdates") {
-        let out = capture_stdout("checkupdates", &[])?;
-        return Ok(parse_upgrade_text(&out));
-    }
-    vlog!("checkupdates not found; syncing repos then pacman -Qu");
+fn attach_pgo_pipelines(mut pending: PendingUpdates, config: &Config) -> PendingUpdates {
+    pending.pgo_pipelines = crate::pgo::active_pipelines(config)
+        .into_iter()
+        .map(|p| PgoPipelineHold {
+            package: p.package,
+            stage_label: p.stage_label,
+        })
+        .collect();
+    pending
+}
+
+fn gather_repo(config: &Config, repos_helper: UpdateHelper) -> Result<Vec<PendingPkg>, String> {
     prepare_privileged_update()?;
     let _ = crate::system::run_system_update(config, SystemUpdateMode::UpdateRepositories);
-    let out = capture_stdout("pacman", &["-Qu"])?;
+    let (bin, args) = repo_pending_query(repos_helper);
+    let out = capture_stdout(bin, args)?;
     Ok(parse_upgrade_text(&out))
 }
 
@@ -497,76 +526,119 @@ fn gather_aur_rpc() -> Result<Vec<PendingPkg>, String> {
     Ok(out)
 }
 
-fn print_human(pending: &PendingUpdates) {
-    println!(
+fn human_skip_reason(reason: &str) -> &str {
+    match reason {
+        "pgo_pipeline" => "PGO pipeline not finished",
+        other => other,
+    }
+}
+
+fn human_report(pending: &PendingUpdates) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    if !pending.pgo_pipelines.is_empty() {
+        let _ = writeln!(
+            out,
+            "{} {}",
+            "==> PGO IN PROGRESS — SYSTEM UPDATE PAUSED".red().bold(),
+            "(no packages are installed while a kernel PGO pipeline is not finished)"
+                .yellow()
+                .bold()
+        );
+        for pipeline in &pending.pgo_pipelines {
+            let _ = writeln!(
+                out,
+                "    {} {} — {}",
+                "•".yellow().bold(),
+                pipeline.package.yellow().bold(),
+                pipeline.stage_label.yellow()
+            );
+        }
+        let _ = writeln!(
+            out,
+            "    {} Finish with {} or abandon with {} before running system updates.",
+            "Hint:".bold(),
+            "`abs --pgo-resume PKG`".cyan(),
+            "`abs --pgo-abort PKG`".cyan()
+        );
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(
+        out,
         "{} Official repos ({})  helper={}",
         "==>".green().bold(),
         pending.repo.len(),
         pending.helper
     );
     if pending.repo.is_empty() {
-        println!("    {}", "(none)".dimmed());
+        let _ = writeln!(out, "    {}", "(none)".dimmed());
     } else {
         for p in &pending.repo {
-            print_pending_pkg(p);
+            let _ = writeln!(out, "{}", format_pending_pkg(p));
         }
     }
-    println!("{} AUR ({})", "==>".green().bold(), pending.aur.len());
+    let _ = writeln!(out, "{} AUR ({})", "==>".green().bold(), pending.aur.len());
     if pending.aur.is_empty() {
-        println!("    {}", "(none)".dimmed());
+        let _ = writeln!(out, "    {}", "(none)".dimmed());
     } else {
         for p in &pending.aur {
-            print_pending_pkg(p);
+            let _ = writeln!(out, "{}", format_pending_pkg(p));
         }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "{} ABS watched ({})",
         "==>".green().bold(),
         pending.manual.len()
     );
     if pending.manual.is_empty() {
-        println!("    {}", "(none)".dimmed());
+        let _ = writeln!(out, "    {}", "(none)".dimmed());
     } else {
         for p in &pending.manual {
-            print_pending_pkg(p);
+            let _ = writeln!(out, "{}", format_pending_pkg(p));
         }
     }
     if !pending.skipped.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "{} Skipped, ABS-managed ({})",
             "==>".yellow().bold(),
             pending.skipped.len()
         );
         for p in &pending.skipped {
-            println!(
+            let _ = writeln!(
+                out,
                 "    {}  {} -> {}  ({})",
                 p.name,
                 p.old,
                 p.new,
-                p.reason.dimmed()
+                human_skip_reason(&p.reason).dimmed()
             );
         }
     }
+    out
+}
+
+fn print_human(pending: &PendingUpdates) {
+    print!("{}", human_report(pending));
     let _ = io::stdout().flush();
 }
 
-fn print_pending_pkg(p: &PendingPkg) {
+fn format_pending_pkg(p: &PendingPkg) -> String {
     match p
         .repository
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(repo) => {
-            println!(
-                "    {} [{}]  {} -> {}",
-                p.name.bold(),
-                repo,
-                p.old,
-                p.new.green()
-            )
-        }
-        None => println!("    {}  {} -> {}", p.name.bold(), p.old, p.new.green()),
+        Some(repo) => format!(
+            "    {} [{}]  {} -> {}",
+            p.name.bold(),
+            repo,
+            p.old,
+            p.new.green()
+        ),
+        None => format!("    {}  {} -> {}", p.name.bold(), p.old, p.new.green()),
     }
 }
 
@@ -729,6 +801,8 @@ mod tests {
                 command_to_perform_system_update_no_refresh: None,
                 ignore_flag: "--ignore".into(),
                 ignore_packages: ignore.into_iter().map(String::from).collect(),
+                auto_refresh_delay: 0,
+                remember_sudo: false,
             },
             repositories: Default::default(),
             manual_update_packages: manual.into_iter().map(String::from).collect(),
@@ -775,6 +849,22 @@ mod tests {
         assert_eq!(
             helper_from_update_command("/usr/bin/pikaur -Syu"),
             UpdateHelper::Pikaur
+        );
+    }
+
+    #[test]
+    fn repo_pending_query_uses_helper_from_update_repositories_command() {
+        assert_eq!(
+            repo_pending_query(helper_from_update_command("yay -Sy")),
+            ("yay", &["-Qu", "--repo"] as &[&str])
+        );
+        assert_eq!(
+            repo_pending_query(helper_from_update_command("sudo pacman -Sy")),
+            ("pacman", &["-Qu"] as &[&str])
+        );
+        assert_eq!(
+            repo_pending_query(helper_from_update_command("paru -Sy --quiet")),
+            ("paru", &["-Qu", "--repo"] as &[&str])
         );
     }
 
@@ -849,6 +939,26 @@ Version         : 6.9-1
     }
 
     #[test]
+    fn apply_si_repositories_picks_znver4_when_pkgrel_dot_suffix_is_newer() {
+        let mut pkgs = vec![pending("libreoffice-still", "26.2.5-2", "26.2.5-2.1")];
+        let si = "\
+Repository      : extra
+Name            : libreoffice-still
+Version         : 26.2.5-2
+
+Repository      : cachyos-extra-znver4
+Name            : libreoffice-still
+Version         : 26.2.5-2.1
+";
+        apply_si_repositories(&mut pkgs, si);
+        assert_eq!(
+            pkgs[0].repository.as_deref(),
+            Some("cachyos-extra-znver4"),
+            "the .1 pkgrel from the higher-priority znver4 repo is what pacman installs"
+        );
+    }
+
+    #[test]
     fn classify_moves_ignored_to_skipped() {
         let config = minimal_config(vec!["linux-cachyos"], vec!["held-via-ignore"]);
         let upgrades = vec![
@@ -892,6 +1002,7 @@ Version         : 6.9-1
                 new: "2".into(),
                 reason: "held_packages".into(),
             }],
+            pgo_pipelines: vec![],
         };
         assert!(!empty.has_work());
         let watched = PendingUpdates {
@@ -900,8 +1011,149 @@ Version         : 6.9-1
             aur: vec![],
             manual: vec![pending("linux-cachyos", "1", "2")],
             skipped: vec![],
+            pgo_pipelines: vec![],
         };
         assert!(watched.has_work());
+    }
+
+    fn pending_with_pgo() -> PendingUpdates {
+        PendingUpdates {
+            helper: "yay".into(),
+            repo: vec![],
+            aur: vec![],
+            manual: vec![],
+            skipped: vec![],
+            pgo_pipelines: vec![PgoPipelineHold {
+                package: "linux-cachyos".into(),
+                stage_label: "Waiting for reboot (boot stage-2 kernel)".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn json_includes_active_pgo_pipelines_even_when_lists_are_empty() {
+        let json = serde_json::to_value(&pending_with_pgo()).unwrap();
+        assert_eq!(json["repo"], serde_json::json!([]));
+        assert_eq!(
+            json["pgo_pipelines"][0]["package"],
+            serde_json::json!("linux-cachyos")
+        );
+        assert_eq!(
+            json["pgo_pipelines"][0]["stage_label"],
+            serde_json::json!("Waiting for reboot (boot stage-2 kernel)")
+        );
+    }
+
+    #[test]
+    fn human_report_explains_unfinished_pgo_when_nothing_is_installable() {
+        let text = human_report(&pending_with_pgo());
+        assert!(
+            text.contains("PGO") && text.contains("linux-cachyos"),
+            "empty pending list must still say PGO is why updates are paused: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("not finished")
+                || text.to_lowercase().contains("in progress"),
+            "must say the pipeline is unfinished, not only list the package: {text}"
+        );
+    }
+
+    #[test]
+    fn human_skip_reason_explains_pgo_pipeline() {
+        assert_eq!(
+            human_skip_reason("pgo_pipeline"),
+            "PGO pipeline not finished"
+        );
+    }
+
+    #[test]
+    fn attach_pgo_pipelines_reads_active_state_file() {
+        use crate::config::{PackageConfig, PgoConfig};
+        use crate::pgo::{PgoStageId, PgoState};
+
+        let dir = std::env::temp_dir().join(format!(
+            "abs-pending-pgo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("linux-cachyos.json");
+        let state = PgoState {
+            package: "linux-cachyos".into(),
+            repo_dir: "/tmp/repo".into(),
+            current_stage: PgoStageId::WaitReboot2,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: None,
+            expected_package_base: None,
+            stage_history: vec![],
+            compare_run_dir: None,
+        };
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+        let mut config = minimal_config(vec![], vec![]);
+        config.packages.insert(
+            "linux-cachyos".into(),
+            PackageConfig {
+                pgo: Some(PgoConfig {
+                    enabled: true,
+                    preset: "cachyos-kernel".into(),
+                    profiles_archive_dir: Some(dir.to_string_lossy().into_owned()),
+                    profile_scratch_dir: "auto".into(),
+                    perf_data_on_ram: true,
+                    propeller_profiles_on_ram: true,
+                    convert_relocate: "force".into(),
+                    benchmark_command: None,
+                    benchmark_workdir: None,
+                    benchmark_preset: "kernel".into(),
+                    compare_preset: "auto".into(),
+                    kernel_workload_seconds: 0,
+                    profiling_quality: "sweet".into(),
+                    build_user: None,
+                    perf_event_args: "auto".into(),
+                    perf_extra_args: crate::config::PERF_EXTRA_ARGS_STANDARD.into(),
+                    sysctl_command: None,
+                    vmlinux: "auto".into(),
+                    afdo_tool: "llvm-profgen".into(),
+                    propeller_tool: "create_llvm_prof".into(),
+                    afdo_profile_name: "kernel-compilation.afdo".into(),
+                    verify_boot: true,
+                    select_boot_kernel: true,
+                    auto_restart: false,
+                    reboot_before_start: false,
+                    reuse_afdo_profile: false,
+                    reuse_propeller_profile: false,
+                    skip_propeller: false,
+                    compare_current: false,
+                    compare_debug: false,
+                    compare_debug_clean: false,
+                    compare_autofdo: false,
+                    compare_autofdo_clean: false,
+                    compare_final: false,
+                    state_file: Some(state_path.to_string_lossy().into_owned()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let pending = attach_pgo_pipelines(
+            PendingUpdates {
+                helper: "yay".into(),
+                repo: vec![],
+                aur: vec![],
+                manual: vec![],
+                skipped: vec![],
+                pgo_pipelines: vec![],
+            },
+            &config,
+        );
+        assert_eq!(pending.pgo_pipelines.len(), 1);
+        assert_eq!(pending.pgo_pipelines[0].package, "linux-cachyos");
+        assert!(!pending.pgo_pipelines[0].stage_label.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

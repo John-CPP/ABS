@@ -4,7 +4,7 @@ use crate::utils::{
     append_deletable_roots, check_sudo_removal, path_has_prefix, resolve_path_for_deletion,
     run_command, validate_config_path,
 };
-use crate::{blog, die, ewarn, is_dry_run_mode, vlog};
+use crate::{blog, ewarn, is_dry_run_mode, vlog};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
@@ -616,6 +616,56 @@ fn unmount_mount_point(mount_point: &Path) -> bool {
     run_command("sudo", &["umount", "-l", path.as_ref()], None::<&str>).is_ok()
 }
 
+/// Blocking umount only. Lazy `umount -l` can leave tmpfs pages charged after the
+/// mount disappears from `findmnt`.
+pub fn unmount_blocking(mount_point: &Path) -> Result<(), String> {
+    if !is_mount_point(mount_point) {
+        return Ok(());
+    }
+    let path = mount_point.to_string_lossy();
+    if is_dry_run_mode() {
+        println!("[DRY RUN] sudo umount {path}");
+        return Ok(());
+    }
+    run_command("sudo", &["umount", path.as_ref()], None::<&str>).map_err(|e| {
+        format!(
+            "blocking umount of {} failed (not using lazy umount): {e}",
+            mount_point.display()
+        )
+    })?;
+    if is_mount_point(mount_point) {
+        return Err(format!(
+            "{} is still mounted after blocking umount",
+            mount_point.display()
+        ));
+    }
+    Ok(())
+}
+
+fn remount_target(ramdisk: &RamdiskConfig) -> Result<PathBuf, String> {
+    let mount_point = PathBuf::from(ramdisk.mount_point.trim());
+    if mount_point.as_os_str().is_empty() {
+        return Err("ramdisk.mount_point is empty".into());
+    }
+    Ok(mount_point)
+}
+
+/// Kill holders, blocking-unmount, and mount a new empty tmpfs. Discards cached chroot.
+pub fn remount_ramdisk_fresh(config: &Config) -> Result<(), String> {
+    let mount_point = remount_target(&config.ramdisk)?;
+    crate::utils::kill_processes_with_cwd_under(&mount_point, "ramdisk");
+    cleanup_pending_workdirs();
+    if is_mount_point(&mount_point) {
+        blog!(
+            "Remounting ramdisk at {} to free leftover PGO tmpfs pages",
+            mount_point.display()
+        );
+        unmount_blocking(&mount_point)?;
+    }
+    mount_tmpfs_maybe_reuse(&mount_point, &config.ramdisk, false)?;
+    Ok(())
+}
+
 fn force_unmount(mount_point: &Path) -> Result<(), String> {
     if unmount_mount_point(mount_point) {
         Ok(())
@@ -628,8 +678,18 @@ fn force_unmount(mount_point: &Path) -> Result<(), String> {
 }
 
 fn mount_tmpfs(mount_point: &Path, config: &RamdiskConfig) -> Result<bool, String> {
+    mount_tmpfs_maybe_reuse(mount_point, config, true)
+}
+
+fn mount_tmpfs_maybe_reuse(
+    mount_point: &Path,
+    config: &RamdiskConfig,
+    reuse_existing: bool,
+) -> Result<bool, String> {
     if is_mount_point(mount_point) {
-        if config.reclaim_mount_on_startup {
+        if !reuse_existing {
+            unmount_blocking(mount_point)?;
+        } else if config.reclaim_mount_on_startup {
             let cached_chroot = mount_point.join("chroot/base/root");
             if is_chroot_rootfs_complete(&cached_chroot) {
                 blog!(
@@ -798,6 +858,7 @@ pub fn install_exit_handlers() {
             env!("CARGO_PKG_VERSION")
         );
         crate::utils::terminate_foreground_children();
+        crate::utils::kill_pgo_workload_processes();
         if let Some(session) = session_ref() {
             crate::utils::kill_processes_with_cwd_under(&session.mount_point, "ramdisk");
         }
@@ -829,6 +890,7 @@ pub fn install_exit_handlers() {
                     env!("CARGO_PKG_VERSION")
                 );
                 crate::utils::terminate_foreground_children();
+                crate::utils::kill_pgo_workload_processes();
                 if let Some(session) = session_ref() {
                     crate::utils::kill_processes_with_cwd_under(&session.mount_point, "ramdisk");
                 }
@@ -870,14 +932,13 @@ pub fn ensure_for_targets(config: &Config, targets: &RamdiskTargets) -> Result<(
 }
 
 fn mount_session(config: &Config) -> Result<RamdiskSession, String> {
-    let available = mem_available_mb()?;
-    if available < config.ramdisk.min_free_ram_mb {
-        die!(
-            "Refusing to mount ramdisk: MemAvailable is {} MiB (min_free_ram_mb = {})",
-            available,
-            config.ramdisk.min_free_ram_mb
-        );
-    }
+    crate::zram::require_headroom(
+        "ramdisk mount",
+        config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+        config
+            .zram_mode_for(None)
+            .unwrap_or_else(|e| crate::die!("{e}")),
+    );
     if let Ok(total) = mem_total_bytes()
         && let Err(e) = ensure_ramdisk_size_fits_ram(&config.ramdisk.size, total)
     {
@@ -924,6 +985,56 @@ pub fn session_mount_point() -> Option<PathBuf> {
 /// Path for PGO perf/profile scratch on the active ramdisk session.
 pub fn pgo_scratch_path(mount: &Path, package: &str) -> PathBuf {
     mount.join("pgo-scratch").join(package)
+}
+
+const TINY_PGO_PROFILE_NAMES: &[&str] = &[
+    "kernel-compilation.afdo",
+    "propeller_cc_profile.txt",
+    "propeller_ld_profile.txt",
+];
+
+/// Copy tiny AFDO/Propeller texts off tmpfs before zram teardown (Ctrl+C leaves ramdisk mounted).
+fn persist_tiny_pgo_profiles_from_ramdisk(mount: &Path) {
+    let root = mount.join("pgo-scratch");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let pkg_dir = entry.path();
+        if !pkg_dir.is_dir() {
+            continue;
+        }
+        let dest_dir = std::env::temp_dir()
+            .join("abs-pgo-scratch")
+            .join(entry.file_name());
+        for name in TINY_PGO_PROFILE_NAMES {
+            let src = pkg_dir.join(name);
+            if !src.is_file() {
+                continue;
+            }
+            if let Err(e) = fs::create_dir_all(&dest_dir) {
+                ewarn!(
+                    "Could not persist {} before zram teardown: {e}",
+                    src.display()
+                );
+                continue;
+            }
+            let dest = dest_dir.join(name);
+            if let Err(e) = fs::copy(&src, &dest) {
+                ewarn!(
+                    "Could not persist {} to {}: {e}",
+                    src.display(),
+                    dest.display()
+                );
+            }
+        }
+    }
+}
+
+/// Exit / `--purge`: unmount ramdisk before tearing down ABS zram.
+#[cfg(test)]
+fn shutdown_teardown_order() -> &'static [&'static str] {
+    &["unmount_tmpfs", "teardown_abs_zram"]
 }
 
 /// Mount tmpfs (when needed) and create `pgo-scratch/<package>` for PGO profiling.
@@ -1054,12 +1165,15 @@ pub fn shutdown_on_interrupt() {
     }
 
     crate::utils::terminate_foreground_children();
+    crate::utils::kill_pgo_workload_processes();
 
     let session = session_lock().lock().unwrap().take();
     let Some(session) = session else {
+        crate::zram::teardown_abs_zram();
         return;
     };
 
+    persist_tiny_pgo_profiles_from_ramdisk(&session.mount_point);
     sync_chroot_to_seed(&session);
     if session.unmount_on_shutdown {
         crate::utils::phase_banner(format!(
@@ -1067,6 +1181,7 @@ pub fn shutdown_on_interrupt() {
             session.mount_point.display()
         ));
     }
+    crate::zram::teardown_abs_zram();
 }
 
 pub fn shutdown() {
@@ -1079,14 +1194,14 @@ pub fn shutdown() {
     let session = session_lock().lock().unwrap().take();
     let Some(session) = session else {
         cleanup_pending_workdirs();
-        crate::pgo_priv::maybe_remove_dropin();
+        crate::zram::teardown_abs_zram();
         return;
     };
 
     sync_chroot_to_seed(&session);
     cleanup_pending_workdirs();
     unmount_tmpfs(&session.mount_point, session.unmount_on_shutdown);
-    crate::pgo_priv::maybe_remove_dropin();
+    crate::zram::teardown_abs_zram();
 }
 
 /// Unmount the configured ramdisk when the abs process no longer has session state
@@ -1212,6 +1327,14 @@ mod tests {
     fn pgo_scratch_path_under_mount() {
         let p = pgo_scratch_path(Path::new("/run/abs-ram"), "linux-cachyos");
         assert_eq!(p, PathBuf::from("/run/abs-ram/pgo-scratch/linux-cachyos"));
+    }
+
+    #[test]
+    fn shutdown_unmounts_ramdisk_before_zram() {
+        assert_eq!(
+            shutdown_teardown_order(),
+            &["unmount_tmpfs", "teardown_abs_zram"]
+        );
     }
 
     #[test]
@@ -1458,5 +1581,40 @@ packages = false
         assert!(ensure_ramdisk_size_fits_ram("16G", ram_32g).is_ok());
         assert!(ensure_ramdisk_size_fits_ram("169G", ram_32g).is_err());
         assert!(ensure_ramdisk_size_fits_ram("150%", ram_32g).is_err());
+    }
+
+    #[test]
+    fn remount_target_rejects_empty_mount_point() {
+        let mut ramdisk = RamdiskConfig::default();
+        ramdisk.mount_point.clear();
+        assert_eq!(
+            remount_target(&ramdisk).unwrap_err(),
+            "ramdisk.mount_point is empty"
+        );
+        ramdisk.mount_point = "   ".into();
+        assert_eq!(
+            remount_target(&ramdisk).unwrap_err(),
+            "ramdisk.mount_point is empty"
+        );
+        ramdisk.mount_point = "/run/abs-ram".into();
+        assert_eq!(
+            remount_target(&ramdisk).unwrap(),
+            PathBuf::from("/run/abs-ram")
+        );
+    }
+
+    #[test]
+    fn unmount_blocking_is_ok_when_not_mounted() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs-not-a-mount-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        unmount_blocking(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

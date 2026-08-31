@@ -48,6 +48,14 @@ pub struct SkippedPkg {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct PgoPipelineHold {
+    #[serde(default)]
+    pub package: String,
+    #[serde(default)]
+    pub stage_label: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PendingUpdates {
     #[serde(default)]
     pub helper: String,
@@ -59,6 +67,8 @@ pub struct PendingUpdates {
     pub manual: Vec<PendingPkg>,
     #[serde(default)]
     pub skipped: Vec<SkippedPkg>,
+    #[serde(default)]
+    pub pgo_pipelines: Vec<PgoPipelineHold>,
 }
 
 impl PendingUpdates {
@@ -1011,13 +1021,57 @@ fn path_is_trusted_executable(p: &Path) -> bool {
         || s.starts_with("/usr/libexec/")
 }
 
-/// Find a graphical askpass program so sudo can prompt for a password from the GUI (there is no
-/// interactive terminal). Honors an existing `SUDO_ASKPASS`, then known helpers, then generates a
-/// zenity/kdialog/yad/qarma/pinentry wrapper. Returns the askpass path, or `None` if nothing is available.
-fn ensure_askpass_helper() -> Option<String> {
-    if let Some(v) = std::env::var_os("SUDO_ASKPASS") {
-        if !v.is_empty() {
-            return Some(v.to_string_lossy().into_owned());
+static REMEMBER_SUDO: AtomicBool = AtomicBool::new(false);
+
+/// Honor AbsGui `[system_update] remember_sudo`. Clearing it also deletes any cached password.
+pub fn set_remember_sudo(enabled: bool) {
+    REMEMBER_SUDO.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        clear_sudo_session_cache();
+    }
+}
+
+pub fn clear_sudo_session_cache() {
+    if let Some(path) = sudo_session_cache_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn sudo_session_cache_path() -> Option<PathBuf> {
+    dirs::runtime_dir().map(|d| d.join("abs").join("sudo-askpass"))
+}
+
+/// Askpass wrapper: optional session cache via `ABS_SUDO_CACHE`, then `inner` (stdout = password).
+fn askpass_script_body(inner: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+CACHE=\"${{ABS_SUDO_CACHE-}}\"\n\
+if [ -n \"$CACHE\" ] && [ -s \"$CACHE\" ]; then\n\
+  cat \"$CACHE\"\n\
+  exit 0\n\
+fi\n\
+PW=$({inner})\n\
+status=$?\n\
+if [ \"$status\" -ne 0 ] || [ -z \"$PW\" ]; then\n\
+  exit 1\n\
+fi\n\
+if [ -n \"$CACHE\" ]; then\n\
+  mkdir -p \"$(dirname \"$CACHE\")\" || exit 1\n\
+  umask 077\n\
+  printf '%s\\n' \"$PW\" > \"$CACHE\" || exit 1\n\
+  chmod 600 \"$CACHE\" 2>/dev/null || true\n\
+fi\n\
+printf '%s\\n' \"$PW\"\n"
+    )
+}
+
+fn askpass_inner_command() -> Option<String> {
+    if let Ok(existing) = std::env::var("SUDO_ASKPASS") {
+        if !existing.is_empty() {
+            let p = Path::new(&existing);
+            if p.file_name().and_then(|n| n.to_str()) != Some("askpass.sh") {
+                return Some(format!("{} 2>/dev/null", shell_quote(&existing)));
+            }
         }
     }
 
@@ -1032,46 +1086,53 @@ fn ensure_askpass_helper() -> Option<String> {
     ];
     for candidate in CANDIDATES {
         if Path::new(candidate).exists() {
-            return Some((*candidate).to_string());
+            return Some(format!("{} 2>/dev/null", shell_quote(candidate)));
         }
     }
 
-    // Generate a wrapper around zenity/kdialog/yad/qarma/pinentry as a last resort.
     // Embed absolute allowlisted paths so a later PATH prepend cannot hijack the password prompt.
     // Password on stdout; GTK/Qt warnings on stderr would otherwise land in the abs log.
-    let tool = if let Some(bin) = trusted_bin("zenity") {
-        format!(
-            "exec {} --password --title='absgui: sudo password' 2>/dev/null",
+    if let Some(bin) = trusted_bin("zenity") {
+        return Some(format!(
+            "{} --password --title='absgui: sudo password' 2>/dev/null",
             shell_quote(&bin)
-        )
-    } else if let Some(bin) = trusted_bin("kdialog") {
-        format!(
-            "exec {} --password 'absgui needs your sudo password to stop builds and unmount the ramdisk' 2>/dev/null",
+        ));
+    }
+    if let Some(bin) = trusted_bin("kdialog") {
+        return Some(format!(
+            "{} --password 'absgui needs your sudo password to stop builds and unmount the ramdisk' 2>/dev/null",
             shell_quote(&bin)
-        )
-    } else if let Some(bin) = trusted_bin("yad") {
-        format!(
-            "exec {} --entry --hide-text --title='absgui: sudo password' --text='Password:' 2>/dev/null",
+        ));
+    }
+    if let Some(bin) = trusted_bin("yad") {
+        return Some(format!(
+            "{} --entry --hide-text --title='absgui: sudo password' --text='Password:' 2>/dev/null",
             shell_quote(&bin)
-        )
-    } else if let Some(bin) = trusted_bin("qarma") {
-        format!(
-            "exec {} --password --title='absgui: sudo password' 2>/dev/null",
+        ));
+    }
+    if let Some(bin) = trusted_bin("qarma") {
+        return Some(format!(
+            "{} --password --title='absgui: sudo password' 2>/dev/null",
             shell_quote(&bin)
-        )
-    } else {
-        let pinentry = first_pinentry()?;
-        format!(
-            "printf '%s\\n' 'SETTITLE absgui' 'SETDESC absgui needs your sudo password' \
-             'SETPROMPT Password:' 'GETPIN' 'BYE' | {} 2>/dev/null | sed -n 's/^D //p'",
-            shell_quote(&pinentry)
-        )
-    };
+        ));
+    }
+    let pinentry = first_pinentry()?;
+    Some(format!(
+        "printf '%s\\n' 'SETTITLE absgui' 'SETDESC absgui needs your sudo password' \
+         'SETPROMPT Password:' 'GETPIN' 'BYE' | {} 2>/dev/null | sed -n 's/^D //p'",
+        shell_quote(&pinentry)
+    ))
+}
 
+/// Find a graphical askpass program so sudo can prompt for a password from the GUI (there is no
+/// interactive terminal). Always writes our wrapper so `ABS_SUDO_CACHE` can reuse one password
+/// for the AbsGui session. Returns the askpass path, or `None` if nothing is available.
+fn ensure_askpass_helper() -> Option<String> {
+    let inner = askpass_inner_command()?;
     let dir = dirs::cache_dir()?.join("abs");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("askpass.sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{tool}\n")).ok()?;
+    std::fs::write(&path, askpass_script_body(&inner)).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1097,6 +1158,11 @@ fn apply_gui_sudo_env(cmd: &mut Command) {
     cmd.env("ABS_GUI", "1");
     if let Some(askpass) = ensure_askpass_helper() {
         cmd.env("SUDO_ASKPASS", askpass);
+    }
+    if REMEMBER_SUDO.load(Ordering::Relaxed) {
+        if let Some(path) = sudo_session_cache_path() {
+            cmd.env("ABS_SUDO_CACHE", path);
+        }
     }
 }
 
@@ -1766,6 +1832,21 @@ mod tests {
     fn system_update_command_is_abs_ru() {
         let cmd = super::format_abs_system_update_command();
         assert!(cmd.contains("-RU"), "{cmd}");
+    }
+
+    #[test]
+    fn askpass_script_reuses_cache_file_when_set() {
+        let body = super::askpass_script_body("/usr/bin/zenity --password");
+        assert!(body.contains("ABS_SUDO_CACHE"), "{body}");
+        assert!(body.contains("[ -s \"$CACHE\" ]"), "{body}");
+        assert!(
+            body.contains("printf '%s\\n' \"$PW\" > \"$CACHE\""),
+            "{body}"
+        );
+        assert!(
+            !body.contains("exec /usr/bin/zenity"),
+            "must capture dialog output so the cache can be filled: {body}"
+        );
     }
 
     #[test]

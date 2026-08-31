@@ -6,7 +6,9 @@ use crate::app_settings::{
     clamp_terminal_lines_limit, clamp_window_geometry, load_rgba_png, load_window_icon, AppTheme,
     GuiSettings, ThemePref, TERMINAL_LINES_STEP,
 };
-use crate::config::{config_path, load_config, save_config, ConfigDocument, PackageSection};
+use crate::config::{
+    config_path, load_config, pending_list_needs_fetch, save_config, ConfigDocument, PackageSection,
+};
 use crate::dialog;
 use crate::field_help;
 use crate::list_editors::{self, ListEditors, PackageListField};
@@ -50,6 +52,7 @@ use std::time::{Duration, Instant};
 const PGO_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LOG_SCROLL_IGNORE: Duration = Duration::from_millis(120);
 const FETCH_OVERLAY_TICK: Duration = Duration::from_millis(16);
+const PENDING_AUTO_REFRESH_TICK: Duration = Duration::from_secs(30);
 
 const PGO_STEPS: [(&str, &str); 7] = [
     ("Debug build", "stage1_build"),
@@ -134,6 +137,16 @@ fn pgo_resume_stage_arg<'a>(selected: &'a str, saved: &str) -> Option<&'a str> {
 
 fn pgo_saved_at_wait_reboot(saved: &str) -> bool {
     pgo_is_wait_reboot(saved)
+}
+
+/// In-progress pipeline that should offer Continue (`--pgo-resume` with no `--pgo-stage`).
+/// Wait gates use "Continue after reboot" instead; empty / done / aborted are not resumable.
+fn pgo_show_pipeline_continue(saved: &str) -> bool {
+    !saved.is_empty() && saved != "done" && saved != "aborted" && !pgo_saved_at_wait_reboot(saved)
+}
+
+fn pgo_show_start_from_phase(selected: &str, saved: &str) -> bool {
+    !pgo_saved_at_wait_reboot(saved) && selected != pgo_first_phase_key()
 }
 
 /// OS-package install and oneshot compile reuse `busy`, but they are not a PGO run.
@@ -252,8 +265,9 @@ const TICK_OPTS: &[&str] = &["full", "idle", "periodic"];
 const PREEMPT_OPTS: &[&str] = &["full", "voluntary", "server", "lazy"];
 const HUGE_OPTS: &[&str] = &["always", "madvise"];
 const ENV_OPTS: &[&str] = &["local", "chroot"];
-const PGO_BENCHMARK_PRESET_OPTS: &[&str] = &["fast", "cachyos"];
-const PGO_PROFILING_QUALITY_OPTS: &[&str] = &["standard", "maximum"];
+const PACKAGE_ZRAM_OPTS: &[&str] = &["inherit", "off", "full"];
+const PGO_PROFILING_QUALITY_OPTS: &[&str] = &["short", "sweet", "long"];
+const PGO_CONVERT_RELOCATE_OPTS: &[&str] = &["force", "smart"];
 
 pub fn run() -> iced::Result {
     let gui_settings = GuiSettings::load();
@@ -329,6 +343,7 @@ pub struct App {
     pending_updates: Option<PendingUpdates>,
     pending_updates_error: Option<String>,
     pending_updates_loading: bool,
+    last_pending_refresh: Option<Instant>,
     fetch_overlay_started: Option<Instant>,
     wizard: config_wizard::WizardSession,
     pgo_run: PgoRunHandle,
@@ -403,6 +418,14 @@ impl App {
         }
         if state.page == Page::SystemUpdate && state.pending_updates_loading {
             subs.push(time::every(FETCH_OVERLAY_TICK).map(|_| Message::FetchOverlayTick));
+        }
+        if state.page == Page::SystemUpdate
+            && !state.pending_updates_loading
+            && state.config.system_update.auto_refresh_delay > 0
+        {
+            subs.push(
+                time::every(PENDING_AUTO_REFRESH_TICK).map(|_| Message::PendingUpdatesMaybeRefresh),
+            );
         }
         Subscription::batch(subs)
     }
@@ -525,6 +548,7 @@ impl App {
                 pending_updates: None,
                 pending_updates_error: None,
                 pending_updates_loading: false,
+                last_pending_refresh: None,
                 fetch_overlay_started: None,
                 wizard: {
                     let mut w = config_wizard::WizardSession::default();
@@ -671,6 +695,20 @@ impl App {
         self.gui_settings.window_maximized = window_maximized;
         self.sync_terminal_previews();
         self.terminal_lines_limit_input = self.gui_settings.terminal_lines_limit.to_string();
+        abs_runner::set_remember_sudo(self.config.system_update.remember_sudo);
+    }
+
+    fn maybe_refresh_pending_updates(&self) -> Task<Message> {
+        if pending_list_needs_fetch(
+            self.config.system_update.auto_refresh_delay,
+            self.last_pending_refresh,
+            Instant::now(),
+            self.pending_updates.is_some(),
+        ) {
+            Task::done(Message::PendingUpdatesRefresh)
+        } else {
+            Task::none()
+        }
     }
 
     fn overlay_message_allowed(message: &Message) -> bool {
@@ -697,6 +735,7 @@ impl App {
                 | Message::PgoStatusLoaded(_)
                 | Message::WizardTimer
                 | Message::FetchOverlayTick
+                | Message::PendingUpdatesMaybeRefresh
                 | Message::WizardCheckResult(_, _, _)
                 | Message::WizardFormLoaded(_)
                 | Message::WizardApplyDone(_)
@@ -1495,7 +1534,7 @@ impl App {
             }
             Message::OpenSystemUpdate => {
                 self.navigate(Page::SystemUpdate);
-                return Task::done(Message::PendingUpdatesRefresh);
+                return self.maybe_refresh_pending_updates();
             }
             Message::OpenAbsSettings => self.navigate(Page::AbsSettings),
             Message::OpenConfigWizard => {
@@ -1643,8 +1682,9 @@ impl App {
                     self.status_message = Some(abs_i18n::t("gui.status.config_loaded").into());
                     self.mark_saved();
                     apply_effective_lang(&self.gui_settings);
+                    abs_runner::set_remember_sudo(self.config.system_update.remember_sudo);
                     if self.page == Page::SystemUpdate {
-                        return Task::done(Message::PendingUpdatesRefresh);
+                        return self.maybe_refresh_pending_updates();
                     }
                 }
                 Err(e) => {
@@ -1790,6 +1830,15 @@ impl App {
                     .command_to_perform_system_update_no_refresh = opt_str(v);
             }
             Message::SysUpdateIgnoreFlag(v) => self.config.system_update.ignore_flag = v,
+            Message::SysUpdateAutoRefreshDelay(v) => {
+                if let Ok(n) = v.trim().parse() {
+                    self.config.system_update.auto_refresh_delay = n;
+                }
+            }
+            Message::SysUpdateRememberSudo(v) => {
+                self.config.system_update.remember_sudo = v;
+                abs_runner::set_remember_sudo(v);
+            }
             Message::RamdiskEnabled(v) => self.config.ramdisk.enabled = v,
             Message::RamdiskWorkdir(v) => self.config.ramdisk.build_workdir = v,
             Message::RamdiskChroot(v) => self.config.ramdisk.chroot = v,
@@ -1804,6 +1853,7 @@ impl App {
                     self.config.ramdisk.min_free_ram_mb = n;
                 }
             }
+            Message::RamdiskZram(v) => self.config.ramdisk.zram = v,
             Message::RamdiskWarnPackages(v) => self.config.ramdisk.warn_packages_ram = v,
             Message::RamdiskReclaimOnStartup(v) => {
                 self.config.ramdisk.reclaim_mount_on_startup = v;
@@ -2094,7 +2144,12 @@ impl App {
                     .selected_kernel
                     .as_deref()
                     .unwrap_or_else(|| abs_i18n::t("gui.msg.kernel_fallback"));
-                let status = abs_i18n::tf("gui.msg.pgo_continue_reboot", &[("pkg", pkg)]);
+                let status_key = if pgo_saved_at_wait_reboot(self.effective_pgo_stage()) {
+                    "gui.msg.pgo_continue_reboot"
+                } else {
+                    "gui.msg.pgo_continue"
+                };
+                let status = abs_i18n::tf(status_key, &[("pkg", pkg)]);
                 return self.launch_pgo_run(PgoAction::Resume, None, false, &status);
             }
             Message::KernelBuildStart => {
@@ -2184,13 +2239,18 @@ impl App {
             Message::SystemUpdateStart => {
                 let has_work = self.pending_updates.as_ref().is_some_and(|p| p.has_work());
                 if !has_work {
-                    return self.push_log(abs_i18n::t("gui.msg.no_updates"));
+                    return self.push_log(system_update::no_updates_message(
+                        self.pending_updates.as_ref(),
+                    ));
                 }
                 return self.start_abs_on_update_page(
                     abs_runner::format_abs_system_update_command(),
                     "Running abs -RU…".into(),
                     true,
                 );
+            }
+            Message::PendingUpdatesMaybeRefresh => {
+                return self.maybe_refresh_pending_updates();
             }
             Message::PendingUpdatesRefresh => {
                 if self.pending_updates_loading {
@@ -2216,6 +2276,7 @@ impl App {
                     Ok(data) => {
                         self.pending_updates_error = None;
                         self.pending_updates = Some(data);
+                        self.last_pending_refresh = Some(Instant::now());
                     }
                     Err(e) => {
                         self.pending_updates_error = Some(e);
@@ -2854,12 +2915,14 @@ impl App {
                     );
                 }
                 let _ = self.gui_settings.save();
+                abs_runner::clear_sudo_session_cache();
                 return self.begin_exit();
             }
             Message::WindowCloseRequested => {
                 return Self::snapshot_window_then_close();
             }
             Message::ExitAfterCleanup => {
+                abs_runner::clear_sudo_session_cache();
                 return iced::exit();
             }
         }
@@ -4260,8 +4323,8 @@ impl App {
         let saved = self.effective_pgo_stage();
         let saved_idx = pgo_stage_index(saved);
         let at_wait_reboot = pgo_saved_at_wait_reboot(saved);
-        let show_start_from_phase =
-            !at_wait_reboot && self.pgo_selected_stage != pgo_first_phase_key();
+        let show_continue = pgo_show_pipeline_continue(saved);
+        let show_start_from_phase = pgo_show_start_from_phase(selected, saved);
 
         let pgo_live =
             pgo_timeline_is_live(self.busy, self.building_oneshot, self.running_system_update);
@@ -4380,6 +4443,12 @@ impl App {
         if at_wait_reboot {
             action_row = action_row.push(
                 button(text(abs_i18n::t("gui.pgo.continue_reboot")).size(13))
+                    .style(style::btn_primary(theme))
+                    .on_press_maybe((!self.busy).then_some(Message::PgoContinueAfterReboot)),
+            );
+        } else if show_continue {
+            action_row = action_row.push(
+                button(text(abs_i18n::t("gui.pgo.continue")).size(13))
                     .style(style::btn_primary(theme))
                     .on_press_maybe((!self.busy).then_some(Message::PgoContinueAfterReboot)),
             );
@@ -4610,25 +4679,32 @@ fn kernel_form<'a>(
                 move |v| Message::PackageCompileAlone(target, v),
             ),
             kernel_ramdisk_targets_field(target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r, theme),
+            field_pick(
+                abs_i18n::t("gui.field.package_zram"),
+                Some(field_help::package_zram()),
+                PACKAGE_ZRAM_OPTS,
+                &zram_pick_display(pkg, fallback),
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::Zram, v),
+            ),
         ]
         .spacing(12),
     );
 
-    let benchmark_preset = {
-        let v = kstr_value(pkg, KStr::BenchmarkPreset);
-        if v.is_empty() {
-            "fast".to_string()
-        } else {
-            v
-        }
-    };
-
     let profiling_quality = {
         let v = kstr_value(pkg, KStr::ProfilingQuality);
-        if v.is_empty() {
-            "maximum".to_string()
-        } else {
-            v
+        match v.to_ascii_lowercase().as_str() {
+            "" | "standard" => "sweet".to_string(),
+            "maximum" | "max" | "perfect" => "long".to_string(),
+            "quick" => "short".to_string(),
+            other => other.to_string(),
+        }
+    };
+    let convert_relocate = {
+        let v = kstr_value(pkg, KStr::ConvertRelocate);
+        match v.to_ascii_lowercase().as_str() {
+            "smart" => "smart".to_string(),
+            _ => "force".to_string(),
         }
     };
 
@@ -4694,6 +4770,14 @@ fn kernel_form<'a>(
                 move |v| Message::SetKernelBool(target, KBool::PgoPropellerProfilesOnRam, v),
             ),]
             .spacing(16),
+            field_pick(
+                abs_i18n::t("gui.field.pgo_convert_relocate"),
+                Some(field_help::pgo_convert_relocate()),
+                PGO_CONVERT_RELOCATE_OPTS,
+                &convert_relocate,
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::ConvertRelocate, v),
+            ),
             text(abs_i18n::t("gui.pgo.compare_title"))
                 .size(13)
                 .color(style::muted(theme)),
@@ -4730,6 +4814,14 @@ fn kernel_form<'a>(
                     move |v| Message::SetKernelBool(target, KBool::PgoCompareAutofdoClean, v),
                 ),
             ]
+            .spacing(16),
+            row![field_checkbox(
+                abs_i18n::t("gui.field.pgo_skip_propeller"),
+                Some(field_help::pgo_skip_propeller()),
+                kbool_value(pkg, KBool::PgoSkipPropeller),
+                theme,
+                move |v| Message::SetKernelBool(target, KBool::PgoSkipPropeller, v),
+            ),]
             .spacing(16),
             row![
                 field_checkbox(
@@ -4794,14 +4886,6 @@ fn kernel_form<'a>(
                 theme,
                 move |v| Message::SetKernelStr(target, KStr::ProfilingQuality, v),
             ),
-            field_pick(
-                abs_i18n::t("gui.field.pgo_benchmark_preset"),
-                Some(field_help::pgo_benchmark_preset()),
-                PGO_BENCHMARK_PRESET_OPTS,
-                &benchmark_preset,
-                theme,
-                move |v| Message::SetKernelStr(target, KStr::BenchmarkPreset, v),
-            ),
             field_path(
                 abs_i18n::t("gui.field.pgo_benchmark"),
                 Some(field_help::pgo_benchmark()),
@@ -4853,7 +4937,7 @@ fn kernel_form<'a>(
                 abs_i18n::t("gui.field.pgo_perf_extra_args"),
                 Some(field_help::pgo_perf_extra_args()),
                 &kstr_value(pkg, KStr::PerfExtraArgs),
-                "--mmap-pages 131072 -a -N -b -c 56000",
+                "--mmap-pages 4096 -a -N -b -c 1000003",
                 theme,
                 move |v| Message::SetKernelStr(target, KStr::PerfExtraArgs, v),
             ),
@@ -4962,6 +5046,14 @@ fn package_form<'a>(
                 move |v| Message::SetPackageOptBool(target, KOptBool::Tests, v),
             ),
             ramdisk_targets_field(target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r, theme),
+            field_pick(
+                abs_i18n::t("gui.field.package_zram"),
+                Some(field_help::package_zram()),
+                PACKAGE_ZRAM_OPTS,
+                &zram_pick_display(pkg, None),
+                theme,
+                move |v| Message::SetKernelStr(target, KStr::Zram, v),
+            ),
         ]
         .spacing(12),
     );
@@ -5329,6 +5421,19 @@ fn validate_pgo_start(section: &PackageSection, package: &str) -> Result<(), Str
     Ok(())
 }
 
+fn zram_pick_display(pkg: &PackageSection, fallback: Option<&PackageSection>) -> String {
+    let v = if fallback.is_some() {
+        kstr_pick_value(pkg, fallback, KStr::Zram)
+    } else {
+        kstr_value(pkg, KStr::Zram)
+    };
+    if v.trim().is_empty() {
+        "inherit".into()
+    } else {
+        v
+    }
+}
+
 fn kstr_pick_value(pkg: &PackageSection, fallback: Option<&PackageSection>, field: KStr) -> String {
     let own = kstr_value(pkg, field);
     if !own.is_empty() {
@@ -5350,6 +5455,7 @@ fn kstr_value(pkg: &PackageSection, field: KStr) -> String {
         KStr::Source => pkg.source.clone(),
         KStr::BuildEnv => pkg.build_env.clone(),
         KStr::Ramdisk => pkg.ramdisk.clone(),
+        KStr::Zram => pkg.zram.clone(),
         KStr::Alias => pkg.alias.clone(),
         KStr::Compiler => pkg.compiler.clone(),
         KStr::UpstreamGithub => pkg.upstream_github.clone(),
@@ -5367,8 +5473,8 @@ fn kstr_value(pkg: &PackageSection, field: KStr) -> String {
         KStr::ArchiveDir => pgo.and_then(|p| p.profiles_archive_dir.clone()),
         KStr::Benchmark => pgo.and_then(|p| p.benchmark_command.clone()),
         KStr::BenchmarkWorkdir => pgo.and_then(|p| p.benchmark_workdir.clone()),
-        KStr::BenchmarkPreset => pgo.map(|p| p.benchmark_preset.clone()),
         KStr::ProfilingQuality => pgo.map(|p| p.profiling_quality.clone()),
+        KStr::ConvertRelocate => pgo.map(|p| p.convert_relocate.clone()),
         KStr::BuildUser => pgo.and_then(|p| p.build_user.clone()),
         KStr::SysctlCommand => pgo.and_then(|p| p.sysctl_command.clone()),
         KStr::PgoPreset => pgo.map(|p| p.preset.clone()),
@@ -5385,21 +5491,27 @@ fn kstr_value(pkg: &PackageSection, field: KStr) -> String {
 }
 
 fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
-    if matches!(field, KStr::BenchmarkPreset) {
-        let pgo = pkg.pgo.get_or_insert_with(Default::default);
-        pgo.benchmark_preset = if value.trim().is_empty() {
-            "fast".into()
-        } else {
-            value.trim().to_string()
+    if matches!(field, KStr::Zram) {
+        pkg.zram = match value.trim().to_ascii_lowercase().as_str() {
+            "" | "inherit" => None,
+            other => Some(other.to_string()),
         };
         return;
     }
     if matches!(field, KStr::ProfilingQuality) {
         let pgo = pkg.pgo.get_or_insert_with(Default::default);
         pgo.profiling_quality = if value.trim().is_empty() {
-            "maximum".into()
+            "sweet".into()
         } else {
             value.trim().to_string()
+        };
+        return;
+    }
+    if matches!(field, KStr::ConvertRelocate) {
+        let pgo = pkg.pgo.get_or_insert_with(Default::default);
+        pgo.convert_relocate = match value.trim().to_ascii_lowercase().as_str() {
+            "smart" => "smart".into(),
+            _ => "force".into(),
         };
         return;
     }
@@ -5476,6 +5588,7 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
         KStr::Source => pkg.source = opt,
         KStr::BuildEnv => pkg.build_env = opt,
         KStr::Ramdisk => pkg.ramdisk = opt,
+        KStr::Zram => pkg.zram = opt,
         KStr::Alias => pkg.alias = opt,
         KStr::Compiler => pkg.compiler = opt,
         KStr::UpstreamGithub => pkg.upstream_github = opt,
@@ -5509,7 +5622,12 @@ fn set_kstr(pkg: &mut PackageSection, field: KStr, value: String) {
                 .get_or_insert_with(Default::default)
                 .benchmark_workdir = opt
         }
-        KStr::BenchmarkPreset | KStr::ProfilingQuality => unreachable!("handled above"),
+        KStr::ProfilingQuality => {
+            unreachable!("handled above")
+        }
+        KStr::ConvertRelocate => {
+            unreachable!("handled above")
+        }
         KStr::BuildUser => pkg.pgo.get_or_insert_with(Default::default).build_user = opt,
         KStr::SysctlCommand => pkg.pgo.get_or_insert_with(Default::default).sysctl_command = opt,
         KStr::PgoPreset
@@ -5567,6 +5685,7 @@ fn kbool_value(pkg: &PackageSection, field: KBool) -> bool {
             .as_ref()
             .map(|p| p.reuse_propeller_profile)
             .unwrap_or(false),
+        KBool::PgoSkipPropeller => pkg.pgo.as_ref().map(|p| p.skip_propeller).unwrap_or(false),
         KBool::CcHarder => pkg
             .kernel
             .as_ref()
@@ -5641,6 +5760,9 @@ fn set_kbool(pkg: &mut PackageSection, field: KBool, value: bool) {
             pkg.pgo
                 .get_or_insert_with(Default::default)
                 .reuse_propeller_profile = value
+        }
+        KBool::PgoSkipPropeller => {
+            pkg.pgo.get_or_insert_with(Default::default).skip_propeller = value
         }
         KBool::CcHarder => {
             pkg.kernel.get_or_insert_with(Default::default).cc_harder =
@@ -6026,7 +6148,7 @@ mod pgo_abort_tests {
 mod pgo_wait_tests {
     use super::{
         pgo_default_selected_stage, pgo_is_wait_reboot, pgo_resume_stage_arg,
-        pgo_saved_at_wait_reboot,
+        pgo_saved_at_wait_reboot, pgo_show_pipeline_continue, pgo_show_start_from_phase,
     };
 
     #[test]
@@ -6051,5 +6173,32 @@ mod pgo_wait_tests {
     fn default_selected_after_start_reboot_is_debug_build() {
         assert_eq!(pgo_default_selected_stage("wait_reboot0"), "stage1_build");
         assert_eq!(pgo_default_selected_stage("wait_reboot3"), "stage3_build");
+    }
+
+    #[test]
+    fn continue_is_offered_for_in_progress_kernel_compile() {
+        assert!(
+            pgo_show_pipeline_continue("stage1_build"),
+            "saved debug kernel compile must offer Continue, not only Start from scratch"
+        );
+        assert!(pgo_show_pipeline_continue("stage2_build"));
+        assert!(pgo_show_pipeline_continue("stage3_profile"));
+        assert!(pgo_show_pipeline_continue("stage3_build"));
+        assert!(
+            !pgo_show_start_from_phase("stage1_build", "stage1_build"),
+            "Start from current phase stays hidden at the first node; Continue covers resume"
+        );
+    }
+
+    #[test]
+    fn continue_is_not_offered_without_a_resumable_pipeline() {
+        assert!(!pgo_show_pipeline_continue(""));
+        assert!(!pgo_show_pipeline_continue("done"));
+        assert!(!pgo_show_pipeline_continue("aborted"));
+        assert!(
+            !pgo_show_pipeline_continue("wait_reboot1"),
+            "wait gates use Continue after reboot, not the in-progress Continue"
+        );
+        assert!(!pgo_show_pipeline_continue("wait_reboot0"));
     }
 }

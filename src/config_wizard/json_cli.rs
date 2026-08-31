@@ -131,6 +131,7 @@ fn field_json(doc: &DocumentMut, field: &FieldDef) -> WizardFieldJson {
                     let prefix = match field.id {
                         "build.default_environment" => "wizard.choice.env",
                         "build.global_cpu_threads_mode" => "wizard.choice.cpu",
+                        "ramdisk.zram" => "wizard.choice.zram",
                         _ => "wizard.choice",
                     };
                     ChoiceJson {

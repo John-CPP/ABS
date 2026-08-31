@@ -3,8 +3,9 @@
 //! Auto-restart installs `/etc/sudoers.d/abs-pgo-<uid>` so this user may run
 //! `abs --pgo-priv -- CMD…` without a password. The helper (this module) is the
 //! only NOPASSWD target; it rejects anything outside a PGO-oriented allowlist.
-//! The drop-in is removed when no auto-resume unit remains (pipeline done, abort,
-//! or purge).
+//! The drop-in is removed when no auto-resume unit remains (pipeline done or abort
+//! via `remove_pgo_auto_resume_service`, or `--purge`). Unrelated abs commands
+//! such as `-R` must not touch it.
 
 use crate::blog;
 use crate::utils::{run_command, sh_single_quote, write_file_mode};
@@ -16,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static CLIENT_ENABLED: AtomicBool = AtomicBool::new(false);
 
-const DROP_CACHES_SH: &str = "sync; echo 1 > /proc/sys/vm/drop_caches";
+/// Page cache + dentries + inodes. Scored comparisons and profiling must start cold.
+pub(crate) const DROP_CACHES_SH: &str = "sync; echo 3 > /proc/sys/vm/drop_caches";
 
 pub fn take_cli_args<I, S>(args: I) -> Option<Vec<String>>
 where
@@ -188,6 +190,7 @@ pub fn install_dropin() -> Result<(), String> {
 }
 
 /// Remove the drop-in when no `abs-pgo@` auto-resume unit is still enabled.
+/// Call from PGO auto-resume teardown only — not from generic process exit.
 pub fn maybe_remove_dropin() {
     if resume_unit_enabled() {
         return;
@@ -387,6 +390,10 @@ fn validate_command(argv: &[String]) -> Result<(), String> {
         "systemctl" => validate_systemctl(&argv[1..]),
         "reboot" => validate_reboot(&argv[1..]),
         "grub-reboot" | "grub2-reboot" => validate_grub_reboot(&argv[1..]),
+        "modprobe" => validate_modprobe(&argv[1..]),
+        "zramctl" => validate_zramctl(&argv[1..]),
+        "mkswap" => validate_mkswap(&argv[1..]),
+        "swapon" | "swapoff" => validate_swap_device(cmd, &argv[1..]),
         _ if looks_like_sysctl_script(cmd) => validate_sysctl_script(cmd, &argv[1..]),
         other => Err(format!("abs --pgo-priv does not allow command {other:?}")),
     }
@@ -741,6 +748,117 @@ fn validate_grub_reboot(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn validate_modprobe(args: &[String]) -> Result<(), String> {
+    if args == ["zram"] {
+        Ok(())
+    } else {
+        Err("abs --pgo-priv only allows `modprobe zram`".into())
+    }
+}
+
+fn zramctl_size_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    matches!(
+        &s[i..],
+        "" | "K" | "k" | "M" | "m" | "G" | "g" | "T" | "t" | "KiB" | "MiB" | "GiB"
+    )
+}
+
+fn validate_zramctl(args: &[String]) -> Result<(), String> {
+    let mut i = 0;
+    let mut saw_find = false;
+    let mut reset_dev: Option<&str> = None;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--find" | "-f" => {
+                saw_find = true;
+                i += 1;
+            }
+            "--size" | "-s" => {
+                let Some(sz) = args.get(i + 1) else {
+                    return Err("zramctl --size requires a value".into());
+                };
+                if !zramctl_size_ok(sz) {
+                    return Err(format!("abs --pgo-priv rejected zramctl size {sz}"));
+                }
+                i += 2;
+            }
+            "--algorithm" | "-a" => {
+                let Some(alg) = args.get(i + 1).map(String::as_str) else {
+                    return Err("zramctl --algorithm requires a value".into());
+                };
+                if alg != "zstd" {
+                    return Err(format!("abs --pgo-priv rejected zramctl algorithm {alg}"));
+                }
+                i += 2;
+            }
+            "--reset" | "-r" => {
+                let Some(dev) = args.get(i + 1).map(String::as_str) else {
+                    return Err("zramctl --reset requires a device".into());
+                };
+                if !crate::zram::is_zram_dev(dev) {
+                    return Err(format!("abs --pgo-priv rejected zramctl device {dev}"));
+                }
+                reset_dev = Some(dev);
+                i += 2;
+            }
+            other if crate::zram::is_zram_dev(other) => {
+                i += 1;
+            }
+            other => {
+                return Err(format!("abs --pgo-priv rejected zramctl argument {other}"));
+            }
+        }
+    }
+    if saw_find || reset_dev.is_some() {
+        Ok(())
+    } else {
+        Err("abs --pgo-priv zramctl requires --find or --reset".into())
+    }
+}
+
+fn validate_mkswap(args: &[String]) -> Result<(), String> {
+    if args.len() == 3 && args[0] == "-L" && crate::zram::is_abs_pgo_label(&args[1]) {
+        if crate::zram::is_zram_dev(&args[2]) {
+            return Ok(());
+        }
+        return Err(format!(
+            "abs --pgo-priv mkswap device must be /dev/zramN (got {})",
+            args[2]
+        ));
+    }
+    Err("abs --pgo-priv only allows `mkswap -L abs-pgo /dev/zramN`".into())
+}
+
+fn validate_swap_device(cmd: &str, args: &[String]) -> Result<(), String> {
+    let paths: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if paths.len() != 1 {
+        return Err(format!("abs --pgo-priv {cmd} requires one /dev/zramN"));
+    }
+    if crate::zram::is_zram_dev(paths[0]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "abs --pgo-priv {cmd} is limited to /dev/zramN (got {})",
+            paths[0]
+        ))
+    }
+}
+
 fn looks_like_sysctl_script(cmd: &str) -> bool {
     Path::new(cmd).is_absolute()
 }
@@ -803,6 +921,9 @@ fn abs_named_dir(path: &str) -> Result<(), String> {
 }
 
 fn path_writable_for_pgo(path: &str) -> Result<(), String> {
+    if crate::zram::is_zram_mem_limit_sysfs(path) {
+        return Ok(());
+    }
     let p = Path::new(path);
     if is_blocked_root(p) {
         return Err(format!("abs --pgo-priv refused system path {path}"));
@@ -825,12 +946,17 @@ fn path_writable_for_pgo(path: &str) -> Result<(), String> {
         || path_under(p, Path::new("/var/tmp"))
         || path_under(p, Path::new("/opt"))
         || path_has_abs_component(p).is_ok()
+        || path_has_pgo_convert_component(p)
     {
         return Ok(());
     }
     Err(format!(
-        "abs --pgo-priv path must be under home/tmp/run or named abs*: {path}"
+        "abs --pgo-priv path must be under home/tmp/run, named abs*, or under pgo-convert: {path}"
     ))
+}
+
+fn path_has_pgo_convert_component(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "pgo-convert")
 }
 
 fn path_has_abs_component(path: &Path) -> Result<(), String> {
@@ -1288,6 +1414,63 @@ mod tests {
     }
 
     #[test]
+    fn validate_allows_convert_spill_outside_home_tmp_run() {
+        // `{profiles_archive_dir}/pgo-convert/<pkg>/` is convert scratch, not an
+        // abs*-named dir, and the archive may live on a data mount.
+        v(&[
+            "chown",
+            "-hR",
+            "john:john",
+            "/media/storage/tmp/pgo-convert/linux-cachyos/propeller.data",
+        ])
+        .unwrap();
+        v(&[
+            "rm",
+            "-f",
+            "/media/storage/tmp/pgo-convert/linux-cachyos/propeller.data",
+        ])
+        .unwrap();
+        v(&[
+            "mkdir",
+            "-p",
+            "/media/storage/tmp/pgo-convert/linux-cachyos",
+        ])
+        .unwrap();
+        let err = v(&[
+            "chown",
+            "-hR",
+            "john:john",
+            "/media/storage/tmp/linux-cachyos/propeller.data",
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("home/tmp/run") || err.contains("named abs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_abs_pgo_zram_commands() {
+        v(&["modprobe", "zram"]).unwrap();
+        v(&["zramctl", "--find", "--size", "16G", "--algorithm", "zstd"]).unwrap();
+        v(&["zramctl", "--reset", "/dev/zram0"]).unwrap();
+        v(&["mkswap", "-L", "abs-pgo", "/dev/zram0"]).unwrap();
+        v(&["swapon", "/dev/zram0"]).unwrap();
+        v(&["swapoff", "/dev/zram0"]).unwrap();
+        v(&["tee", "/sys/block/zram0/mem_limit"]).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_non_abs_swap() {
+        assert!(v(&["swapon", "/var/swapfile"]).is_err());
+        assert!(v(&["swapon", "/dev/sda1"]).is_err());
+        assert!(v(&["mkswap", "/dev/zram0"]).is_err());
+        assert!(v(&["mkswap", "-L", "other", "/dev/zram0"]).is_err());
+        assert!(v(&["modprobe", "zram", "num_devices=8"]).is_err());
+        assert!(v(&["zramctl", "--reset", "/dev/sda"]).is_err());
+    }
+
+    #[test]
     fn validate_allows_privilege_drop_for_benchmark() {
         let got = v(&[
             "-H",
@@ -1305,5 +1488,31 @@ mod tests {
         assert!(v(&["env", "FOO=1", "true"]).is_err());
         assert!(v(&["-u", "root", "id"]).is_err());
         assert!(v(&["-u", "builder"]).is_err());
+    }
+
+    #[test]
+    fn sudoers_dropin_is_not_gc_from_ramdisk_shutdown() {
+        // RamdiskShutdown Drop runs for every abs command (including `abs -R`).
+        // The passwordless helper belongs to the PGO auto-resume lifecycle, not ramdisk.
+        let ramdisk = include_str!("ramdisk.rs");
+        assert!(
+            !ramdisk.contains("maybe_remove_dropin"),
+            "ramdisk::shutdown must not remove /etc/sudoers.d/abs-pgo-* (non-PGO commands share that path)"
+        );
+        let pgo = include_str!("pgo.rs");
+        let start = pgo
+            .find("pub fn remove_pgo_auto_resume_service")
+            .expect("remove_pgo_auto_resume_service");
+        let rest = &pgo[start..];
+        let body_end = rest[1..]
+            .find("\nfn ")
+            .or_else(|| rest[1..].find("\npub fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..body_end];
+        assert!(
+            body.contains("maybe_remove_dropin") || body.contains("remove_dropin"),
+            "remove_pgo_auto_resume_service must drop the sudoers helper when no resume unit remains"
+        );
     }
 }

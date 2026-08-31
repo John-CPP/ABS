@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -238,6 +239,17 @@ pub struct SystemUpdateSection {
     pub ignore_flag: String,
     #[serde(default)]
     pub ignore_packages: Vec<String>,
+    /// Minutes between automatic pending-update fetches. `0` = only the Refresh button
+    /// (first visit this session still loads the list). Accepts a TOML integer or string.
+    #[serde(
+        default,
+        alias = "system_update_auto_refresh_delay",
+        deserialize_with = "deserialize_u32_from_int_or_str"
+    )]
+    pub auto_refresh_delay: u32,
+    /// When true, AbsGui keeps the sudo password in a private runtime file until the app exits.
+    #[serde(default, alias = "system_update_remember_sudo")]
+    pub remember_sudo: bool,
 }
 
 fn default_pacman_sy() -> String {
@@ -258,8 +270,72 @@ impl Default for SystemUpdateSection {
             command_to_perform_system_update_no_refresh: None,
             ignore_flag: default_ignore(),
             ignore_packages: Vec::new(),
+            auto_refresh_delay: 0,
+            remember_sudo: false,
         }
     }
+}
+
+/// Whether AbsGui should fetch the pending-update list.
+///
+/// A missing list (first visit this session) always fetches. `delay_minutes == 0`
+/// never auto-refreshes after a list is already in hand.
+pub fn pending_list_needs_fetch(
+    delay_minutes: u32,
+    last_refresh: Option<Instant>,
+    now: Instant,
+    have_list: bool,
+) -> bool {
+    if !have_list {
+        return true;
+    }
+    if delay_minutes == 0 {
+        return false;
+    }
+    let Some(last) = last_refresh else {
+        return true;
+    };
+    now.saturating_duration_since(last) >= Duration::from_secs(u64::from(delay_minutes) * 60)
+}
+
+fn deserialize_u32_from_int_or_str<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct U32Loose;
+
+    impl<'de> Visitor<'de> for U32Loose {
+        type Value = u32;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a non-negative integer or a numeric string")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
+            u32::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
+            u32::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_u32<E: de::Error>(self, v: u32) -> Result<u32, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
+            v.trim().parse().map_err(E::custom)
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<u32, E> {
+            self.visit_str(&v)
+        }
+    }
+
+    deserializer.deserialize_any(U32Loose)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,6 +364,8 @@ pub struct RamdiskSection {
     pub warn_packages_ram: bool,
     #[serde(default = "default_true")]
     pub reclaim_mount_on_startup: bool,
+    #[serde(default = "default_zram")]
+    pub zram: String,
 }
 
 fn default_mount() -> String {
@@ -301,6 +379,9 @@ fn default_mode() -> String {
 }
 fn default_min_free_ram() -> u64 {
     4096
+}
+fn default_zram() -> String {
+    "full".into()
 }
 
 impl Default for RamdiskSection {
@@ -318,6 +399,7 @@ impl Default for RamdiskSection {
             min_free_ram_mb: default_min_free_ram(),
             warn_packages_ram: true,
             reclaim_mount_on_startup: true,
+            zram: default_zram(),
         }
     }
 }
@@ -360,6 +442,8 @@ pub struct PackageSection {
     pub post_update_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramdisk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zram: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compilation_threads: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -438,10 +522,16 @@ pub struct PgoSection {
     pub perf_data_on_ram: bool,
     #[serde(default = "default_true")]
     pub propeller_profiles_on_ram: bool,
+    #[serde(default = "default_convert_relocate")]
+    pub convert_relocate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_command: Option<String>,
     #[serde(default = "default_benchmark_preset")]
     pub benchmark_preset: String,
+    #[serde(default = "default_compare_preset")]
+    pub compare_preset: String,
+    #[serde(default = "default_kernel_workload_seconds")]
+    pub kernel_workload_seconds: u32,
     #[serde(default = "default_profiling_quality")]
     pub profiling_quality: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,6 +565,8 @@ pub struct PgoSection {
     #[serde(default)]
     pub reuse_propeller_profile: bool,
     #[serde(default)]
+    pub skip_propeller: bool,
+    #[serde(default)]
     pub compare_current: bool,
     #[serde(default)]
     pub compare_debug: bool,
@@ -507,7 +599,7 @@ fn default_afdo_profile_name() -> String {
 }
 
 fn default_perf_extra_args() -> String {
-    "--mmap-pages 131072 -a -N -b -c 56000".into()
+    "--mmap-pages 4096 -a -N -b -c 1000003".into()
 }
 
 fn default_perf_event_args() -> String {
@@ -519,11 +611,23 @@ fn default_auto() -> String {
 }
 
 fn default_benchmark_preset() -> String {
-    "fast".into()
+    "kernel".into()
+}
+
+fn default_compare_preset() -> String {
+    "auto".into()
+}
+
+fn default_kernel_workload_seconds() -> u32 {
+    0
 }
 
 fn default_profiling_quality() -> String {
-    "maximum".into()
+    "sweet".into()
+}
+
+fn default_convert_relocate() -> String {
+    "force".into()
 }
 
 impl Default for PgoSection {
@@ -535,8 +639,11 @@ impl Default for PgoSection {
             profile_scratch_dir: default_auto(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
+            convert_relocate: default_convert_relocate(),
             benchmark_command: None,
             benchmark_preset: default_benchmark_preset(),
+            compare_preset: default_compare_preset(),
+            kernel_workload_seconds: default_kernel_workload_seconds(),
             profiling_quality: default_profiling_quality(),
             benchmark_workdir: None,
             build_user: None,
@@ -553,6 +660,7 @@ impl Default for PgoSection {
             reboot_before_start: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
+            skip_propeller: false,
             compare_current: false,
             compare_debug: false,
             compare_debug_clean: false,
@@ -665,6 +773,7 @@ impl ConfigDocument {
         let default_source = self.kernel_defaults.source.clone();
         let default_build_env = self.kernel_defaults.build_env.clone();
         let default_ramdisk = self.kernel_defaults.ramdisk.clone();
+        let default_zram = self.kernel_defaults.zram.clone();
 
         let pkg = self.packages.get_mut(name).expect("just inserted");
         if pkg.kernel.as_ref().is_none_or(KernelSection::is_unset) {
@@ -682,5 +791,40 @@ impl ConfigDocument {
         if pkg.ramdisk.is_none() {
             pkg.ramdisk = default_ramdisk;
         }
+        if pkg.zram.is_none() {
+            pkg.zram = default_zram;
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_refresh_tests {
+    use super::pending_list_needs_fetch;
+    use std::time::{Duration, Instant};
+
+    fn ago(now: Instant, minutes: u64) -> Instant {
+        now.checked_sub(Duration::from_secs(minutes * 60))
+            .expect("instant")
+    }
+
+    #[test]
+    fn first_visit_always_fetches() {
+        let now = Instant::now();
+        assert!(pending_list_needs_fetch(0, None, now, false));
+        assert!(pending_list_needs_fetch(15, None, now, false));
+    }
+
+    #[test]
+    fn zero_delay_never_auto_refreshes_after_a_list_exists() {
+        let now = Instant::now();
+        assert!(!pending_list_needs_fetch(0, Some(ago(now, 120)), now, true));
+    }
+
+    #[test]
+    fn positive_delay_refreshes_when_interval_elapsed() {
+        let now = Instant::now();
+        assert!(!pending_list_needs_fetch(15, Some(ago(now, 14)), now, true));
+        assert!(pending_list_needs_fetch(15, Some(ago(now, 15)), now, true));
+        assert!(pending_list_needs_fetch(15, None, now, true));
     }
 }

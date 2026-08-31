@@ -157,7 +157,8 @@ pub fn view<'a>(
     stdin_enabled: bool,
 ) -> Element<'a, Message> {
     let can_act = !busy && !pending_loading;
-    let can_update_all = can_act && pending.is_some_and(|p| p.has_work());
+    let pgo_blocked = pending.is_some_and(pgo_is_blocking);
+    let can_update_all = can_act && !pgo_blocked && pending.is_some_and(|p| p.has_work());
 
     let mut col = column![crate::widgets::breadcrumb_row(
         abs_i18n::t("gui.nav.system_update"),
@@ -168,40 +169,45 @@ pub fn view<'a>(
     .spacing(10);
 
     if let Some(data) = pending {
+        if pgo_is_blocking(data) {
+            col = col.push(pgo_paused_banner(data, theme));
+        }
         let n = data.repo.len() + data.aur.len() + data.manual.len();
-        col = col.push(
-            container(
-                row![
-                    text(abs_i18n::tf(
-                        "gui.system_update.pending_banner",
-                        &[("n", &n.to_string())],
-                    ))
-                    .size(13)
-                    .font(Font {
-                        weight: iced::font::Weight::Bold,
-                        ..Font::DEFAULT
-                    }),
-                    Space::new().width(Length::Fill),
-                    text(abs_i18n::tf(
-                        "gui.system_update.helper",
-                        &[(
-                            "name",
-                            if data.helper.is_empty() {
-                                "?"
-                            } else {
-                                data.helper.as_str()
-                            },
-                        )],
-                    ))
-                    .size(style::TEXT_HELP)
-                    .color(style::muted(theme)),
-                ]
-                .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([8.0, 14.0]))
-            .width(Length::Fill)
-            .style(style::card_banner(theme)),
-        );
+        if n > 0 || !pgo_is_blocking(data) {
+            col = col.push(
+                container(
+                    row![
+                        text(abs_i18n::tf(
+                            "gui.system_update.pending_banner",
+                            &[("n", &n.to_string())],
+                        ))
+                        .size(13)
+                        .font(Font {
+                            weight: iced::font::Weight::Bold,
+                            ..Font::DEFAULT
+                        }),
+                        Space::new().width(Length::Fill),
+                        text(abs_i18n::tf(
+                            "gui.system_update.helper",
+                            &[(
+                                "name",
+                                if data.helper.is_empty() {
+                                    "?"
+                                } else {
+                                    data.helper.as_str()
+                                },
+                            ),],
+                        ))
+                        .size(style::TEXT_HELP)
+                        .color(style::muted(theme)),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([8.0, 14.0]))
+                .width(Length::Fill)
+                .style(style::card_banner(theme)),
+            );
+        }
     }
 
     col = col.push(
@@ -218,7 +224,7 @@ pub fn view<'a>(
                 .padding(Padding::from([6.0, 12.0]))
                 .style(style::btn_secondary(theme))
                 .on_press_maybe(
-                    (can_act && pending.is_some_and(|p| !p.repo.is_empty()))
+                    (can_act && !pgo_blocked && pending.is_some_and(|p| !p.repo.is_empty()))
                         .then_some(Message::InstallRepoUpdates),
                 ),
             button(text(abs_i18n::t("gui.common.abort")).size(13))
@@ -235,7 +241,7 @@ pub fn view<'a>(
     }
 
     if let Some(data) = pending {
-        col = col.push(pending_dense_table(data, can_act, theme));
+        col = col.push(pending_dense_table(data, can_act && !pgo_blocked, theme));
         if !data.skipped.is_empty() {
             col = col.push(skipped_table(data, theme));
         }
@@ -308,7 +314,7 @@ fn pending_dense_table<'a>(
     }
 
     if rows.is_empty() {
-        return text(abs_i18n::t("gui.common.up_to_date"))
+        return text(empty_pending_copy(data))
             .size(13)
             .color(style::muted(theme))
             .into();
@@ -430,6 +436,67 @@ fn status_label<'a>(
         .into()
 }
 
+pub fn pgo_is_blocking(data: &PendingUpdates) -> bool {
+    !data.pgo_pipelines.is_empty()
+}
+
+pub fn empty_pending_copy(data: &PendingUpdates) -> String {
+    if pgo_is_blocking(data) {
+        abs_i18n::t("gui.system_update.pgo_paused_empty").to_string()
+    } else {
+        abs_i18n::t("gui.common.up_to_date").to_string()
+    }
+}
+
+pub fn skip_reason_label(reason: &str) -> String {
+    match reason {
+        "pgo_pipeline" => abs_i18n::t("gui.system_update.skip_pgo_pipeline").to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn no_updates_message(pending: Option<&PendingUpdates>) -> String {
+    if pending.is_some_and(pgo_is_blocking) {
+        abs_i18n::t("gui.msg.no_updates_pgo").to_string()
+    } else {
+        abs_i18n::t("gui.msg.no_updates").to_string()
+    }
+}
+
+fn pgo_paused_banner<'a>(data: &'a PendingUpdates, theme: AppTheme) -> Element<'a, Message> {
+    let mut body = column![text(abs_i18n::t("gui.system_update.pgo_paused"))
+        .size(13)
+        .font(Font {
+            weight: iced::font::Weight::Bold,
+            ..Font::DEFAULT
+        })
+        .color(style::warning(theme)),]
+    .spacing(6);
+    for pipeline in &data.pgo_pipelines {
+        body = body.push(
+            text(abs_i18n::tf(
+                "gui.system_update.pgo_paused_pkg",
+                &[
+                    ("package", pipeline.package.as_str()),
+                    ("stage", pipeline.stage_label.as_str()),
+                ],
+            ))
+            .size(12)
+            .color(style::warning(theme)),
+        );
+    }
+    body = body.push(
+        text(abs_i18n::t("gui.system_update.pgo_paused_hint"))
+            .size(12)
+            .color(style::muted(theme)),
+    );
+    container(body)
+        .padding(Padding::from([10.0, 14.0]))
+        .width(Length::Fill)
+        .style(style::warning_banner(theme))
+        .into()
+}
+
 fn skipped_table<'a>(data: &'a PendingUpdates, theme: AppTheme) -> Element<'a, Message> {
     const COLS: &[u16] = &[3, 4, 3];
     let header = container(dense_table_row(
@@ -457,7 +524,7 @@ fn skipped_table<'a>(data: &'a PendingUpdates, theme: AppTheme) -> Element<'a, M
                 .size(12)
                 .color(style::muted(theme))
                 .into(),
-                text(pkg.reason.clone())
+                text(skip_reason_label(&pkg.reason))
                     .size(11)
                     .color(style::muted(theme))
                     .into(),
@@ -513,5 +580,63 @@ mod tests {
         assert!(super::gear_angle(0.0).abs() < 1e-5);
         assert!((super::gear_angle(super::GEAR_TURN_SECS) - std::f32::consts::TAU).abs() < 1e-4);
         assert!(super::gear_angle(super::GEAR_TURN_SECS / 2.0) > 0.0);
+    }
+
+    fn empty_pending() -> crate::abs_runner::PendingUpdates {
+        crate::abs_runner::PendingUpdates::default()
+    }
+
+    fn pending_with_pgo() -> crate::abs_runner::PendingUpdates {
+        crate::abs_runner::PendingUpdates {
+            pgo_pipelines: vec![crate::abs_runner::PgoPipelineHold {
+                package: "linux-cachyos".into(),
+                stage_label: "Waiting for reboot (boot stage-2 kernel)".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_list_without_pgo_is_up_to_date() {
+        assert_eq!(
+            super::empty_pending_copy(&empty_pending()),
+            abs_i18n::t("gui.common.up_to_date")
+        );
+        assert!(!super::pgo_is_blocking(&empty_pending()));
+    }
+
+    #[test]
+    fn empty_list_with_unfinished_pgo_explains_pause() {
+        let copy = super::empty_pending_copy(&pending_with_pgo());
+        assert_ne!(copy, abs_i18n::t("gui.common.up_to_date"));
+        assert!(
+            copy.contains("PGO") || copy.to_lowercase().contains("pgo"),
+            "empty system-update list must say PGO is why nothing is installable: {copy}"
+        );
+        assert!(super::pgo_is_blocking(&pending_with_pgo()));
+    }
+
+    #[test]
+    fn skip_reason_pgo_pipeline_is_human() {
+        let label = super::skip_reason_label("pgo_pipeline");
+        assert_ne!(label, "pgo_pipeline");
+        assert!(
+            label.contains("PGO") || label.to_lowercase().contains("pgo"),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn no_updates_message_mentions_pgo_when_pipeline_is_active() {
+        assert_eq!(
+            super::no_updates_message(Some(&empty_pending())),
+            abs_i18n::t("gui.msg.no_updates")
+        );
+        let msg = super::no_updates_message(Some(&pending_with_pgo()));
+        assert_ne!(msg, abs_i18n::t("gui.msg.no_updates"));
+        assert!(
+            msg.contains("PGO") || msg.to_lowercase().contains("pgo"),
+            "{msg}"
+        );
     }
 }

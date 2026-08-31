@@ -765,6 +765,21 @@ const CPU_MODE_CHOICES: &[ChoiceDef] = &[
     },
 ];
 
+const ZRAM_CHOICES: &[ChoiceDef] = &[
+    ChoiceDef {
+        value: "full",
+        label: "As much as remaining RAM allows (full)",
+        help: "Always sets up ABS zram using almost all remaining MemAvailable as the compressed-RAM cap, with disksize at 4× that. Used for compiles and system updates, not only converting profiles. Unused zram is a cap, not reserved up front.",
+        suggested: true,
+    },
+    ChoiceDef {
+        value: "off",
+        label: "Do not add ABS zram (off)",
+        help: "Never bring up the temporary abs-pgo zram device. Use this if you already have enough RAM or your own swap.",
+        suggested: false,
+    },
+];
+
 pub static STEPS: &[StepDef] = &[
     StepDef {
         id: "absgui",
@@ -1140,6 +1155,32 @@ const SYSTEM_UPDATE_FIELDS: &[FieldDef] = &[
         path_pick: PathPick::None,
     },
     FieldDef {
+        id: "system_update.auto_refresh_delay",
+        kind: FieldKind::Usize,
+        title: "How often should AbsGui refresh the pending-update list by itself? (minutes)",
+        explanation: "0 means only when you press Refresh. 15 means every 15 minutes while the System update page is open, and when you come back after 15 minutes. The first visit still loads the list.",
+        suggested: Suggested::Usize(0),
+        optional: false,
+        in_gap_fill: false,
+        choices: &[],
+        usize_min: 0,
+        visible_if: VisibleIf::Always,
+        path_pick: PathPick::None,
+    },
+    FieldDef {
+        id: "system_update.remember_sudo",
+        kind: FieldKind::Bool,
+        title: "Remember your sudo password until AbsGui is closed?",
+        explanation: "Yes: type the password once; AbsGui keeps it in a private file until you quit. No: ask every time a command needs sudo (same as today).",
+        suggested: Suggested::Bool(false),
+        optional: false,
+        in_gap_fill: false,
+        choices: &[],
+        usize_min: 0,
+        visible_if: VisibleIf::Always,
+        path_pick: PathPick::None,
+    },
+    FieldDef {
         id: "system_update.ignore_flag",
         kind: FieldKind::String,
         title: "How should the updater skip a package?",
@@ -1271,6 +1312,19 @@ const RAMDISK_FIELDS: &[FieldDef] = &[
         choices: &[],
         usize_min: 0,
         visible_if: VisibleIf::RamdiskEnabled,
+        path_pick: PathPick::None,
+    },
+    FieldDef {
+        id: "ramdisk.zram",
+        kind: FieldKind::Choice,
+        title: "How should ABS size temporary compressed swap (zram)?",
+        explanation: "full (recommended) always gives as much compressed swap as remaining RAM allows. Unused zram is a cap, not reserved up front. off disables ABS zram. This is independent of the RAM disk — used for compiles and system updates, not only converting profiles.",
+        suggested: Suggested::Str("full"),
+        optional: false,
+        in_gap_fill: true,
+        choices: ZRAM_CHOICES,
+        usize_min: 0,
+        visible_if: VisibleIf::Always,
         path_pick: PathPick::None,
     },
 ];
@@ -1445,6 +1499,21 @@ mod tests {
         assert!(!title.is_empty());
         assert_ne!(title, "paths.packages_path");
         assert_eq!(display_title_for_gap_key("unknown.key"), "unknown.key");
+    }
+
+    #[test]
+    fn auto_refresh_delay_reads_quoted_number() {
+        let doc: DocumentMut = r#"
+[system_update]
+auto_refresh_delay = "15"
+remember_sudo = true
+"#
+        .parse()
+        .unwrap();
+        let delay = field_by_id("system_update.auto_refresh_delay").unwrap();
+        assert_eq!(current_json(&doc, delay), json!(15));
+        let remember = field_by_id("system_update.remember_sudo").unwrap();
+        assert_eq!(current_json(&doc, remember), json!(true));
     }
 
     #[test]

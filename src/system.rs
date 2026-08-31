@@ -145,10 +145,23 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
 
     vlog!("Executing system update: {}", argv.join(" "));
 
+    if zram_for_system_update(mode) {
+        crate::zram::require_headroom(
+            "system update",
+            config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+            config.zram_mode_for(None).unwrap_or_else(|e| die!("{e}")),
+        );
+    }
+
     if let Err(e) = run_argv_command(&argv, None::<&str>) {
         die!("System update failed: {}", e);
     }
     true
+}
+
+/// Repo refresh (`pacman -Sy` / pending-list fetch) is not a compile. Zram is for `-U` / `-RU`.
+fn zram_for_system_update(mode: SystemUpdateMode) -> bool {
+    !matches!(mode, SystemUpdateMode::UpdateRepositories)
 }
 
 fn system_update_mode_label(mode: SystemUpdateMode) -> &'static str {
@@ -232,6 +245,8 @@ mod tests {
                 command_to_perform_system_update_no_refresh: None,
                 ignore_flag: "--ignore".into(),
                 ignore_packages: ignore.into_iter().map(String::from).collect(),
+                auto_refresh_delay: 0,
+                remember_sudo: false,
             },
             repositories: Default::default(),
             manual_update_packages: manual.into_iter().map(String::from).collect(),
@@ -286,6 +301,15 @@ mod tests {
             system_update_mode_label(SystemUpdateMode::PerformUpdateNoRefresh),
             "system update"
         );
+        assert!(!zram_for_system_update(
+            SystemUpdateMode::UpdateRepositories
+        ));
+        assert!(zram_for_system_update(
+            SystemUpdateMode::PerformUpdateWithRefresh
+        ));
+        assert!(zram_for_system_update(
+            SystemUpdateMode::PerformUpdateNoRefresh
+        ));
     }
 
     #[test]
@@ -306,6 +330,7 @@ mod tests {
             expected_kernel_uname: None,
             expected_package_base: None,
             stage_history: vec![],
+            compare_run_dir: None,
         };
         std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
@@ -317,10 +342,13 @@ mod tests {
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
+            convert_relocate: "force".into(),
             benchmark_command: None,
             benchmark_workdir: None,
-            benchmark_preset: "fast".into(),
-            profiling_quality: "maximum".into(),
+            benchmark_preset: "kernel".into(),
+            compare_preset: "auto".into(),
+            kernel_workload_seconds: 0,
+            profiling_quality: "sweet".into(),
             build_user: None,
             perf_event_args: "auto".into(),
             perf_extra_args: crate::config::PERF_EXTRA_ARGS_STANDARD.into(),
@@ -335,6 +363,7 @@ mod tests {
             reboot_before_start: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
+            skip_propeller: false,
             compare_current: false,
             compare_debug: false,
             compare_debug_clean: false,

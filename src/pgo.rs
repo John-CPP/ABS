@@ -2,7 +2,7 @@
 
 use crate::build::{self, PgoBuildContext};
 use crate::cli::Cli;
-use crate::config::{self, Config, KernelBuildConfig, PgoConfig};
+use crate::config::{self, Config, ConvertRelocateMode, KernelBuildConfig, PgoConfig};
 use crate::package_spec::PackageSpec;
 use crate::utils::{run_command, run_command_with_output, sh_single_quote};
 use crate::{blog, die, ewarn, vlog};
@@ -118,6 +118,108 @@ pub struct PgoState {
     pub expected_kernel_uname: Option<String>,
     pub expected_package_base: Option<String>,
     pub stage_history: Vec<String>,
+    /// Timestamped `{profiles_archive_dir}/compare-benchmarks/YYYY-MM-DD-HHMMSS`.
+    #[serde(default)]
+    pub compare_run_dir: Option<String>,
+}
+
+pub fn compare_run_stamp(unix_secs: i64) -> String {
+    let t = unix_secs as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let ptr = unsafe { libc::localtime_r(&t, tm.as_mut_ptr()) };
+    if ptr.is_null() {
+        return format!("unix-{unix_secs}");
+    }
+    let tm = unsafe { tm.assume_init() };
+    format!(
+        "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+pub fn pipeline_compare_dir(compare_root: &Path, stamp: &str) -> PathBuf {
+    compare_root.join(stamp)
+}
+
+fn ensure_compare_run_dir(state: &mut PgoState, pgo: &PgoConfig, package: &str) -> PathBuf {
+    if let Some(dir) = &state.compare_run_dir {
+        return PathBuf::from(dir);
+    }
+    let stamp = compare_run_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
+    let dir = pipeline_compare_dir(&pgo.resolved_compare_dir(package), &stamp);
+    let _ = fs::create_dir_all(&dir);
+    state.compare_run_dir = Some(dir.to_string_lossy().into_owned());
+    dir
+}
+
+const TINY_PGO_PROFILES: &[&str] = &[
+    "kernel-compilation.afdo",
+    "propeller_cc_profile.txt",
+    "propeller_ld_profile.txt",
+];
+
+/// Kbench must persist tiny profiles, leave ramdisk mounted, then drop ABS zram.
+#[cfg(test)]
+fn kbench_prep_steps() -> &'static [&'static str] {
+    &[
+        "persist_tiny_profiles",
+        "leave_ramdisk_mounted",
+        "teardown_abs_zram",
+        "run_kbench",
+        "restore_zram_if_full",
+    ]
+}
+
+fn tiny_profile_scratch_dirs(package: &str, pgo: &PgoConfig) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(mount) = crate::ramdisk::session_mount_point() {
+        dirs.push(crate::ramdisk::pgo_scratch_path(&mount, package));
+    }
+    if pgo.profile_scratch_dir != "auto" {
+        dirs.push(config::expand_user_path(&pgo.profile_scratch_dir));
+    }
+    dirs.push(std::env::temp_dir().join("abs-pgo-scratch").join(package));
+    dirs
+}
+
+fn persist_tiny_profiles_before_kbench(
+    state: &PgoState,
+    pgo: &PgoConfig,
+    package: &str,
+) -> Result<(), String> {
+    let repo = PathBuf::from(&state.repo_dir);
+    let archive = pgo.resolved_archive_dir();
+    let scratches = tiny_profile_scratch_dirs(package, pgo);
+    for name in TINY_PGO_PROFILES {
+        let dest = repo.join(name);
+        let scratch_src = scratches.iter().map(|d| d.join(name)).find(|p| p.is_file());
+        let src = if dest.is_file() {
+            dest.clone()
+        } else if let Some(src) = scratch_src {
+            copy_to_repo(&src, &dest)?;
+            src
+        } else {
+            continue;
+        };
+        if let Some(archive) = &archive {
+            fs::create_dir_all(archive)
+                .map_err(|e| format!("create archive {}: {e}", archive.display()))?;
+            let archived = archive.join(name);
+            fs::copy(&src, &archived)
+                .map_err(|e| format!("archive {} → {}: {e}", src.display(), archived.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -450,6 +552,7 @@ pub fn remove_pgo_auto_resume_service(package: &str) {
         .stderr(Stdio::null())
         .status();
     unlink_pgo_auto_resume_links(&pgo_auto_systemd_dir(), package);
+    crate::pgo_priv::maybe_remove_dropin();
 }
 
 fn pgo_auto_unit_text(abs_bin: &str) -> String {
@@ -485,6 +588,23 @@ fn transition(state: &mut PgoState, stage: PgoStageId) {
         .push(format!("{:?}", state.current_stage));
     state.current_stage = stage;
     state.updated_at = EventLog::now();
+}
+
+fn complete_pgo_pipeline(
+    state: &mut PgoState,
+    state_path: &Path,
+    pgo: &PgoConfig,
+    package: &str,
+    cli: &Cli,
+) {
+    transition(state, PgoStageId::Done);
+    crate::pkgbuild::restore_pkgbuild(Path::new(&state.repo_dir));
+    remove_pgo_auto_resume_service(package);
+    save_state(state_path, state);
+    blog!("PGO pipeline complete for {}", package);
+    if cli.json {
+        print_json_status(state, pgo);
+    }
 }
 
 fn run_start(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
@@ -558,11 +678,21 @@ fn run_start(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
         expected_kernel_uname: None,
         expected_package_base: None,
         stage_history: Vec::new(),
+        compare_run_dir: None,
     };
+    ensure_compare_run_dir(&mut state, &pgo, package);
     if plan.reboot_before_start {
         stamp_running_kernel(&mut state);
     } else {
-        maybe_run_compare_benchmark(&pgo, package, CompareStage::Current, events, false);
+        maybe_run_compare_benchmark(
+            &pgo,
+            package,
+            CompareStage::Current,
+            events,
+            config,
+            &mut state,
+            &state_path,
+        );
     }
     save_state(&state_path, &state);
     execute_current_stage(
@@ -636,6 +766,8 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
             state_path.display()
         )
     });
+    ensure_compare_run_dir(&mut state, &pgo, package);
+    save_state(&state_path, &state);
 
     if let Some(stage_raw) = cli.pgo_stage.as_deref() {
         let target = parse_pgo_stage(stage_raw).unwrap_or_else(|e| die!("{e}"));
@@ -653,7 +785,15 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
                 if pgo.verify_boot {
                     verify_boot_kernel(&state, &pgo);
                 }
-                maybe_run_compare_benchmark(&pgo, package, CompareStage::Current, events, false);
+                maybe_run_compare_benchmark(
+                    &pgo,
+                    package,
+                    CompareStage::Current,
+                    events,
+                    config,
+                    &mut state,
+                    &state_path,
+                );
                 transition(
                     &mut state,
                     first_post_start_reboot_stage(live_work_plan(&pgo)),
@@ -672,10 +812,15 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
                         package,
                         CompareStage::DebugClean,
                         events,
-                        false,
+                        config,
+                        &mut state,
+                        &state_path,
                     );
                     if plan.run_autofdo_build {
                         transition(&mut state, PgoStageId::Stage2Build);
+                    } else if pgo.skip_propeller {
+                        complete_pgo_pipeline(&mut state, &state_path, &pgo, package, cli);
+                        return;
                     } else {
                         transition(&mut state, PgoStageId::Stage3Build);
                     }
@@ -686,32 +831,38 @@ fn run_resume(package: &str, cli: &Cli, config: &Config, events: &EventLog) {
                     verify_boot_kernel(&state, &pgo);
                 }
                 let plan = live_work_plan(&pgo);
-                if plan.run_propeller_collect {
-                    transition(&mut state, PgoStageId::Stage3Profile);
-                } else {
+                if !plan.run_propeller_collect {
                     maybe_run_compare_benchmark(
                         &pgo,
                         package,
                         CompareStage::AutofdoClean,
                         events,
-                        false,
+                        config,
+                        &mut state,
+                        &state_path,
                     );
-                    transition(&mut state, PgoStageId::Stage3Build);
                 }
+                let next = after_wait_reboot2_stage(&pgo, plan);
+                if next == PgoStageId::Done {
+                    complete_pgo_pipeline(&mut state, &state_path, &pgo, package, cli);
+                    return;
+                }
+                transition(&mut state, next);
             }
             PgoStageId::WaitReboot3 => {
                 if pgo.verify_boot {
                     verify_boot_kernel(&state, &pgo);
                 }
-                maybe_run_compare_benchmark(&pgo, package, CompareStage::Final, events, false);
-                transition(&mut state, PgoStageId::Done);
-                crate::pkgbuild::restore_pkgbuild(Path::new(&state.repo_dir));
-                remove_pgo_auto_resume_service(package);
-                save_state(&state_path, &state);
-                blog!("PGO pipeline complete for {}", package);
-                if cli.json {
-                    print_json_status(&state, &pgo);
-                }
+                maybe_run_compare_benchmark(
+                    &pgo,
+                    package,
+                    CompareStage::Final,
+                    events,
+                    config,
+                    &mut state,
+                    &state_path,
+                );
+                complete_pgo_pipeline(&mut state, &state_path, &pgo, package, cli);
                 return;
             }
             PgoStageId::Done => {
@@ -868,6 +1019,7 @@ fn run_abort_inner(
     let (pgo, _) = load_pgo_config(package, config);
     let state_path = pgo.resolved_state_file(package);
     crate::utils::kill_abs_cli_processes(package);
+    crate::utils::kill_pgo_workload_processes();
     if let Some(state) = load_state(&state_path) {
         let repo = Path::new(&state.repo_dir);
         crate::utils::kill_processes_with_cwd_under(repo, "PGO repo");
@@ -878,6 +1030,10 @@ fn run_abort_inner(
             crate::utils::kill_processes_with_cwd_under(&packages_path, "packages_path");
         }
     }
+    crate::utils::kill_processes_with_cwd_under(
+        &pgo.resolved_benchmark_workdir(package),
+        "PGO benchmark workdir",
+    );
     if config.ramdisk.enabled {
         let mount = PathBuf::from(config.ramdisk.mount_point.trim());
         if !mount.as_os_str().is_empty() {
@@ -1026,24 +1182,31 @@ fn preflight(pgo: &PgoConfig, package: &str, config: &Config) {
     if which(&pgo.afdo_tool).is_none() {
         die!("PGO requires '{}' in PATH (afdo_tool)", pgo.afdo_tool);
     }
-    match resolve_propeller_tool(&pgo.propeller_tool) {
-        Ok(_) => {}
-        Err(_) if can_bootstrap_generate_propeller_profiles() => {
-            ewarn!(
-                "No Propeller converter in PATH; stage 3 will build {PROPELLER_TOOL_GENERATE} \
-                 from https://github.com/google/llvm-propeller against system LLVM"
-            );
+    if !pgo.skip_propeller {
+        match resolve_propeller_tool(&pgo.propeller_tool) {
+            Ok(_) => {}
+            Err(_) if can_bootstrap_generate_propeller_profiles() => {
+                ewarn!(
+                    "No Propeller converter in PATH; stage 3 will build {PROPELLER_TOOL_GENERATE} \
+                     from https://github.com/google/llvm-propeller against system LLVM"
+                );
+            }
+            Err(e) => die!("{e}"),
         }
-        Err(e) => die!("{e}"),
     }
     if let Err(e) = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command) {
         die!("{e}");
     }
-    if pgo.compare_any() && which("cachyos-benchmarker").is_none() {
-        die!(
-            "Comparison benchmarks require cachyos-benchmarker in PATH \
-             (enable compare_current / compare_debug_clean / compare_autofdo_clean / compare_final)"
-        );
+    let train = pgo.benchmark_preset.trim();
+    if let Err(e) = crate::config::validate_pgo_benchmark_preset(train) {
+        die!("PGO preset does not exist: packages.{package}.pgo.benchmark_preset = {train:?}\n{e}");
+    }
+    let cmp = pgo.compare_preset.trim();
+    if let Err(e) = crate::config::validate_pgo_compare_preset(cmp) {
+        die!("PGO preset does not exist: packages.{package}.pgo.compare_preset = {cmp:?}\n{e}");
+    }
+    if pgo.compare_any() {
+        blog!("Comparison benches use kbench (kernel-path metrics)");
     }
     if let Some(pc) = config.packages.get(package)
         && let Ok(targets) = crate::ramdisk::resolve_ramdisk_targets(config, Some(pc), None, None)
@@ -1113,8 +1276,10 @@ impl CompareStage {
             Self::Debug => pgo.compare_debug,
             Self::DebugClean => pgo.compare_debug_clean,
             Self::Autofdo => pgo.compare_autofdo,
-            Self::AutofdoClean => pgo.compare_autofdo_clean,
-            Self::Final => pgo.compare_final,
+            Self::AutofdoClean => {
+                pgo.compare_autofdo_clean || (pgo.skip_propeller && pgo.compare_final)
+            }
+            Self::Final => pgo.compare_final && !pgo.skip_propeller,
         }
     }
 
@@ -1141,12 +1306,11 @@ fn should_run_standalone_compare(pgo: &PgoConfig, stage: CompareStage) -> bool {
     stage.enabled(pgo) && !stage.shares_profiling_run()
 }
 
-fn profile_compare_stage(pgo: &PgoConfig, stage: CompareStage) -> Option<CompareStage> {
-    if stage.shares_profiling_run() && pgo.compare_any() {
-        Some(stage)
-    } else {
-        None
-    }
+fn profile_compare_stage(_pgo: &PgoConfig, _stage: CompareStage) -> Option<CompareStage> {
+    // Training must not share a `perf record` window with a scored comparison.
+    // Appending a scoring pass to collection dilutes AutoFDO with extra samples.
+    // Comparison is always a standalone no-perf kbench run.
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1159,14 +1323,15 @@ struct PgoWorkPlan {
 }
 
 fn pgo_work_plan(pgo: &PgoConfig, afdo_reusable: bool, propeller_reusable: bool) -> PgoWorkPlan {
+    let skip = pgo.skip_propeller;
     let afdo_ok = pgo.reuse_afdo_profile && afdo_reusable;
-    let prop_ok = pgo.reuse_propeller_profile && propeller_reusable;
+    let prop_ok = !skip && pgo.reuse_propeller_profile && propeller_reusable;
     PgoWorkPlan {
         reboot_before_start: pgo.reboot_before_start,
         run_debug_build: pgo.compare_debug_clean || !afdo_ok,
         run_afdo_collect: !afdo_ok,
-        run_autofdo_build: pgo.compare_autofdo_clean || !prop_ok,
-        run_propeller_collect: !prop_ok,
+        run_autofdo_build: skip || pgo.compare_autofdo_clean || !prop_ok,
+        run_propeller_collect: !skip && !prop_ok,
     }
 }
 
@@ -1188,6 +1353,27 @@ fn first_post_start_reboot_stage(plan: PgoWorkPlan) -> PgoStageId {
     }
 }
 
+/// After the AutoFDO kernel is installed: boot it (to keep or profile), unless we
+/// jump straight to a reused Propeller compile in the same boot.
+fn after_stage2_build_stage(pgo: &PgoConfig, plan: PgoWorkPlan) -> PgoStageId {
+    if pgo.skip_propeller || plan.run_propeller_collect || pgo.compare_autofdo_clean {
+        PgoStageId::WaitReboot2
+    } else {
+        PgoStageId::Stage3Build
+    }
+}
+
+/// After booting the AutoFDO kernel: collect Propeller, compile Propeller, or stop.
+fn after_wait_reboot2_stage(pgo: &PgoConfig, plan: PgoWorkPlan) -> PgoStageId {
+    if plan.run_propeller_collect {
+        PgoStageId::Stage3Profile
+    } else if pgo.skip_propeller {
+        PgoStageId::Done
+    } else {
+        PgoStageId::Stage3Build
+    }
+}
+
 fn archived_afdo_reusable(pgo: &PgoConfig) -> bool {
     let Some(archive) = pgo.resolved_archive_dir() else {
         return false;
@@ -1203,10 +1389,8 @@ fn archived_propeller_reusable(pgo: &PgoConfig) -> bool {
         && validate_propeller_profile(&archive.join("propeller_ld_profile.txt")).is_ok()
 }
 
-fn profiling_workload(pgo: &PgoConfig, combine: Option<CompareStage>) -> (&str, Option<String>) {
-    let preset = resolved_benchmark_preset(pgo, combine.is_some());
-    let label = combine.map(|s| crate::pgo_benchmark::compare_run_label(s.slug()));
-    (preset, label)
+fn profiling_workload(pgo: &PgoConfig) -> String {
+    resolved_benchmark_preset(pgo)
 }
 
 fn benchie_logs(dir: &Path) -> Vec<PathBuf> {
@@ -1229,26 +1413,35 @@ fn benchie_logs(dir: &Path) -> Vec<PathBuf> {
 fn drop_page_cache() {
     if let Err(e) = run_command(
         "sudo",
-        &["sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches"],
+        &["sh", "-c", crate::pgo_priv::DROP_CACHES_SH],
         None::<&str>,
     ) {
-        ewarn!("Could not drop page cache before comparison benchmark: {e}");
+        ewarn!("Could not drop page cache: {e}");
     }
 }
 
-/// Clean cachyos-benchmarker run (no perf record) plus comparison charts.
-/// Debug/AutoFDO stages skip this: their comparison is the profiling run.
-/// `after_perf`: the profiling pass just ran on this kernel, so skip cache-drop + fast warm-up.
+/// Clean kbench run (no perf record) plus comparison charts.
+/// Always drops caches and CPU-warms first, including right after a profiling
+/// pass on the same kernel — otherwise debug/AutoFDO scores a hot page cache.
 fn maybe_run_compare_benchmark(
     pgo: &PgoConfig,
     package: &str,
     stage: CompareStage,
     events: &EventLog,
-    after_perf: bool,
+    config: &Config,
+    state: &mut PgoState,
+    state_path: &Path,
 ) {
     if !should_run_standalone_compare(pgo, stage) {
         return;
     }
+    let compare_dir = ensure_compare_run_dir(state, pgo, package);
+    save_state(state_path, state);
+    if let Err(e) = persist_tiny_profiles_before_kbench(state, pgo, package) {
+        die!("Could not persist PGO profiles before kbench: {e}");
+    }
+    crate::zram::teardown_abs_zram();
+
     let assets = pgo.resolved_benchmark_workdir(package);
     if let Err(e) = fs::create_dir_all(&assets) {
         die!("create benchmark workdir {}: {e}", assets.display());
@@ -1262,32 +1455,56 @@ fn maybe_run_compare_benchmark(
     events.log_line(
         "stdout",
         format!(
-            "Clean cachyos-benchmarker for {} — charts in {}",
+            "Clean scored run ({}) for {} — charts in {}",
+            resolved_compare_preset(pgo),
             stage.title(),
-            pgo.resolved_compare_dir(package).display()
+            compare_dir.display()
         ),
     );
 
     let benchmark = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command)
         .unwrap_or_else(|e| die!("{e}"));
-    if after_perf {
-        blog!("Skipping warm-up (profiling run on this kernel just finished)");
-    } else {
-        drop_page_cache();
-        blog!("Warm-up (fast sysbench/stress-ng) before scored comparison…");
-        let warm = crate::pgo_benchmark::warmup_compare_command(&assets, &benchmark);
-        if let Err(e) = run_logged_shell(&assets, &warm, events) {
-            ewarn!("Comparison warm-up failed (continuing with scored run): {e}");
-        }
+    drop_page_cache();
+    blog!("CPU warm-up before scored comparison (page cache stays cold)…");
+    let warm = crate::pgo_benchmark::warmup_compare_command(&assets, &benchmark);
+    if let Err(e) = run_logged_shell(&assets, &warm, events) {
+        ewarn!("Comparison warm-up failed (continuing with scored run): {e}");
     }
 
     let before = benchie_logs(&assets);
-    let cmd = crate::pgo_benchmark::standalone_compare_command(&assets, &run_label, &benchmark);
+    let compare_preset = resolved_compare_preset(pgo);
+    let tier = crate::config::parse_profiling_tier(&pgo.profiling_quality);
+    let cmd = crate::pgo_benchmark::standalone_compare_command(
+        &assets,
+        &run_label,
+        &benchmark,
+        &compare_preset,
+        tier.as_str(),
+    );
     if let Err(e) = run_logged_shell(&assets, &cmd, events) {
         die!("Comparison benchmark ({}) failed: {e}", stage.title());
     }
 
-    publish_compare_log(pgo, package, stage, events, Some(&before), true);
+    publish_compare_log(
+        pgo,
+        package,
+        stage,
+        events,
+        Some(&before),
+        true,
+        &compare_dir,
+    );
+
+    let mode = config
+        .zram_mode_for(config.packages.get(package))
+        .unwrap_or_else(|e| die!("{e}"));
+    if matches!(mode, crate::zram::ZramMode::Full) {
+        crate::zram::require_headroom(
+            "after kbench",
+            config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+            mode,
+        );
+    }
 }
 
 fn publish_compare_log(
@@ -1297,10 +1514,10 @@ fn publish_compare_log(
     events: &EventLog,
     before: Option<&[PathBuf]>,
     required: bool,
+    compare_dir: &Path,
 ) {
     let assets = pgo.resolved_benchmark_workdir(package);
-    let compare_dir = pgo.resolved_compare_dir(package);
-    if let Err(e) = fs::create_dir_all(&compare_dir) {
+    if let Err(e) = fs::create_dir_all(compare_dir) {
         die!("create compare-benchmarks {}: {e}", compare_dir.display());
     }
 
@@ -1340,7 +1557,7 @@ fn publish_compare_log(
         uname.replace('/', "-")
     );
     // Replace any previous log for this stage so scraper series stay 1:1 with kernels.
-    if let Ok(entries) = fs::read_dir(&compare_dir) {
+    if let Ok(entries) = fs::read_dir(compare_dir) {
         let prefix = format!(
             "benchie_{}_",
             crate::pgo_benchmark::compare_run_label(stage.slug())
@@ -1360,16 +1577,20 @@ fn publish_compare_log(
         die!("write {}: {e}", dest.display());
     }
     blog!("Comparison log: {}", dest.display());
-    compile_compare_chart_sets(pgo, package, events);
+    compile_compare_chart_sets(pgo, package, events, compare_dir);
 }
 
-fn compile_compare_chart_sets(pgo: &PgoConfig, package: &str, events: &EventLog) {
+fn compile_compare_chart_sets(
+    _pgo: &PgoConfig,
+    _package: &str,
+    events: &EventLog,
+    compare_dir: &Path,
+) {
     use crate::pgo_benchmark::{
         chart_kernel_token, chart_set_dir_name, compare_index_html, compare_stage_is_overhead,
         include_stage_in_chart_set, relabel_kernel_token, slug_from_benchie_name,
     };
 
-    let compare_dir = pgo.resolved_compare_dir(package);
     let mut logs: Vec<(String, PathBuf)> = Vec::new();
     for path in benchie_logs(&compare_dir) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1422,7 +1643,25 @@ fn compile_compare_chart_sets(pgo: &PgoConfig, package: &str, events: &EventLog)
         scrape_compare_dir(&set_dir, events);
     }
 
-    let html = compare_index_html(has_overhead, &without_tokens, &with_tokens);
+    let without_table = fs::read_to_string(
+        compare_dir
+            .join(chart_set_dir_name(false))
+            .join("winners_table.html"),
+    )
+    .unwrap_or_default();
+    let with_table = fs::read_to_string(
+        compare_dir
+            .join(chart_set_dir_name(true))
+            .join("winners_table.html"),
+    )
+    .unwrap_or_default();
+    let html = compare_index_html(
+        has_overhead,
+        &without_tokens,
+        &with_tokens,
+        &without_table,
+        &with_table,
+    );
     let index = compare_dir.join("index.html");
     if let Err(e) = fs::write(&index, html) {
         ewarn!("write {}: {e}", index.display());
@@ -1549,9 +1788,19 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
             }
             PgoStageId::Stage2Profile => {
                 run_stage2_profile(state, pgo, package, cli, config, events);
-                maybe_run_compare_benchmark(pgo, package, CompareStage::DebugClean, events, true);
+                maybe_run_compare_benchmark(
+                    pgo,
+                    package,
+                    CompareStage::DebugClean,
+                    events,
+                    config,
+                    state,
+                    state_path,
+                );
                 if plan.run_autofdo_build {
                     transition(state, PgoStageId::Stage2Build);
+                } else if pgo.skip_propeller {
+                    transition(state, PgoStageId::Done);
                 } else {
                     transition(state, PgoStageId::Stage3Build);
                 }
@@ -1560,28 +1809,33 @@ fn execute_current_stage(state: &mut PgoState, ctx: &StageRunCtx<'_>) {
             PgoStageId::Stage2Build => {
                 restore_profiles_to_repo(state, pgo, &["kernel-compilation.afdo"], None);
                 let kernel = kernel_cfg();
-                let mut env = stage2_build_env(package, &kernel, &pgo.afdo_profile_name);
+                let mut env =
+                    stage2_build_env(package, &kernel, &pgo.afdo_profile_name, pgo.skip_propeller);
                 merge_user_kernel_overrides(&mut env, &kernel);
                 let build_ctx = PgoBuildContext {
                     env_vars: env,
                     makepkg_flags: "-f --skipinteg".to_string(),
                     clean_src: true,
                     clean_pkg: true,
-                    defer_pkgbuild_restore: true,
+                    defer_pkgbuild_restore: !pgo.skip_propeller,
                     skip_abs_install: false,
                 };
                 run_pgo_build(package, cli, config, &build_ctx, events);
                 let pkgbase = build::pgo_pkgbase_from_env(package, &build_ctx.env_vars);
                 record_installed_kernel(state, &pkgbase);
-                if plan.run_propeller_collect || pgo.compare_autofdo_clean {
-                    transition(state, PgoStageId::WaitReboot2);
-                } else {
-                    transition(state, PgoStageId::Stage3Build);
-                }
+                transition(state, after_stage2_build_stage(pgo, plan));
             }
             PgoStageId::Stage3Profile => {
                 run_stage3_profile(state, pgo, package, cli, config, events);
-                maybe_run_compare_benchmark(pgo, package, CompareStage::AutofdoClean, events, true);
+                maybe_run_compare_benchmark(
+                    pgo,
+                    package,
+                    CompareStage::AutofdoClean,
+                    events,
+                    config,
+                    state,
+                    state_path,
+                );
                 transition(state, PgoStageId::Stage3Build);
                 save_state(state_path, state);
             }
@@ -1693,7 +1947,7 @@ fn pgo_lto_suffix_flag(package: &str) -> &'static str {
 
 fn stage1_env(package: &str, _kernel: &KernelBuildConfig) -> HashMap<String, String> {
     HashMap::from([
-        ("_use_llvm_lto".into(), "none".into()),
+        ("_use_llvm_lto".into(), "thin".into()),
         ("_processor_opt".into(), "native".into()),
         (
             "_use_lto_suffix".into(),
@@ -1710,8 +1964,9 @@ fn stage2_build_env(
     package: &str,
     _kernel: &KernelBuildConfig,
     profile: &str,
+    skip_propeller: bool,
 ) -> HashMap<String, String> {
-    HashMap::from([
+    let mut env = HashMap::from([
         ("_use_llvm_lto".into(), "thin".into()),
         ("_processor_opt".into(), "native".into()),
         (
@@ -1719,12 +1974,17 @@ fn stage2_build_env(
             pgo_lto_suffix_flag(package).into(),
         ),
         ("_use_kcfi".into(), "yes".into()),
-        ("_build_debug".into(), "yes".into()),
         ("_autofdo".into(), "yes".into()),
         ("_autofdo_profile_name".into(), profile.into()),
         ("_use_gcc_suffix".into(), "no".into()),
-        ("_propeller".into(), "yes".into()),
-    ])
+    ]);
+    if skip_propeller {
+        env.insert("_build_debug".into(), "no".into());
+    } else {
+        env.insert("_build_debug".into(), "yes".into());
+        env.insert("_propeller".into(), "yes".into());
+    }
+    env
 }
 
 fn stage3_build_env(
@@ -1765,6 +2025,13 @@ fn run_pgo_build(
     events: &EventLog,
 ) {
     let spec = PackageSpec::plain(package);
+    crate::zram::require_headroom(
+        "PGO kernel compile",
+        config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+        config
+            .zram_mode_for(config.packages.get(package))
+            .unwrap_or_else(|e| die!("{e}")),
+    );
     vlog!("PGO build env: {:?}", pgo_ctx.env_vars);
     if !build::process_package_pgo(&spec, cli, config, pgo_ctx, events) {
         die!("PGO build failed for {package}");
@@ -2146,10 +2413,10 @@ fn running_kernel_identity() -> PerfKernelIdentity {
     PerfKernelIdentity { uname, pkgbase }
 }
 
-/// Ramdisk captures vanish on reboot. Reuse a sidecar-less file there so a failed
-/// `chown` after `perf record` does not throw away a multi-GB profile in the same boot.
-fn allow_anonymous_perf_reuse(path: &Path) -> bool {
-    crate::utils::path_has_prefix(Path::new("/run"), path)
+/// Ramdisk captures vanish on reboot. A sidecar-less file is an unfinished
+/// `perf record` (or an abort mid-workload), not a finished capture.
+fn allow_anonymous_perf_reuse(_path: &Path) -> bool {
+    false
 }
 
 fn usable_matching_perf(path: &Path, running: &PerfKernelIdentity) -> Option<u64> {
@@ -2178,23 +2445,10 @@ fn usable_matching_perf(path: &Path, running: &PerfKernelIdentity) -> Option<u64
     }
 }
 
-/// Prefer scratch, then the repo copy left after a previous capture (convert can
-/// fail after collection; resume must not throw away a gigabyte of LBR data).
-/// Reuse only when a sidecar records the same running kernel (`uname` + `pkgbase`).
-fn existing_perf_data(
-    scratch_file: &Path,
-    repo: &Path,
-    running: &PerfKernelIdentity,
-) -> Option<(PathBuf, u64)> {
-    if let Some(n) = usable_matching_perf(scratch_file, running) {
-        return Some((scratch_file.to_path_buf(), n));
-    }
-    let name = scratch_file.file_name()?;
-    let repo_file = repo.join(name);
-    if repo_file == *scratch_file {
-        return None;
-    }
-    usable_matching_perf(&repo_file, running).map(|n| (repo_file, n))
+/// Reuse a ramdisk capture only to retry conversion. Raw `.data` is not copied
+/// to the package repo; a leftover HDD copy is not a finished profile.
+fn existing_perf_data(scratch_file: &Path, running: &PerfKernelIdentity) -> Option<(PathBuf, u64)> {
+    usable_matching_perf(scratch_file, running).map(|n| (scratch_file.to_path_buf(), n))
 }
 
 fn compare_stage_for_perf_data(perf_data: &Path) -> Option<CompareStage> {
@@ -2212,34 +2466,47 @@ fn collect_or_reuse_perf_data(
     scratch: &Path,
     perf_data: &Path,
     events: &EventLog,
-    persist_to_repo: bool,
+    converted_ready: bool,
 ) -> Result<PathBuf, String> {
     let combine =
         compare_stage_for_perf_data(perf_data).and_then(|stage| profile_compare_stage(pgo, stage));
     let running = running_kernel_identity();
     let build_user = pgo_build_user(pgo);
-    if let Some((path, bytes)) = existing_perf_data(perf_data, repo, &running) {
+    let file_name = perf_data
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("perf.data");
+    let spill = convert_spill_path(pgo, package, file_name);
+    let usable = existing_perf_for_convert(perf_data, &spill, &running);
+    if should_reuse_raw_perf(usable.is_some(), converted_ready)
+        && let Some((path, bytes)) = usable
+    {
         blog!(
-            "Reusing existing perf data {} ({bytes} bytes) — skipping collection",
+            "Reusing perf data {} ({bytes} bytes) to retry conversion — skipping recapture",
             path.display()
         );
         write_perf_kernel_identity(&path, &running)?;
         chown_perf_to_build_user(repo, &path, &build_user)?;
         if let Some(stage) = combine {
-            publish_compare_log(pgo, package, stage, events, None, false);
+            let state_file = pgo.resolved_state_file(package);
+            let compare_dir = if let Some(mut st) = load_state(&state_file) {
+                let dir = ensure_compare_run_dir(&mut st, pgo, package);
+                save_state(&state_file, &st);
+                dir
+            } else {
+                pgo.resolved_compare_dir(package)
+            };
+            publish_compare_log(pgo, package, stage, events, None, false, &compare_dir);
         }
         return Ok(path);
     }
+    remove_stale_perf_capture(perf_data);
     run_profile_collection(pgo, package, repo, scratch, perf_data, events, combine)?;
     write_perf_kernel_identity(perf_data, &running)?;
-    if persist_to_repo {
-        sync_perf_data_to_repo(perf_data, repo)?;
-    } else {
-        blog!(
-            "Leaving {} on ramdisk scratch (not copying to the package repo)",
-            perf_data.display()
-        );
-    }
+    blog!(
+        "Leaving {} on ramdisk until conversion succeeds (not copying raw capture to disk)",
+        perf_data.display()
+    );
     Ok(perf_data.to_path_buf())
 }
 
@@ -2287,6 +2554,21 @@ fn run_stage2_profile(
 ) {
     let repo = PathBuf::from(&state.repo_dir);
     let scratch = scratch_dir(state, pgo, cli, config);
+    let converted_ready = afdo_on_disk_ready(pgo, &repo)
+        && converted_covers_raw(
+            &[
+                repo.join(&pgo.afdo_profile_name),
+                pgo.resolved_archive_dir()
+                    .map(|a| a.join(&pgo.afdo_profile_name))
+                    .unwrap_or_default(),
+            ],
+            &[
+                scratch.join("kernel.data"),
+                convert_spill_path(pgo, package, "kernel.data"),
+            ],
+        );
+    prepare_profile_ram(pgo, package, cli, config, &scratch, converted_ready, events)
+        .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
     let _ = fs::create_dir_all(&scratch);
     let perf_data = scratch.join("kernel.data");
     let profile_out = scratch.join(&pgo.afdo_profile_name);
@@ -2298,9 +2580,35 @@ fn run_stage2_profile(
         remove_undersized_profile(&archive.join(&pgo.afdo_profile_name));
     }
 
-    let perf_data =
-        collect_or_reuse_perf_data(pgo, package, &repo, &scratch, &perf_data, events, true)
-            .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
+    let perf_data = collect_or_reuse_perf_data(
+        pgo,
+        package,
+        &repo,
+        &scratch,
+        &perf_data,
+        events,
+        converted_ready,
+    )
+    .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
+    let scratch_file = scratch.join("kernel.data");
+    let spill_file = convert_spill_path(pgo, package, "kernel.data");
+    let perf_data = maybe_relocate_perf_for_convert(
+        pgo,
+        config,
+        package,
+        &perf_data,
+        convert_kind_from_tool(&pgo.afdo_tool),
+    )
+    .unwrap_or_else(|e| die!("Stage 2 profile failed: {e}"));
+    let file_bytes = fs::metadata(&perf_data).map(|m| m.len()).unwrap_or(0);
+    crate::zram::require_headroom(
+        "AutoFDO convert",
+        convert_anon_estimate_bytes(file_bytes, convert_kind_from_tool(&pgo.afdo_tool))
+            .saturating_add(config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024)),
+        config
+            .zram_mode_for(config.packages.get(package))
+            .unwrap_or_else(|e| die!("{e}")),
+    );
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -2332,9 +2640,14 @@ fn run_stage2_profile(
         "AutoFDO profile OK ({} bytes) — review before continuing to the AutoFDO build stage",
         profile_bytes
     );
+    report_afdo_coverage(&profile_out, events);
 
     archive_profile(pgo, &profile_out, &pgo.afdo_profile_name).unwrap_or_else(|e| die!("{e}"));
     copy_to_repo(&profile_out, &repo_profile).unwrap_or_else(|e| die!("{e}"));
+    drop_raw_convert_inputs(&scratch_file, &spill_file);
+    if profile_out != repo_profile {
+        let _ = fs::remove_file(&profile_out);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2713,8 +3026,25 @@ fn run_stage3_profile(
 ) {
     let repo = PathBuf::from(&state.repo_dir);
     let scratch = scratch_dir(state, pgo, cli, config);
-    let _ = fs::create_dir_all(&scratch);
+    remove_stale_perf_capture(&scratch.join("kernel.data"));
     let persist_disk = persist_propeller_to_disk(pgo);
+    let texts_ok = propeller_texts_ready(&repo, &scratch, !persist_disk);
+    let converted_ready = texts_ok
+        && converted_covers_raw(
+            &[
+                repo.join("propeller_cc_profile.txt"),
+                repo.join("propeller_ld_profile.txt"),
+                scratch.join("propeller_cc_profile.txt"),
+                scratch.join("propeller_ld_profile.txt"),
+            ],
+            &[
+                scratch.join("propeller.data"),
+                convert_spill_path(pgo, package, "propeller.data"),
+            ],
+        );
+    prepare_profile_ram(pgo, package, cli, config, &scratch, converted_ready, events)
+        .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
+    let _ = fs::create_dir_all(&scratch);
     let perf_data = scratch.join("propeller.data");
     let perf_data = collect_or_reuse_perf_data(
         pgo,
@@ -2723,9 +3053,23 @@ fn run_stage3_profile(
         &scratch,
         &perf_data,
         events,
-        persist_disk,
+        converted_ready,
     )
     .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
+    let scratch_file = scratch.join("propeller.data");
+    let spill_file = convert_spill_path(pgo, package, "propeller.data");
+    let perf_data =
+        maybe_relocate_perf_for_convert(pgo, config, package, &perf_data, ConvertKind::Propeller)
+            .unwrap_or_else(|e| die!("Stage 3 profile failed: {e}"));
+    let file_bytes = fs::metadata(&perf_data).map(|m| m.len()).unwrap_or(0);
+    crate::zram::require_headroom(
+        "Propeller convert",
+        convert_anon_estimate_bytes(file_bytes, ConvertKind::Propeller)
+            .saturating_add(config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024)),
+        config
+            .zram_mode_for(config.packages.get(package))
+            .unwrap_or_else(|e| die!("{e}")),
+    );
 
     let vmlinux = resolve_vmlinux(
         pgo,
@@ -2758,6 +3102,15 @@ fn run_stage3_profile(
             copy_to_repo(&path, &repo_path).unwrap_or_else(|e| die!("{e}"));
         }
     }
+    drop_raw_convert_inputs(&scratch_file, &spill_file);
+    if persist_disk {
+        for name in ["propeller_cc_profile.txt", "propeller_ld_profile.txt"] {
+            let scratch_copy = scratch.join(name);
+            if scratch_copy != repo.join(name) {
+                let _ = fs::remove_file(&scratch_copy);
+            }
+        }
+    }
 }
 
 fn run_profile_collection(
@@ -2771,8 +3124,8 @@ fn run_profile_collection(
 ) -> Result<(), String> {
     sysctl_toggle(pgo, true)?;
     let perf_events = detect_perf_event_args(pgo)?;
-    let perf_extra = resolved_perf_extra_args(pgo);
-    let (preset, compare_label) = profiling_workload(pgo, combine);
+    let mut perf_extra = resolved_perf_extra_args(pgo);
+    let preset = profiling_workload(pgo);
     let benchmark = crate::pgo_benchmark::resolve_benchmark_command(&pgo.benchmark_command)?;
     let bench_cache = pgo.resolved_benchmark_workdir(package);
     fs::create_dir_all(&bench_cache)
@@ -2785,40 +3138,32 @@ fn run_profile_collection(
     blog!("PGO perf scratch (may be tmpfs): {}", scratch.display());
     let build_user = pgo_build_user(pgo);
 
+    let kernel_secs = resolved_kernel_workload_seconds(pgo);
+    let tier = crate::config::parse_profiling_tier(&pgo.profiling_quality);
+    perf_extra = probe_branch_stack_sampling(repo, scratch, &perf_events, &perf_extra, events)?;
     blog!(
-        "PGO profiling: quality={}, benchmark_preset={}, perf_extra={}",
-        if profiling_quality_is_maximum(pgo) {
-            "maximum"
-        } else {
-            "standard"
-        },
+        "PGO profiling: quality={}, workload={}, kernel_budget={}s, perf_extra={}",
+        tier.as_str(),
         preset,
+        kernel_secs,
         perf_extra,
     );
 
-    probe_branch_stack_sampling(repo, scratch, &perf_events, &perf_extra, events)?;
+    drop_page_cache();
+    let _ = combine;
 
-    if combine.is_some() {
-        drop_page_cache();
-    }
-    let before = if combine.is_some() {
-        benchie_logs(&bench_cache)
-    } else {
-        Vec::new()
-    };
-
-    let mut bench_cmd = format!(
-        "env ABS_PGO_PROFILE_DIR={} ABS_PGO_BENCHMARK_DIR={} ABS_PGO_BENCHMARK={}",
+    let bench_cmd = format!(
+        "env ABS_PGO_PROFILE_DIR={} ABS_PGO_BENCHMARK_DIR={} ABS_PGO_BENCHMARK={} \
+         ABS_PGO_KERNEL_SECS={kernel_secs} ABS_PGO_PROFILE={}",
         sh_single_quote(&scratch.to_string_lossy()),
         sh_single_quote(&bench_cache.to_string_lossy()),
-        sh_single_quote(preset),
+        sh_single_quote(&preset),
+        sh_single_quote(tier.as_str()),
     );
-    if let Some(label) = &compare_label {
-        bench_cmd.push_str(" ABS_PGO_COMPARE_LABEL=");
-        bench_cmd.push_str(&sh_single_quote(label));
-    }
-    bench_cmd.push(' ');
-    bench_cmd.push_str(&crate::pgo_benchmark::shell_benchmark_runner(&benchmark));
+    let bench_cmd = format!(
+        "{bench_cmd} {}",
+        crate::pgo_benchmark::shell_benchmark_runner(&benchmark)
+    );
 
     // Write perf data to the absolute scratch path; cwd may differ from `scratch`
     // (e.g. when perf_data_on_ram puts scratch on the ramdisk while cwd stays the repo).
@@ -2833,30 +3178,15 @@ fn run_profile_collection(
         user = sh_single_quote(&build_user),
         bench = bench_cmd,
     );
-    if let Some(stage) = combine {
-        blog!(
-            "Running {} comparison + profile collection under perf record (one pass)…",
-            stage.title()
-        );
-    } else {
-        blog!("Running benchmark with perf record...");
-    }
+    blog!("Running benchmark with perf record...");
     blog!("PGO benchmark command: {bench_cmd}");
     events.log_line(
         "stdout",
-        if let Some(stage) = combine {
-            format!(
-                "Profiling + comparison ({preset}, label={}): perf record runs until \
-                 cachyos-benchmarker exits. This is the {} chart series, not a second run.",
-                compare_label.as_deref().unwrap_or(""),
-                stage.title()
-            )
-        } else {
-            format!(
-                "Profiling workload ({preset}): perf record runs until the benchmark script exits. \
-                 profiling_quality=maximum forces cachyos-benchmarker and denser sampling."
-            )
-        },
+        format!(
+            "Profiling workload ({preset}, {} quality, {kernel_secs}s): perf record runs until \
+             the kernel training script exits. This pass is not a comparison score.",
+            tier.as_str()
+        ),
     );
     let perf_result = run_logged_shell(repo, &perf_cmd, events);
     if let Err(e) = perf_result {
@@ -2869,10 +3199,6 @@ fn run_profile_collection(
         } else {
             return Err(e);
         }
-    }
-
-    if let Some(stage) = combine {
-        publish_compare_log(pgo, package, stage, events, Some(&before), true);
     }
 
     // Stamp identity before chown so a helper rejection cannot strand a multi-GB
@@ -2899,34 +3225,633 @@ fn branch_stack_unavailable_message(detail: &str) -> String {
     )
 }
 
-/// Fail fast before cachyos-benchmarker if this CPU/VM cannot open LBR sampling.
+const PGO_SHMEM_RECLAIM_MAX: u64 = 1024 * 1024 * 1024;
+
+fn parse_cgroup_shmem_bytes(stat: &str) -> Option<u64> {
+    for line in stat.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("shmem") {
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+fn pgo_shmem_unreclaimable(shmem: Option<u64>) -> bool {
+    shmem.is_some_and(|n| n >= PGO_SHMEM_RECLAIM_MAX)
+}
+
+fn parse_confirm_default_yes(input: &str) -> bool {
+    let t = input.trim().to_lowercase();
+    t.is_empty() || matches!(t.as_str(), "y" | "yes")
+}
+
+fn should_reuse_raw_perf(usable: bool, converted_ready: bool) -> bool {
+    usable && !converted_ready
+}
+
+fn path_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// True when converted output is at least as new as every leftover raw capture.
+/// Missing raw → vacuously covered (convert already dropped `.data`).
+/// Stale texts from an earlier pipeline do **not** cover a newer unfinished capture.
+fn converted_covers_raw(converted: &[PathBuf], raws: &[PathBuf]) -> bool {
+    let Some(raw) = raws.iter().filter_map(|p| path_mtime(p)).max() else {
+        return true;
+    };
+    let Some(conv) = converted.iter().filter_map(|p| path_mtime(p)).min() else {
+        return false;
+    };
+    conv >= raw
+}
+
+/// Conservative convert anon working-set vs file size. Propeller was measured at
+/// 5.0× RSS+swapents (82 GiB + 32 GiB on a 23 GiB capture, 2026-08-30 18:46);
+/// 6× is the keep-on-tmpfs / zram bar. llvm-profgen streams more; 2× is still pessimistic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvertKind {
+    LlvmProfgen,
+    Propeller,
+}
+
+fn convert_kind_from_tool(tool: &str) -> ConvertKind {
+    let name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    if name.contains("llvm-profgen") {
+        ConvertKind::LlvmProfgen
+    } else {
+        ConvertKind::Propeller
+    }
+}
+
+fn convert_anon_estimate_bytes(file_bytes: u64, kind: ConvertKind) -> u64 {
+    let mul = match kind {
+        ConvertKind::LlvmProfgen => 2,
+        ConvertKind::Propeller => 6,
+    };
+    file_bytes.saturating_mul(mul)
+}
+
+/// Relocate a tmpfs capture before convert. Unknown MemAvailable fails closed (relocate).
+fn should_relocate_capture_for_convert(
+    mode: ConvertRelocateMode,
+    on_tmpfs: bool,
+    mem_available: Option<u64>,
+    file_bytes: u64,
+    min_free_bytes: u64,
+    kind: ConvertKind,
+) -> bool {
+    if !on_tmpfs || file_bytes == 0 {
+        return false;
+    }
+    match mode {
+        ConvertRelocateMode::Force => true,
+        ConvertRelocateMode::Smart => {
+            let Some(avail) = mem_available else {
+                return true;
+            };
+            let need = convert_anon_estimate_bytes(file_bytes, kind).saturating_add(min_free_bytes);
+            avail < need
+        }
+    }
+}
+
+fn convert_spill_path(pgo: &PgoConfig, package: &str, file_name: &str) -> PathBuf {
+    let root = pgo
+        .resolved_archive_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/abs-pgo-convert"));
+    root.join("pgo-convert").join(package).join(file_name)
+}
+
+fn existing_perf_for_convert(
+    scratch_file: &Path,
+    spill_file: &Path,
+    running: &PerfKernelIdentity,
+) -> Option<(PathBuf, u64)> {
+    existing_perf_data(scratch_file, running).or_else(|| {
+        usable_matching_perf(spill_file, running).map(|n| (spill_file.to_path_buf(), n))
+    })
+}
+
+fn path_on_tmpfs(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type == libc::TMPFS_MAGIC {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn capture_on_tmpfs(path: &Path, config: &Config) -> bool {
+    scratch_on_configured_ramdisk(path, config) || path_on_tmpfs(path)
+}
+
+fn relocate_capture_to_disk(src: &Path, dest: &Path) -> Result<PathBuf, String> {
+    if src == dest {
+        return Ok(dest.to_path_buf());
+    }
+    let bytes = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create convert scratch {}: {e}", parent.display()))?;
+    }
+    blog!(
+        "Relocating {} ({bytes} bytes) off tmpfs to {} before convert",
+        src.display(),
+        dest.display()
+    );
+    if dest.exists() {
+        let _ = fs::remove_file(dest);
+        let _ = fs::remove_file(perf_identity_sidecar_path(dest));
+    }
+    fs::copy(src, dest).map_err(|e| {
+        format!(
+            "copy {} → {} before convert: {e}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    if let Ok(f) = File::open(dest) {
+        let _ = f.sync_all();
+    }
+    let src_side = perf_identity_sidecar_path(src);
+    let dest_side = perf_identity_sidecar_path(dest);
+    if src_side.exists()
+        && let Err(e) = fs::copy(&src_side, &dest_side)
+    {
+        ewarn!(
+            "Could not copy perf kernel sidecar to {}: {e}",
+            dest_side.display()
+        );
+    }
+    let _ = fs::remove_file(src);
+    if src.exists() {
+        let _ = run_command("sudo", &["rm", "-f", &src.to_string_lossy()], None::<&str>);
+    }
+    if src_side.exists() {
+        let _ = fs::remove_file(&src_side);
+        if src_side.exists() {
+            let _ = run_command(
+                "sudo",
+                &["rm", "-f", &src_side.to_string_lossy()],
+                None::<&str>,
+            );
+        }
+    }
+    Ok(dest.to_path_buf())
+}
+
+fn maybe_relocate_perf_for_convert(
+    pgo: &PgoConfig,
+    config: &Config,
+    package: &str,
+    perf_data: &Path,
+    kind: ConvertKind,
+) -> Result<PathBuf, String> {
+    if !perf_data.exists() {
+        return Ok(perf_data.to_path_buf());
+    }
+    let file_name = perf_data
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("perf.data");
+    let spill = convert_spill_path(pgo, package, file_name);
+    if perf_data == spill.as_path() {
+        return Ok(perf_data.to_path_buf());
+    }
+    let file_bytes = fs::metadata(perf_data).map(|m| m.len()).unwrap_or(0);
+    let on_tmpfs = capture_on_tmpfs(perf_data, config);
+    let mem_available = crate::ramdisk::mem_available_mb()
+        .ok()
+        .map(|mb| mb.saturating_mul(1024 * 1024));
+    let min_free_bytes = config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024);
+    let mode = crate::config::parse_convert_relocate(&pgo.convert_relocate);
+    if !should_relocate_capture_for_convert(
+        mode,
+        on_tmpfs,
+        mem_available,
+        file_bytes,
+        min_free_bytes,
+        kind,
+    ) {
+        if on_tmpfs {
+            blog!(
+                "Keeping {} on tmpfs for convert (convert_relocate=smart; MemAvailable covers estimate)",
+                perf_data.display()
+            );
+        }
+        return Ok(perf_data.to_path_buf());
+    }
+    let dest = relocate_capture_to_disk(perf_data, &spill)?;
+    drop_page_cache();
+    Ok(dest)
+}
+
+fn drop_raw_convert_inputs(scratch_file: &Path, spill_file: &Path) {
+    if scratch_file.exists() {
+        drop_raw_perf_after_convert(scratch_file);
+    }
+    if spill_file != scratch_file && spill_file.exists() {
+        drop_raw_perf_after_convert(spill_file);
+    }
+}
+
+fn ram_reclaimed(leftovers_empty: bool, shmem: Option<u64>) -> bool {
+    leftovers_empty && !pgo_shmem_unreclaimable(shmem)
+}
+
+fn ram_needs_reboot(remount_failed: bool, leftovers_empty: bool, shmem: Option<u64>) -> bool {
+    remount_failed || !ram_reclaimed(leftovers_empty, shmem)
+}
+
+fn pgo_scratch_artifact_names(afdo_name: &str) -> Vec<String> {
+    let mut names = vec![
+        "kernel.data".into(),
+        "propeller.data".into(),
+        "abs-pgo-branch-stack-probe.data".into(),
+        "kernel.data.kernel.json".into(),
+        "propeller.data.kernel.json".into(),
+        "abs-pgo-branch-stack-probe.data.kernel.json".into(),
+        afdo_name.to_string(),
+        "propeller_cc_profile.txt".into(),
+        "propeller_ld_profile.txt".into(),
+    ];
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn leftover_pgo_scratch_files(scratch: &Path, afdo_name: &str) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
+    for name in pgo_scratch_artifact_names(afdo_name) {
+        let path = scratch.join(name);
+        if let Ok(meta) = fs::metadata(&path)
+            && meta.is_file()
+        {
+            out.push((path, meta.len()));
+        }
+    }
+    out
+}
+
+fn drop_pgo_scratch_captures(scratch: &Path, afdo_name: &str, keep_propeller_texts: bool) {
+    for (path, _) in leftover_pgo_scratch_files(scratch, afdo_name) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if keep_propeller_texts
+            && matches!(
+                name,
+                "propeller_cc_profile.txt" | "propeller_ld_profile.txt"
+            )
+        {
+            continue;
+        }
+        remove_stale_path(&path);
+    }
+}
+
+fn confirm_default_yes(prompt: &str) -> bool {
+    print!("{prompt}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    if !crate::terminal::stdin_is_tty() {
+        println!("yes (no TTY)");
+        return true;
+    }
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return true;
+    }
+    parse_confirm_default_yes(&input)
+}
+
+fn read_pgo_slice_shmem() -> Option<u64> {
+    read_pgo_slice_shmem_under(Path::new("/sys/fs/cgroup"))
+}
+
+fn read_pgo_slice_shmem_under(root: &Path) -> Option<u64> {
+    fn walk(dir: &Path, depth: u8) -> Option<PathBuf> {
+        if depth > 10 {
+            return None;
+        }
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains("abs-pgo") {
+                let stat = path.join("memory.stat");
+                if stat.is_file() {
+                    return Some(stat);
+                }
+            }
+            if path.is_dir()
+                && let Some(found) = walk(&path, depth + 1)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let stat = walk(root, 0)?;
+    parse_cgroup_shmem_bytes(&fs::read_to_string(stat).ok()?)
+}
+
+fn scratch_on_configured_ramdisk(scratch: &Path, config: &Config) -> bool {
+    let mount = Path::new(config.ramdisk.mount_point.trim());
+    !mount.as_os_str().is_empty() && crate::utils::path_has_prefix(mount, scratch)
+}
+
+fn afdo_on_disk_ready(pgo: &PgoConfig, repo: &Path) -> bool {
+    let name = &pgo.afdo_profile_name;
+    if validate_afdo_profile(&repo.join(name)).is_ok() {
+        return true;
+    }
+    pgo.resolved_archive_dir()
+        .is_some_and(|a| validate_afdo_profile(&a.join(name)).is_ok())
+}
+
+fn propeller_texts_ready(repo: &Path, scratch: &Path, on_ram: bool) -> bool {
+    ["propeller_cc_profile.txt", "propeller_ld_profile.txt"]
+        .iter()
+        .all(|n| {
+            validate_propeller_profile(&repo.join(n)).is_ok()
+                || (on_ram && validate_propeller_profile(&scratch.join(n)).is_ok())
+        })
+}
+
+fn drop_raw_perf_after_convert(perf_data: &Path) {
+    blog!(
+        "Dropping raw capture {} (conversion succeeded)",
+        perf_data.display()
+    );
+    remove_stale_perf_capture(perf_data);
+}
+
+/// Free leftover PGO scratch before a new capture. Retry-conversion reuses `.data`
+/// and skips this. Unreclaimable PGO cgroup shmem demands a reboot.
+fn prepare_profile_ram(
+    pgo: &PgoConfig,
+    package: &str,
+    cli: &Cli,
+    config: &Config,
+    scratch: &Path,
+    converted_ready: bool,
+    events: &EventLog,
+) -> Result<(), String> {
+    let leftovers = leftover_pgo_scratch_files(scratch, &pgo.afdo_profile_name);
+    let leftover_bytes: u64 = leftovers.iter().map(|(_, n)| n).sum();
+    let shmem = read_pgo_slice_shmem();
+    let running = running_kernel_identity();
+    let usable_raw = existing_perf_for_convert(
+        &scratch.join("kernel.data"),
+        &convert_spill_path(pgo, package, "kernel.data"),
+        &running,
+    )
+    .is_some()
+        || existing_perf_for_convert(
+            &scratch.join("propeller.data"),
+            &convert_spill_path(pgo, package, "propeller.data"),
+            &running,
+        )
+        .is_some();
+    // A live ramdisk `.data` used to retry convert is supposed to occupy RAM.
+    // Do not remount it away just because slice shmem includes that file.
+    if should_reuse_raw_perf(usable_raw, converted_ready) {
+        return Ok(());
+    }
+    let needs_attention = !leftovers.is_empty() || pgo_shmem_unreclaimable(shmem);
+    if !needs_attention {
+        return Ok(());
+    }
+    blog!(
+        "PGO scratch leftovers: {} files, {leftover_bytes} bytes; PGO cgroup shmem={:?}",
+        leftovers.len(),
+        shmem
+    );
+    let auto = pgo_auto_enabled(pgo, cli);
+    let interactive = crate::terminal::stdin_is_tty() && !auto;
+    let remount = if interactive {
+        let prompt = format!(
+            "PGO scratch on the ramdisk still holds leftover captures / tmpfs pages \
+             ({}, {leftover_bytes} bytes; PGO cgroup shmem {:?}).\n\
+             Remount the ramdisk for a fresh capture? [Y/n]: ",
+            scratch.display(),
+            shmem
+        );
+        confirm_default_yes(&prompt)
+    } else {
+        true
+    };
+    let remount_failed = try_free_pgo_scratch(config, scratch, &pgo.afdo_profile_name, remount);
+    let leftovers_after = leftover_pgo_scratch_files(scratch, &pgo.afdo_profile_name);
+    let shmem_after = read_pgo_slice_shmem();
+    blog!(
+        "After PGO ram free: leftovers={}, PGO cgroup shmem={:?}, remount_failed={remount_failed}",
+        leftovers_after.len(),
+        shmem_after
+    );
+    if ram_needs_reboot(remount_failed, leftovers_after.is_empty(), shmem_after) {
+        return demand_pgo_ram_reboot(pgo, cli, package, events);
+    }
+    Ok(())
+}
+
+fn try_free_pgo_scratch(config: &Config, scratch: &Path, afdo_name: &str, remount: bool) -> bool {
+    if remount && scratch_on_configured_ramdisk(scratch, config) {
+        if let Err(e) = crate::ramdisk::remount_ramdisk_fresh(config) {
+            ewarn!("PGO ramdisk remount failed: {e}");
+            return true;
+        }
+        return false;
+    }
+    drop_pgo_scratch_captures(scratch, afdo_name, false);
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreclaimableRamAction {
+    AutoReboot,
+    AskReboot,
+    Stop,
+}
+
+fn unreclaimable_ram_action(auto: bool, tty: bool) -> UnreclaimableRamAction {
+    if auto {
+        UnreclaimableRamAction::AutoReboot
+    } else if tty {
+        UnreclaimableRamAction::AskReboot
+    } else {
+        UnreclaimableRamAction::Stop
+    }
+}
+
+fn demand_pgo_ram_reboot(
+    pgo: &PgoConfig,
+    cli: &Cli,
+    package: &str,
+    events: &EventLog,
+) -> Result<(), String> {
+    let msg = format!(
+        "Leftover PGO ramdisk memory is still held (detached tmpfs). \
+         Collection cannot start until a reboot frees it. After reboot: abs --pgo-resume {package}"
+    );
+    ewarn!("{msg}");
+    events.emit(&PgoEvent::RebootRequired {
+        ts: EventLog::now(),
+        expected_uname: None,
+        message: msg.clone(),
+    });
+    match unreclaimable_ram_action(pgo_auto_enabled(pgo, cli), crate::terminal::stdin_is_tty()) {
+        UnreclaimableRamAction::AutoReboot => {
+            trigger_pgo_auto_reboot(package, None)?;
+            Err(
+                "rebooting to free leftover PGO ramdisk memory; pipeline will resume this profile stage"
+                    .into(),
+            )
+        }
+        UnreclaimableRamAction::AskReboot => {
+            let prompt = format!(
+                "Reboot now to free leftover PGO ramdisk memory?\n\
+                 After reboot run: abs --pgo-resume {package}\n\
+                 Reboot now? [Y/n]: "
+            );
+            if confirm_default_yes(&prompt) {
+                crate::boot_entry::reboot(None)?;
+                return Err("rebooting to free leftover PGO ramdisk memory".into());
+            }
+            Err(msg)
+        }
+        UnreclaimableRamAction::Stop => Err(msg),
+    }
+}
+
+const MIN_PERF_MMAP_PAGES: u64 = 128;
+
+fn mmap_alloc_failed(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("failed to mmap") || (s.contains("mmap") && s.contains("cannot allocate memory"))
+}
+
+fn mmap_enomem_message(detail: &str) -> String {
+    format!(
+        "perf cannot mmap its sample buffer. \
+         `--mmap-pages` is per CPU under `-a`; 131072 pages is 512MiB × NCPU and \
+         typically fails this probe. ABS defaults to 4096 pages (16MiB × NCPU). \
+         Free leftover captures on the PGO ramdisk scratch, or set a smaller \
+         mmap-pages in perf_extra_args.\n\
+         {detail}"
+    )
+}
+
+fn parse_mmap_pages(extra: &str) -> Option<u64> {
+    let mut tokens = extra.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if t == "--mmap-pages" || t == "-m" {
+            return tokens.next()?.parse().ok();
+        }
+        if let Some(v) = t.strip_prefix("--mmap-pages=") {
+            return v.parse().ok();
+        }
+    }
+    None
+}
+
+fn replace_mmap_pages(extra: &str, pages: u64) -> String {
+    let mut out = Vec::new();
+    let mut tokens = extra.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if t == "--mmap-pages" || t == "-m" {
+            out.push(t.to_string());
+            let _ = tokens.next();
+            out.push(pages.to_string());
+            continue;
+        }
+        if t.starts_with("--mmap-pages=") {
+            out.push(format!("--mmap-pages={pages}"));
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out.join(" ")
+}
+
+fn shrink_mmap_pages(extra: &str) -> Option<String> {
+    let pages = parse_mmap_pages(extra)?;
+    if pages <= MIN_PERF_MMAP_PAGES {
+        return None;
+    }
+    let next = (pages / 2).max(MIN_PERF_MMAP_PAGES);
+    Some(replace_mmap_pages(extra, next))
+}
+
+fn remove_stale_perf_capture(path: &Path) {
+    remove_stale_path(path);
+    remove_stale_path(&perf_identity_sidecar_path(path));
+}
+
+fn remove_stale_path(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    ewarn!(
+        "Removing leftover {} ({bytes} bytes) before a new capture",
+        path.display()
+    );
+    if fs::remove_file(path).is_ok() {
+        return;
+    }
+    let _ = run_command("sudo", &["rm", "-f", &path.to_string_lossy()], None::<&str>);
+}
+
+/// Fail fast before kernel training if this CPU/VM cannot open LBR sampling.
+/// On mmap ENOMEM, retry with a smaller per-CPU ring buffer and return the
+/// extra args that actually opened.
 fn probe_branch_stack_sampling(
     repo: &Path,
     scratch: &Path,
     perf_events: &str,
     perf_extra: &str,
     events: &EventLog,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let sudo = crate::utils::shell_sudo();
     let probe = scratch.join("abs-pgo-branch-stack-probe.data");
-    let _ = fs::remove_file(&probe);
-    let cmd = format!(
-        "{sudo} perf record {perf_events} {extra} -o {out} -- true",
-        extra = perf_extra,
-        out = sh_single_quote(&probe.to_string_lossy()),
-    );
-    events.log_line(
-        "stdout",
-        "Probing perf branch-stack sampling before the profiling workload...".to_string(),
-    );
-    let result = run_logged_shell(repo, &cmd, events);
-    let _ = fs::remove_file(&probe);
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if branch_stack_sampling_unavailable(&e) => {
-            Err(branch_stack_unavailable_message(&e))
+    let mut extra = perf_extra.to_string();
+    loop {
+        let _ = fs::remove_file(&probe);
+        let cmd = format!(
+            "{sudo} perf record {perf_events} {extra} -o {out} -- true",
+            extra = extra,
+            out = sh_single_quote(&probe.to_string_lossy()),
+        );
+        events.log_line(
+            "stdout",
+            "Probing perf branch-stack sampling before the profiling workload...".to_string(),
+        );
+        let result = run_logged_shell(repo, &cmd, events);
+        let _ = fs::remove_file(&probe);
+        match result {
+            Ok(()) => return Ok(extra),
+            Err(e) if mmap_alloc_failed(&e) => {
+                let Some(smaller) = shrink_mmap_pages(&extra) else {
+                    return Err(mmap_enomem_message(&e));
+                };
+                ewarn!("perf mmap failed; --mmap-pages is per CPU. Retrying with {smaller}");
+                extra = smaller;
+            }
+            Err(e) if branch_stack_sampling_unavailable(&e) => {
+                return Err(branch_stack_unavailable_message(&e));
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -2965,33 +3890,47 @@ fn sysctl_toggle(pgo: &PgoConfig, enable: bool) -> Result<(), String> {
     }
 }
 
-fn profiling_quality_is_maximum(pgo: &PgoConfig) -> bool {
-    matches!(
-        pgo.profiling_quality.trim().to_ascii_lowercase().as_str(),
-        "maximum" | "max" | "perfect"
-    )
+fn resolved_benchmark_preset(_pgo: &PgoConfig) -> String {
+    "kernel".to_string()
 }
 
-fn resolved_benchmark_preset(pgo: &PgoConfig, combine_compare: bool) -> &str {
-    if combine_compare || profiling_quality_is_maximum(pgo) {
-        return "cachyos";
-    }
-    let preset = pgo.benchmark_preset.trim();
-    if preset.is_empty() { "fast" } else { preset }
+/// Scoring workload for a standalone comparison run (never under `perf record`).
+fn resolved_compare_preset(_pgo: &PgoConfig) -> String {
+    "kbench".to_string()
+}
+
+fn resolved_kernel_workload_seconds(pgo: &PgoConfig) -> u32 {
+    let tier = crate::config::parse_profiling_tier(&pgo.profiling_quality);
+    let secs = if pgo.kernel_workload_seconds == 0 {
+        tier.train_seconds()
+    } else {
+        pgo.kernel_workload_seconds
+    };
+    secs.clamp(180, crate::config::KERNEL_TRAIN_CAP_SECS)
 }
 
 fn resolved_perf_extra_args(pgo: &PgoConfig) -> String {
     use crate::config::{PERF_EXTRA_ARGS_MAXIMUM, PERF_EXTRA_ARGS_STANDARD};
-    let custom = pgo.perf_extra_args.trim();
-    let is_custom = custom != PERF_EXTRA_ARGS_STANDARD && custom != PERF_EXTRA_ARGS_MAXIMUM;
-    if is_custom {
-        return pgo.perf_extra_args.clone();
-    }
-    if profiling_quality_is_maximum(pgo) {
-        PERF_EXTRA_ARGS_MAXIMUM.into()
+    let extra = pgo.perf_extra_args.trim();
+    let tier = crate::config::parse_profiling_tier(&pgo.profiling_quality);
+    let quality = if tier.dense_lbr() {
+        PERF_EXTRA_ARGS_MAXIMUM
     } else {
-        PERF_EXTRA_ARGS_STANDARD.into()
+        PERF_EXTRA_ARGS_STANDARD
+    };
+    if crate::config::perf_extra_args_is_quality_default(extra) {
+        return quality.into();
     }
+    if crate::config::perf_extra_has_sample_limit(extra) {
+        return extra.to_string();
+    }
+    // Custom mmap/LBR flags but no period: do not fall through to perf's `-F 4000`.
+    let count = if tier.dense_lbr() {
+        "-c 400009"
+    } else {
+        "-c 1000003"
+    };
+    format!("{extra} {count}")
 }
 
 /// Branch sampling event for Intel CPUs (llvm-profgen / AutoFDO).
@@ -3090,6 +4029,149 @@ fn validate_afdo_profile(path: &Path) -> Result<u64, String> {
         ));
     }
     Ok(len)
+}
+
+/// Classify a kernel symbol from `llvm-profdata show --sample --hot-func-list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotClass {
+    Work,
+    Idle,
+    Other,
+}
+
+fn classify_profile_symbol(name: &str) -> HotClass {
+    let n = name.to_ascii_lowercase();
+    // perf's own sampling machinery is always present in an LBR capture.
+    if n.contains("perf_event")
+        || n.contains("cpuidle")
+        || n.contains("do_idle")
+        || n.contains("poll_idle")
+        || n.contains("mwait")
+        || n.contains("native_safe_halt")
+        || n.contains("default_idle")
+        || n.contains("tick_nohz")
+        || n.contains("hrtimer_interrupt")
+    {
+        return HotClass::Idle;
+    }
+    if n.contains("do_syscall")
+        || n.contains("entry_syscall")
+        || n.contains("sys_enter")
+        || n.contains("__x64_sys")
+        || n.contains("__se_sys")
+        || n.contains("x64_sys_call")
+        || n.contains("__schedule")
+        || n.contains("try_to_wake_up")
+        || n.contains("futex")
+        || n.contains("epoll")
+        || n.contains("vfs_")
+        || n.contains("d_lookup")
+        || n.contains("link_path")
+        || n.contains("filemap")
+        || n.contains("handle_mm_fault")
+        || n.contains("do_anonymous_page")
+        || n.contains("tcp_send")
+        || n.contains("tcp_recv")
+        || n.contains("unix_stream")
+        || n.contains("pipe_")
+        || n.contains("copy_process")
+        || n.contains("kmem_cache")
+        || n.contains("alloc_pages")
+    {
+        return HotClass::Work;
+    }
+    HotClass::Other
+}
+
+/// Parse `count name` lines from llvm-profdata hot-function output.
+fn parse_hot_func_counts(out: &str) -> Vec<(u64, String)> {
+    let mut rows = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("Hot") || line.starts_with("Total") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(count) = parts.next().and_then(|s| s.replace(',', "").parse().ok()) else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        rows.push((count, name.to_string()));
+    }
+    rows
+}
+
+fn report_afdo_coverage(profile: &Path, events: &EventLog) {
+    let path = profile.to_string_lossy().to_string();
+    let Ok(out) = run_command_with_output(
+        "llvm-profdata",
+        &["show", "--sample", "--hot-func-list", &path],
+        None::<&str>,
+    ) else {
+        blog!("Skipping profile coverage report (llvm-profdata unavailable)");
+        return;
+    };
+    if out.trim().is_empty() {
+        return;
+    }
+
+    let rows = parse_hot_func_counts(&out);
+    if rows.is_empty() {
+        blog!("Profile coverage: llvm-profdata listed no hot functions to classify");
+        return;
+    }
+    let mut work = 0u64;
+    let mut idle = 0u64;
+    let mut other = 0u64;
+    for (count, name) in &rows {
+        match classify_profile_symbol(name) {
+            HotClass::Work => work += *count,
+            HotClass::Idle => idle += *count,
+            HotClass::Other => other += *count,
+        }
+    }
+    let total = work + idle + other;
+    blog!(
+        "Profile coverage (hot-func counts): work={work} idle={idle} other={other} ({} symbols)",
+        rows.len()
+    );
+    if let Some(n) = parse_afdo_function_count(&out) {
+        blog!("Profile contains samples for {n} functions");
+    }
+    if total == 0 {
+        return;
+    }
+    let work_pct = work * 100 / total;
+    let idle_pct = idle * 100 / total;
+    if work_pct < 25 && idle_pct >= 40 {
+        ewarn!(
+            "AutoFDO profile is idle/perf-dominated ({idle_pct}% idle vs {work_pct}% syscall/sched/VFS). \
+             The resulting kernel may not beat stock. Use profiling_quality = \"sweet\" or \"long\" \
+             so the kernel training workload has enough samples."
+        );
+        events.log_line(
+            "stderr",
+            format!("Low profile work share: {work_pct}% work, {idle_pct}% idle"),
+        );
+    }
+}
+
+/// Pull a function count out of `llvm-profdata show --sample` output. The wording differs
+/// between LLVM releases, so match on the numeric field of any "functions" summary line.
+fn parse_afdo_function_count(out: &str) -> Option<u64> {
+    out.lines()
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("functions") && (l.contains("total") || l.contains("number of"))
+        })
+        .find_map(|l| {
+            l.split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty())
+                .next_back()
+                .and_then(|n| n.parse().ok())
+        })
 }
 
 fn validate_propeller_profile(path: &Path) -> Result<u64, String> {
@@ -3218,42 +4300,6 @@ pub fn resolve_vmlinux(
     ))
 }
 
-/// Copy raw perf data from ramdisk scratch to the package repo when they differ.
-fn sync_perf_data_to_repo(perf_data: &Path, repo: &Path) -> Result<(), String> {
-    if perf_data.parent().is_some_and(|p| p == repo) {
-        return Ok(());
-    }
-    if !perf_data.is_file() {
-        return Err(format!(
-            "perf data missing at {} after profile collection",
-            perf_data.display()
-        ));
-    }
-    let dest = repo.join(
-        perf_data
-            .file_name()
-            .ok_or_else(|| "perf data path has no file name".to_string())?,
-    );
-    if dest == perf_data {
-        return Ok(());
-    }
-    blog!(
-        "Copying perf data {} → {}",
-        perf_data.display(),
-        dest.display()
-    );
-    fs::copy(perf_data, &dest).map_err(|e| format!("copy perf data to repo failed: {e}"))?;
-    crate::utils::ensure_build_user_can_read(&dest)?;
-    let src_id = perf_identity_sidecar_path(perf_data);
-    if src_id.is_file() {
-        let dest_id = perf_identity_sidecar_path(&dest);
-        fs::copy(&src_id, &dest_id)
-            .map_err(|e| format!("copy perf kernel identity to repo failed: {e}"))?;
-        let _ = crate::utils::ensure_build_user_can_read(&dest_id);
-    }
-    Ok(())
-}
-
 fn persist_propeller_to_disk(pgo: &PgoConfig) -> bool {
     !pgo.propeller_profiles_on_ram
 }
@@ -3303,7 +4349,24 @@ fn archive_profile(pgo: &PgoConfig, src: &Path, name: &str) -> Result<(), String
     Ok(())
 }
 
+fn forbidden_clone_dest(dest: &Path) -> Option<&'static str> {
+    let name = dest.file_name()?.to_str()?;
+    if name.ends_with(".data") || name.contains(".data.") {
+        return Some("raw .data must not be written into the package clone");
+    }
+    if name.starts_with("benchie_") && name.ends_with(".log") {
+        return Some("comparison logs must not be written into the package clone");
+    }
+    None
+}
+
 fn copy_to_repo(src: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(why) = forbidden_clone_dest(dest) {
+        return Err(format!(
+            "refusing to copy {} into the package clone: {why}",
+            dest.display()
+        ));
+    }
     fs::copy(src, dest).map_err(|e| format!("copy to repo failed: {e}"))?;
     Ok(())
 }
@@ -3428,10 +4491,13 @@ mod tests {
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
+            convert_relocate: "force".into(),
             benchmark_command: Some("/bin/true".into()),
             benchmark_workdir: None,
-            benchmark_preset: "fast".into(),
-            profiling_quality: "maximum".into(),
+            benchmark_preset: "kernel".into(),
+            compare_preset: "auto".into(),
+            kernel_workload_seconds: 0,
+            profiling_quality: "sweet".into(),
             build_user: None,
             perf_event_args: "auto".into(),
             perf_extra_args: crate::config::PERF_EXTRA_ARGS_STANDARD.into(),
@@ -3446,6 +4512,7 @@ mod tests {
             reboot_before_start: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
+            skip_propeller: false,
             compare_current: false,
             compare_debug: false,
             compare_debug_clean: false,
@@ -3522,6 +4589,118 @@ mod tests {
     }
 
     #[test]
+    fn compare_run_stamp_is_local_filesystem_safe() {
+        let stamp = compare_run_stamp(1_777_000_000);
+        let re = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{6}$").unwrap();
+        assert!(re.is_match(&stamp), "{stamp}");
+        let dir = pipeline_compare_dir(Path::new("/media/storage/tmp/compare-benchmarks"), &stamp);
+        assert_eq!(
+            dir,
+            PathBuf::from(format!("/media/storage/tmp/compare-benchmarks/{stamp}"))
+        );
+    }
+
+    #[test]
+    fn resume_reuses_compare_run_dir() {
+        let pgo = test_pgo();
+        let mut state = PgoState {
+            package: "linux-cachyos".into(),
+            repo_dir: "/tmp/repo".into(),
+            current_stage: PgoStageId::Stage1Build,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: None,
+            expected_package_base: None,
+            stage_history: Vec::new(),
+            compare_run_dir: Some("/media/storage/tmp/compare-benchmarks/2026-08-30-211600".into()),
+        };
+        let dir = ensure_compare_run_dir(&mut state, &pgo, "linux-cachyos");
+        assert_eq!(
+            dir,
+            PathBuf::from("/media/storage/tmp/compare-benchmarks/2026-08-30-211600")
+        );
+        assert_eq!(
+            state.compare_run_dir.as_deref(),
+            Some("/media/storage/tmp/compare-benchmarks/2026-08-30-211600")
+        );
+    }
+
+    #[test]
+    fn kbench_leaves_ramdisk_mounted_and_tears_down_zram() {
+        assert_eq!(
+            kbench_prep_steps(),
+            &[
+                "persist_tiny_profiles",
+                "leave_ramdisk_mounted",
+                "teardown_abs_zram",
+                "run_kbench",
+                "restore_zram_if_full",
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_to_repo_refuses_raw_data_and_benchie_logs() {
+        let dir = std::env::temp_dir().join(format!("abs-clone-guard-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let src = dir.join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        for name in [
+            "kernel.data",
+            "propeller.data",
+            "kernel.data.kernel.json",
+            "benchie_abs-final_k.log",
+        ] {
+            let dest = dir.join(name);
+            let err = copy_to_repo(&src, &dest).unwrap_err();
+            assert!(err.contains("refusing"), "{err}");
+            assert!(!dest.exists(), "{name} must not be created");
+        }
+        let ok = dir.join("kernel-compilation.afdo");
+        copy_to_repo(&src, &ok).unwrap();
+        assert!(ok.is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_tiny_profiles_copies_scratch_to_clone() {
+        let root = std::env::temp_dir().join(format!("abs-persist-tiny-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("propeller_cc_profile.txt"), b"cc").unwrap();
+        fs::write(scratch.join("kernel-compilation.afdo"), b"afdo").unwrap();
+        let mut pgo = test_pgo();
+        pgo.profile_scratch_dir = scratch.to_string_lossy().into_owned();
+        pgo.profiles_archive_dir = Some(root.join("archive").to_string_lossy().into_owned());
+        let state = PgoState {
+            package: "linux-cachyos".into(),
+            repo_dir: repo.to_string_lossy().into_owned(),
+            current_stage: PgoStageId::Stage2Build,
+            started_at: 0,
+            updated_at: 0,
+            expected_kernel_uname: None,
+            expected_package_base: None,
+            stage_history: Vec::new(),
+            compare_run_dir: None,
+        };
+        persist_tiny_profiles_before_kbench(&state, &pgo, "linux-cachyos").unwrap();
+        assert_eq!(
+            fs::read(repo.join("propeller_cc_profile.txt")).unwrap(),
+            b"cc"
+        );
+        assert_eq!(
+            fs::read(repo.join("kernel-compilation.afdo")).unwrap(),
+            b"afdo"
+        );
+        let archive = pgo.resolved_archive_dir().unwrap();
+        assert!(archive.join("kernel-compilation.afdo").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn debug_and_autofdo_compare_share_the_profiling_run() {
         assert!(CompareStage::Debug.shares_profiling_run());
         assert!(CompareStage::Autofdo.shares_profiling_run());
@@ -3555,19 +4734,14 @@ mod tests {
     }
 
     #[test]
-    fn profile_compare_stage_follows_any_comparison() {
+    fn profile_compare_stage_never_shares_the_profiling_run() {
         let mut pgo = test_pgo();
-        assert_eq!(profile_compare_stage(&pgo, CompareStage::Debug), None);
         pgo.compare_final = true;
-        assert_eq!(
-            profile_compare_stage(&pgo, CompareStage::Debug),
-            Some(CompareStage::Debug)
-        );
+        pgo.compare_debug = true;
+        pgo.compare_autofdo = true;
+        assert_eq!(profile_compare_stage(&pgo, CompareStage::Debug), None);
+        assert_eq!(profile_compare_stage(&pgo, CompareStage::Autofdo), None);
         assert_eq!(profile_compare_stage(&pgo, CompareStage::Current), None);
-        assert_eq!(
-            profile_compare_stage(&pgo, CompareStage::Autofdo),
-            Some(CompareStage::Autofdo)
-        );
     }
 
     #[test]
@@ -3611,41 +4785,162 @@ mod tests {
     }
 
     #[test]
+    fn work_plan_skip_propeller_stops_after_autofdo() {
+        let mut pgo = test_pgo();
+        pgo.skip_propeller = true;
+        let plan = pgo_work_plan(&pgo, false, false);
+        assert!(plan.run_debug_build);
+        assert!(plan.run_afdo_collect);
+        assert!(plan.run_autofdo_build);
+        assert!(!plan.run_propeller_collect);
+        assert_eq!(first_post_start_reboot_stage(plan), PgoStageId::Stage1Build);
+        assert_eq!(
+            after_stage2_build_stage(&pgo, plan),
+            PgoStageId::WaitReboot2
+        );
+        assert_eq!(after_wait_reboot2_stage(&pgo, plan), PgoStageId::Done);
+
+        pgo.reuse_afdo_profile = true;
+        let plan = pgo_work_plan(&pgo, true, true);
+        assert!(!plan.run_debug_build);
+        assert!(!plan.run_afdo_collect);
+        assert!(plan.run_autofdo_build);
+        assert!(!plan.run_propeller_collect);
+        assert_eq!(first_post_start_reboot_stage(plan), PgoStageId::Stage2Build);
+        assert_eq!(after_wait_reboot2_stage(&pgo, plan), PgoStageId::Done);
+    }
+
+    #[test]
+    fn skip_propeller_compare_final_scores_autofdo_kernel() {
+        let mut pgo = test_pgo();
+        pgo.skip_propeller = true;
+        pgo.compare_final = true;
+        assert!(!should_run_standalone_compare(&pgo, CompareStage::Final));
+        assert!(should_run_standalone_compare(
+            &pgo,
+            CompareStage::AutofdoClean
+        ));
+        pgo.compare_final = false;
+        pgo.compare_autofdo_clean = false;
+        assert!(!should_run_standalone_compare(
+            &pgo,
+            CompareStage::AutofdoClean
+        ));
+    }
+
+    #[test]
+    fn stage2_env_skip_propeller_is_production_autofdo() {
+        let env = stage2_build_env(
+            "linux-cachyos",
+            &KernelBuildConfig::default(),
+            "kernel-compilation.afdo",
+            true,
+        );
+        assert_eq!(env.get("_autofdo").map(String::as_str), Some("yes"));
+        assert_eq!(env.get("_build_debug").map(String::as_str), Some("no"));
+        assert_ne!(env.get("_propeller").map(String::as_str), Some("yes"));
+        assert!(env.get("_propeller_profiles").is_none());
+    }
+
+    #[test]
+    fn stage2_env_with_propeller_keeps_collection_flags() {
+        let env = stage2_build_env(
+            "linux-cachyos",
+            &KernelBuildConfig::default(),
+            "kernel-compilation.afdo",
+            false,
+        );
+        assert_eq!(env.get("_propeller").map(String::as_str), Some("yes"));
+        assert_eq!(env.get("_build_debug").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
     fn new_pipeline_flags_default_off() {
         let pgo: PgoConfig = toml::from_str("").unwrap();
         assert!(!pgo.reboot_before_start);
         assert!(!pgo.reuse_afdo_profile);
         assert!(!pgo.reuse_propeller_profile);
+        assert!(!pgo.skip_propeller);
         assert!(!pgo.compare_current);
         assert!(!pgo.compare_debug_clean);
         assert!(!pgo.compare_autofdo_clean);
         assert!(!pgo.compare_final);
     }
 
+    /// Training is always the kernel workload. Leftover fast/cachyos config is ignored.
     #[test]
-    fn combined_compare_forces_cachyos_preset() {
+    fn training_preset_is_always_kernel() {
         let mut pgo = test_pgo();
-        pgo.profiling_quality = "standard".into();
+        pgo.compare_final = true;
+        assert_eq!(resolved_benchmark_preset(&pgo), "kernel");
         pgo.benchmark_preset = "fast".into();
-        assert_eq!(resolved_benchmark_preset(&pgo, false), "fast");
-        assert_eq!(resolved_benchmark_preset(&pgo, true), "cachyos");
+        assert_eq!(resolved_benchmark_preset(&pgo), "kernel");
+        pgo.benchmark_preset = "cachyos".into();
+        assert_eq!(resolved_benchmark_preset(&pgo), "kernel");
     }
 
     #[test]
-    fn profiling_workload_sets_compare_label_when_combined() {
-        let pgo = test_pgo();
-        let (preset, label) = profiling_workload(&pgo, Some(CompareStage::Debug));
-        assert_eq!(preset, "cachyos");
-        assert_eq!(label.as_deref(), Some("abs-debug"));
-        let (preset, label) = profiling_workload(&pgo, Some(CompareStage::Autofdo));
-        assert_eq!(preset, "cachyos");
-        assert_eq!(label.as_deref(), Some("abs-autofdo"));
+    fn kernel_workload_budget_follows_short_sweet_long() {
         let mut pgo = test_pgo();
-        pgo.profiling_quality = "standard".into();
+        pgo.kernel_workload_seconds = 0;
+        pgo.profiling_quality = "short".into();
+        assert_eq!(resolved_kernel_workload_seconds(&pgo), 600);
+        pgo.profiling_quality = "sweet".into();
+        assert_eq!(resolved_kernel_workload_seconds(&pgo), 1200);
+        pgo.profiling_quality = "long".into();
+        assert_eq!(resolved_kernel_workload_seconds(&pgo), 3600);
+        pgo.profiling_quality = "maximum".into();
+        assert_eq!(resolved_kernel_workload_seconds(&pgo), 3600);
+        pgo.kernel_workload_seconds = 600;
+        pgo.profiling_quality = "long".into();
+        assert_eq!(resolved_kernel_workload_seconds(&pgo), 600);
+    }
+
+    #[test]
+    fn compare_preset_is_always_kbench() {
+        let mut pgo = test_pgo();
+        assert_eq!(resolved_compare_preset(&pgo), "kbench");
+        pgo.compare_preset = "  ".into();
+        assert_eq!(resolved_compare_preset(&pgo), "kbench");
+        pgo.compare_preset = "cachyos".into();
+        assert_eq!(resolved_compare_preset(&pgo), "kbench");
+        pgo.compare_preset = "kbench+cachyos".into();
+        assert_eq!(resolved_compare_preset(&pgo), "kbench");
+    }
+
+    #[test]
+    fn profiling_workload_is_training_only() {
+        let pgo = test_pgo();
+        assert_eq!(profiling_workload(&pgo), "kernel");
+        let mut pgo = test_pgo();
         pgo.benchmark_preset = "fast".into();
-        let (preset, label) = profiling_workload(&pgo, None);
-        assert_eq!(preset, "fast");
-        assert!(label.is_none());
+        assert_eq!(profiling_workload(&pgo), "kernel");
+    }
+
+    #[test]
+    fn hot_func_counts_prefer_work_over_idle_presence() {
+        let out = "\
+Hot Functions:
+50000 do_syscall_64
+20000 __schedule
+8000 try_to_wake_up
+500 cpuidle_enter
+400 perf_event_overflow
+";
+        let rows = parse_hot_func_counts(out);
+        assert_eq!(rows.len(), 5);
+        let mut work = 0u64;
+        let mut idle = 0u64;
+        for (c, n) in &rows {
+            match classify_profile_symbol(n) {
+                HotClass::Work => work += *c,
+                HotClass::Idle => idle += *c,
+                HotClass::Other => {}
+            }
+        }
+        assert!(work > idle, "work={work} idle={idle}");
+        assert_eq!(classify_profile_symbol("perf_event_nmi"), HotClass::Idle);
+        assert_eq!(classify_profile_symbol("__x64_sys_read"), HotClass::Work);
     }
 
     #[test]
@@ -3847,7 +5142,7 @@ mod tests {
         let env = stage1_env("linux-cachyos", &KernelBuildConfig::default());
         assert_eq!(env.get("_autofdo").map(String::as_str), Some("yes"));
         assert_eq!(env.get("_build_debug").map(String::as_str), Some("yes"));
-        assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("none"));
+        assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("thin"));
         assert_eq!(env.get("_use_lto_suffix").map(String::as_str), Some("no"));
     }
 
@@ -3865,6 +5160,7 @@ mod tests {
             "linux-cachyos",
             &KernelBuildConfig::default(),
             "kernel-compilation.afdo",
+            false,
         );
         assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("thin"));
         assert_eq!(env.get("_use_lto_suffix").map(String::as_str), Some("no"));
@@ -3872,6 +5168,7 @@ mod tests {
             "linux-cachyos-lto",
             &KernelBuildConfig::default(),
             "kernel-compilation.afdo",
+            false,
         );
         assert_eq!(lto.get("_use_lto_suffix").map(String::as_str), Some("yes"));
     }
@@ -3887,8 +5184,8 @@ mod tests {
         let mut env = stage1_env("linux-cachyos", &kernel);
         merge_user_kernel_overrides(&mut env, &kernel);
         assert_eq!(env.get("_cpusched").map(String::as_str), Some("bore"));
-        assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("none"));
-        assert_eq!(env.get("_use_kcfi").map(String::as_str), Some("yes"));
+        assert_eq!(env.get("_use_llvm_lto").map(String::as_str), Some("thin"));
+        assert_eq!(env.get("_use_kcfi").map(String::as_str), Some("no"));
     }
 
     #[test]
@@ -3907,7 +5204,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_perf_extra_args_maximum_uses_densest_sampling() {
+    fn resolved_perf_extra_args_maximum_uses_llvm_lbr_period() {
         let mut pgo = test_pgo();
         pgo.profiling_quality = "maximum".into();
         pgo.perf_extra_args = crate::config::PERF_EXTRA_ARGS_STANDARD.into();
@@ -3915,6 +5212,67 @@ mod tests {
             super::resolved_perf_extra_args(&pgo),
             crate::config::PERF_EXTRA_ARGS_MAXIMUM
         );
+        assert!(crate::config::PERF_EXTRA_ARGS_MAXIMUM.contains("-c 400009"));
+    }
+
+    #[test]
+    fn resolved_perf_extra_args_legacy_dense_periods_follow_quality() {
+        let mut pgo = test_pgo();
+        pgo.profiling_quality = "maximum".into();
+        pgo.perf_extra_args = "--mmap-pages 131072 -a -N -b -c 48000".into();
+        assert_eq!(
+            super::resolved_perf_extra_args(&pgo),
+            crate::config::PERF_EXTRA_ARGS_MAXIMUM
+        );
+        pgo.profiling_quality = "short".into();
+        pgo.perf_extra_args = "--mmap-pages 131072 -a -N -b -c 56000".into();
+        assert_eq!(
+            super::resolved_perf_extra_args(&pgo),
+            crate::config::PERF_EXTRA_ARGS_STANDARD
+        );
+    }
+
+    /// Saved GUI/example strings still used 512MiB/CPU mmap. Treat them as
+    /// quality defaults so long/sweet pick the modest buffer plus the LLVM period.
+    #[test]
+    fn resolved_perf_extra_args_legacy_huge_mmap_follows_quality() {
+        let mut pgo = test_pgo();
+        pgo.profiling_quality = "long".into();
+        pgo.perf_extra_args = "--mmap-pages 131072 -a -N -b -c 400009".into();
+        let got = super::resolved_perf_extra_args(&pgo);
+        assert_eq!(got, crate::config::PERF_EXTRA_ARGS_MAXIMUM);
+        assert!(got.contains("--mmap-pages 4096"), "{got}");
+        assert!(!got.contains("131072"), "{got}");
+
+        pgo.profiling_quality = "short".into();
+        pgo.perf_extra_args = "--mmap-pages 131072 -a -N -b -c 1000003".into();
+        let got = super::resolved_perf_extra_args(&pgo);
+        assert_eq!(got, crate::config::PERF_EXTRA_ARGS_STANDARD);
+        assert!(got.contains("--mmap-pages 4096"), "{got}");
+    }
+
+    #[test]
+    fn drop_caches_clears_page_cache_and_dentries() {
+        assert_eq!(
+            crate::pgo_priv::DROP_CACHES_SH,
+            "sync; echo 3 > /proc/sys/vm/drop_caches"
+        );
+    }
+
+    #[test]
+    fn stage1_collection_kernel_uses_same_lto_as_autofdo_build() {
+        let s1 = stage1_env("linux-cachyos", &KernelBuildConfig::default());
+        let s2 = stage2_build_env(
+            "linux-cachyos",
+            &KernelBuildConfig::default(),
+            "kernel-compilation.afdo",
+            false,
+        );
+        assert_eq!(
+            s1.get("_use_llvm_lto").map(String::as_str),
+            s2.get("_use_llvm_lto").map(String::as_str)
+        );
+        assert_eq!(s1.get("_use_llvm_lto").map(String::as_str), Some("thin"));
     }
 
     #[test]
@@ -3924,6 +5282,45 @@ mod tests {
         assert_eq!(
             super::resolved_perf_extra_args(&pgo),
             "--mmap-pages 131072 -a -N -b -c 42000"
+        );
+    }
+
+    /// Without `-c`/`-F`, perf record defaults to `-F 4000`. An hour of LBR on
+    /// ramdisk then grows propeller.data until the OOM killer fires.
+    #[test]
+    fn resolved_perf_extra_args_missing_period_uses_quality_count() {
+        let mut pgo = test_pgo();
+        pgo.profiling_quality = "long".into();
+        pgo.perf_extra_args = "--mmap-pages 131072 -a -N -b".into();
+        let got = super::resolved_perf_extra_args(&pgo);
+        assert_eq!(got, crate::config::PERF_EXTRA_ARGS_MAXIMUM);
+        assert!(got.contains("-c 400009"), "{got}");
+
+        pgo.profiling_quality = "short".into();
+        let got = super::resolved_perf_extra_args(&pgo);
+        assert_eq!(got, crate::config::PERF_EXTRA_ARGS_STANDARD);
+        assert!(got.contains("-c 1000003"), "{got}");
+    }
+
+    #[test]
+    fn resolved_perf_extra_args_empty_follows_quality() {
+        let mut pgo = test_pgo();
+        pgo.perf_extra_args.clear();
+        pgo.profiling_quality = "long".into();
+        assert_eq!(
+            super::resolved_perf_extra_args(&pgo),
+            crate::config::PERF_EXTRA_ARGS_MAXIMUM
+        );
+    }
+
+    #[test]
+    fn resolved_perf_extra_args_custom_flags_without_count_keep_mmap_and_gain_period() {
+        let mut pgo = test_pgo();
+        pgo.profiling_quality = "short".into();
+        pgo.perf_extra_args = "--mmap-pages 65536 -a -N -b".into();
+        assert_eq!(
+            super::resolved_perf_extra_args(&pgo),
+            "--mmap-pages 65536 -a -N -b -c 1000003"
         );
     }
 
@@ -3983,6 +5380,376 @@ mod tests {
     }
 
     #[test]
+    fn mmap_alloc_failed_detects_enomem() {
+        assert!(super::mmap_alloc_failed(
+            "command failed: sudo perf record ...\nfailed to mmap: Cannot allocate memory"
+        ));
+        assert!(super::mmap_alloc_failed("failed to mmap"));
+        assert!(!super::mmap_alloc_failed(
+            "doesn't support branch stack sampling"
+        ));
+        assert!(!super::mmap_alloc_failed("sudo: perf: command not found"));
+    }
+
+    #[test]
+    fn shrink_mmap_pages_halves_power_of_two() {
+        assert_eq!(
+            super::shrink_mmap_pages("--mmap-pages 131072 -a -N -b -c 400009").as_deref(),
+            Some("--mmap-pages 65536 -a -N -b -c 400009")
+        );
+        assert_eq!(
+            super::shrink_mmap_pages("--mmap-pages=4096 -a -N -b").as_deref(),
+            Some("--mmap-pages=2048 -a -N -b")
+        );
+        assert_eq!(
+            super::shrink_mmap_pages("-m 256 -a -N -b").as_deref(),
+            Some("-m 128 -a -N -b")
+        );
+        assert!(super::shrink_mmap_pages("--mmap-pages 128 -a -N -b").is_none());
+        assert!(super::shrink_mmap_pages("-a -N -b").is_none());
+    }
+
+    #[test]
+    fn parse_cgroup_shmem_bytes_reads_memory_stat() {
+        let stat = "anon 100\nfile 200\nshmem 70633975808\n";
+        assert_eq!(super::parse_cgroup_shmem_bytes(stat), Some(70633975808));
+        assert!(super::parse_cgroup_shmem_bytes("anon 1\n").is_none());
+    }
+
+    #[test]
+    fn pgo_shmem_unreclaimable_uses_one_gib_threshold() {
+        assert!(!super::pgo_shmem_unreclaimable(None));
+        assert!(!super::pgo_shmem_unreclaimable(Some(512 * 1024 * 1024)));
+        assert!(super::pgo_shmem_unreclaimable(Some(1024 * 1024 * 1024)));
+        assert!(super::pgo_shmem_unreclaimable(Some(
+            66 * 1024 * 1024 * 1024
+        )));
+    }
+
+    #[test]
+    fn parse_confirm_default_yes_empty_is_yes() {
+        assert!(super::parse_confirm_default_yes(""));
+        assert!(super::parse_confirm_default_yes("  \n"));
+        assert!(super::parse_confirm_default_yes("Y"));
+        assert!(super::parse_confirm_default_yes("yes"));
+        assert!(!super::parse_confirm_default_yes("n"));
+        assert!(!super::parse_confirm_default_yes("no"));
+    }
+
+    #[test]
+    fn should_reuse_raw_perf_only_when_convert_not_finished() {
+        assert!(super::should_reuse_raw_perf(true, false));
+        assert!(!super::should_reuse_raw_perf(true, true));
+        assert!(!super::should_reuse_raw_perf(false, false));
+        assert!(!super::should_reuse_raw_perf(false, true));
+    }
+
+    fn touch_mtime(path: &Path, older: bool) {
+        fs::write(path, b"x").unwrap();
+        let t = if older {
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)
+        } else {
+            SystemTime::now()
+        };
+        fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn converted_covers_raw_ignores_stale_texts_from_earlier_pipeline() {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("abs-pgo-covers-{pid}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cc = dir.join("propeller_cc_profile.txt");
+        let ld = dir.join("propeller_ld_profile.txt");
+        let raw = dir.join("propeller.data");
+        touch_mtime(&cc, true);
+        touch_mtime(&ld, true);
+        touch_mtime(&raw, false);
+        assert!(
+            !super::converted_covers_raw(&[cc.clone(), ld.clone()], &[raw.clone()]),
+            "Aug 29 texts must not count as convert-done for a newer capture"
+        );
+        assert!(super::converted_covers_raw(&[cc.clone(), ld.clone()], &[]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convert_kind_from_tool_detects_llvm_profgen() {
+        assert_eq!(
+            super::convert_kind_from_tool("llvm-profgen"),
+            super::ConvertKind::LlvmProfgen
+        );
+        assert_eq!(
+            super::convert_kind_from_tool("/usr/bin/llvm-profgen"),
+            super::ConvertKind::LlvmProfgen
+        );
+        assert_eq!(
+            super::convert_kind_from_tool("create_llvm_prof"),
+            super::ConvertKind::Propeller
+        );
+        assert_eq!(
+            super::convert_kind_from_tool(
+                "/home/john/.cache/abs/llvm-propeller/bin/generate_propeller_profiles"
+            ),
+            super::ConvertKind::Propeller
+        );
+    }
+
+    #[test]
+    fn convert_anon_estimate_is_conservative_vs_measured_propeller_oom() {
+        const GIB: u64 = 1 << 30;
+        let file = 23 * GIB;
+        // Measured 18:46: 82 GiB RSS + 32 GiB swapents = 5.0× this file; 6× is the bar.
+        assert_eq!(
+            super::convert_anon_estimate_bytes(file, super::ConvertKind::Propeller),
+            138 * GIB
+        );
+        assert_eq!(
+            super::convert_anon_estimate_bytes(8 * GIB, super::ConvertKind::LlvmProfgen),
+            16 * GIB
+        );
+    }
+
+    #[test]
+    fn force_relocate_always_leaves_tmpfs() {
+        const GIB: u64 = 1 << 30;
+        assert!(super::should_relocate_capture_for_convert(
+            crate::config::ConvertRelocateMode::Force,
+            true,
+            Some(80 * GIB),
+            GIB,
+            4 * GIB,
+            super::ConvertKind::LlvmProfgen,
+        ));
+        assert!(!super::should_relocate_capture_for_convert(
+            crate::config::ConvertRelocateMode::Force,
+            false,
+            Some(8 * GIB),
+            20 * GIB,
+            4 * GIB,
+            super::ConvertKind::Propeller,
+        ));
+    }
+
+    #[test]
+    fn smart_relocate_keeps_tmpfs_only_when_remaining_ram_covers_estimate() {
+        const GIB: u64 = 1 << 30;
+        let min_free = 4 * GIB;
+        // 2 GiB llvm-profgen → 4 GiB estimate + 4 GiB min = 8 GiB; 20 GiB available keeps.
+        assert!(!super::should_relocate_capture_for_convert(
+            crate::config::ConvertRelocateMode::Smart,
+            true,
+            Some(20 * GIB),
+            2 * GIB,
+            min_free,
+            super::ConvertKind::LlvmProfgen,
+        ));
+        // This boot: 23 GiB Propeller → 138 GiB + 4 GiB; 70 GiB available relocates.
+        assert!(super::should_relocate_capture_for_convert(
+            crate::config::ConvertRelocateMode::Smart,
+            true,
+            Some(70 * GIB),
+            23 * GIB,
+            min_free,
+            super::ConvertKind::Propeller,
+        ));
+        // Unknown MemAvailable fails closed.
+        assert!(super::should_relocate_capture_for_convert(
+            crate::config::ConvertRelocateMode::Smart,
+            true,
+            None,
+            GIB,
+            min_free,
+            super::ConvertKind::LlvmProfgen,
+        ));
+        // Not on tmpfs: never relocate.
+        assert!(!super::should_relocate_capture_for_convert(
+            crate::config::ConvertRelocateMode::Smart,
+            false,
+            Some(8 * GIB),
+            40 * GIB,
+            min_free,
+            super::ConvertKind::Propeller,
+        ));
+    }
+
+    #[test]
+    fn convert_spill_path_uses_archive_not_package_repo() {
+        let mut pgo = test_pgo();
+        pgo.profiles_archive_dir = Some("/media/storage/tmp".into());
+        assert_eq!(
+            super::convert_spill_path(&pgo, "linux-cachyos", "propeller.data"),
+            PathBuf::from("/media/storage/tmp/pgo-convert/linux-cachyos/propeller.data")
+        );
+    }
+
+    #[test]
+    fn relocate_capture_to_disk_copies_sidecar_and_unlinks_src() {
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("abs-pgo-relocate-{pid}"));
+        let _ = fs::remove_dir_all(&root);
+        let src_dir = root.join("ram");
+        let dest_dir = root.join("disk");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("propeller.data");
+        fs::write(&src, b"capture").unwrap();
+        super::write_perf_kernel_identity(&src, &running_debug()).unwrap();
+        let dest = dest_dir.join("propeller.data");
+        super::relocate_capture_to_disk(&src, &dest).unwrap();
+        assert!(!src.exists());
+        assert!(!super::perf_identity_sidecar_path(&src).exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"capture");
+        assert!(super::perf_identity_sidecar_path(&dest).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ram_reclaimed_requires_empty_leftovers_and_quiet_slice() {
+        assert!(super::ram_reclaimed(true, None));
+        assert!(super::ram_reclaimed(true, Some(100)));
+        assert!(!super::ram_reclaimed(false, None));
+        assert!(!super::ram_reclaimed(true, Some(2 * 1024 * 1024 * 1024)));
+    }
+
+    #[test]
+    fn ram_needs_reboot_on_failed_umount_even_if_scratch_looks_empty() {
+        assert!(super::ram_needs_reboot(true, true, None));
+        assert!(!super::ram_needs_reboot(false, true, None));
+        assert!(super::ram_needs_reboot(false, false, None));
+        assert!(super::ram_needs_reboot(
+            false,
+            true,
+            Some(2 * 1024 * 1024 * 1024)
+        ));
+    }
+
+    #[test]
+    fn leftover_pgo_scratch_files_lists_captures_and_converted() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs-pgo-leftover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kernel.data"), vec![0u8; 8]).unwrap();
+        fs::write(dir.join("kernel.data.kernel.json"), b"{}").unwrap();
+        fs::write(dir.join("kernel-compilation.afdo"), b"afdo").unwrap();
+        fs::write(dir.join("unrelated.txt"), b"x").unwrap();
+        let got = super::leftover_pgo_scratch_files(&dir, "kernel-compilation.afdo");
+        let names: Vec<_> = got
+            .iter()
+            .map(|(p, n)| (p.file_name().unwrap().to_string_lossy().into_owned(), *n))
+            .collect();
+        assert!(names.contains(&("kernel.data".into(), 8)), "{names:?}");
+        assert!(
+            names.iter().any(|(n, _)| n == "kernel.data.kernel.json"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("kernel-compilation.afdo".into(), 4)),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|(n, _)| n == "unrelated.txt"));
+        fs::write(dir.join("propeller_cc_profile.txt"), b"cc").unwrap();
+        fs::write(dir.join("propeller_ld_profile.txt"), b"ld").unwrap();
+        super::drop_pgo_scratch_captures(&dir, "kernel-compilation.afdo", true);
+        assert!(!dir.join("kernel.data").exists());
+        assert!(!dir.join("kernel-compilation.afdo").exists());
+        assert!(dir.join("propeller_cc_profile.txt").exists());
+        assert!(dir.join("propeller_ld_profile.txt").exists());
+        assert!(dir.join("unrelated.txt").exists());
+        super::drop_pgo_scratch_captures(&dir, "kernel-compilation.afdo", false);
+        assert!(!dir.join("propeller_cc_profile.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pgo_slice_shmem_under_finds_abs_pgo_stat() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs-pgo-cgroup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let slice = dir.join("user.slice").join("app-abs-pgo.slice");
+        fs::create_dir_all(&slice).unwrap();
+        fs::write(slice.join("memory.stat"), "anon 1\nshmem 4096\n").unwrap();
+        let browser = dir.join("user.slice").join("app-firefox.scope");
+        fs::create_dir_all(&browser).unwrap();
+        fs::write(browser.join("memory.stat"), "shmem 999999999\n").unwrap();
+        assert_eq!(super::read_pgo_slice_shmem_under(&dir), Some(4096));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreclaimable_ram_action_matches_auto_and_tty() {
+        assert_eq!(
+            super::unreclaimable_ram_action(true, false),
+            super::UnreclaimableRamAction::AutoReboot
+        );
+        assert_eq!(
+            super::unreclaimable_ram_action(true, true),
+            super::UnreclaimableRamAction::AutoReboot
+        );
+        assert_eq!(
+            super::unreclaimable_ram_action(false, true),
+            super::UnreclaimableRamAction::AskReboot
+        );
+        assert_eq!(
+            super::unreclaimable_ram_action(false, false),
+            super::UnreclaimableRamAction::Stop
+        );
+    }
+
+    #[test]
+    fn drop_raw_perf_after_convert_unlinks_capture() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs-pgo-drop-raw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("kernel.data");
+        fs::write(&data, b"capture").unwrap();
+        super::write_perf_kernel_identity(&data, &running_debug()).unwrap();
+        super::drop_raw_perf_after_convert(&data);
+        assert!(!data.exists());
+        assert!(!super::perf_identity_sidecar_path(&data).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_stale_perf_capture_unlinks_data_and_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "abs-pgo-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("propeller.data");
+        fs::write(&data, b"leftover").unwrap();
+        super::write_perf_kernel_identity(&data, &running_debug()).unwrap();
+        let sidecar = super::perf_identity_sidecar_path(&data);
+        assert!(sidecar.exists());
+        super::remove_stale_perf_capture(&data);
+        assert!(!data.exists());
+        assert!(!sidecar.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn perf_data_usable_requires_minimum_size() {
         let dir = std::env::temp_dir().join(format!("abs-pgo-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -3996,18 +5763,15 @@ mod tests {
     }
 
     #[test]
-    fn ramdisk_perf_without_sidecar_may_be_reused() {
-        assert!(super::allow_anonymous_perf_reuse(Path::new(
+    fn ramdisk_perf_without_sidecar_is_not_reused() {
+        assert!(!super::allow_anonymous_perf_reuse(Path::new(
             "/run/abs-ram/pgo-scratch/linux-cachyos/kernel.data"
         )));
-        assert!(super::allow_anonymous_perf_reuse(Path::new(
+        assert!(!super::allow_anonymous_perf_reuse(Path::new(
             "/run/abs-ram/pgo-scratch/linux-cachyos/propeller.data"
         )));
         assert!(!super::allow_anonymous_perf_reuse(Path::new(
             "/tmp/kernel.data"
-        )));
-        assert!(!super::allow_anonymous_perf_reuse(Path::new(
-            "/home/john/.cache/abs/kernel.data"
         )));
     }
 
@@ -4023,7 +5787,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_perf_data_falls_back_to_repo_copy() {
+    fn existing_perf_data_uses_scratch_not_repo() {
         let pid = std::process::id();
         let scratch = std::env::temp_dir().join(format!("abs-pgo-scratch-{pid}"));
         let repo = std::env::temp_dir().join(format!("abs-pgo-repo-{pid}"));
@@ -4034,18 +5798,60 @@ mod tests {
         let scratch_file = scratch.join("propeller.data");
         let repo_file = repo.join("propeller.data");
         let running = running_debug();
-        assert!(super::existing_perf_data(&scratch_file, &repo, &running).is_none());
+        assert!(super::existing_perf_data(&scratch_file, &running).is_none());
         write_usable_perf(&repo_file, 0);
         super::write_perf_kernel_identity(&repo_file, &running).unwrap();
-        let (path, n) = super::existing_perf_data(&scratch_file, &repo, &running).unwrap();
-        assert_eq!(path, repo_file);
-        assert_eq!(n, MIN_USABLE_PERF_BYTES);
+        assert!(
+            super::existing_perf_data(&scratch_file, &running).is_none(),
+            "raw captures on disk are not reused"
+        );
         write_usable_perf(&scratch_file, 8);
         super::write_perf_kernel_identity(&scratch_file, &running).unwrap();
-        let (path, n) = super::existing_perf_data(&scratch_file, &repo, &running).unwrap();
+        let (path, n) = super::existing_perf_data(&scratch_file, &running).unwrap();
         assert_eq!(path, scratch_file);
         assert_eq!(n, MIN_USABLE_PERF_BYTES + 8);
         let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn existing_perf_for_convert_reuses_spill_not_repo() {
+        let pid = std::process::id();
+        let scratch = std::env::temp_dir().join(format!("abs-pgo-spill-scratch-{pid}"));
+        let spill_dir = std::env::temp_dir().join(format!("abs-pgo-spill-disk-{pid}"));
+        let repo = std::env::temp_dir().join(format!("abs-pgo-spill-repo-{pid}"));
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&spill_dir);
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&spill_dir).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let scratch_file = scratch.join("propeller.data");
+        let spill_file = spill_dir.join("propeller.data");
+        let repo_file = repo.join("propeller.data");
+        let running = running_debug();
+        write_usable_perf(&repo_file, 0);
+        super::write_perf_kernel_identity(&repo_file, &running).unwrap();
+        assert!(
+            super::existing_perf_for_convert(&scratch_file, &spill_file, &running).is_none(),
+            "package-repo leftover is not convert scratch"
+        );
+        write_usable_perf(&spill_file, 4);
+        super::write_perf_kernel_identity(&spill_file, &running).unwrap();
+        let (path, n) =
+            super::existing_perf_for_convert(&scratch_file, &spill_file, &running).unwrap();
+        assert_eq!(path, spill_file);
+        assert_eq!(n, MIN_USABLE_PERF_BYTES + 4);
+        write_usable_perf(&scratch_file, 8);
+        super::write_perf_kernel_identity(&scratch_file, &running).unwrap();
+        let (path, _) =
+            super::existing_perf_for_convert(&scratch_file, &spill_file, &running).unwrap();
+        assert_eq!(
+            path, scratch_file,
+            "same-boot ramdisk capture wins over spill"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&spill_dir);
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -4059,10 +5865,9 @@ mod tests {
         fs::create_dir_all(&scratch).unwrap();
         fs::create_dir_all(&repo).unwrap();
         let scratch_file = scratch.join("kernel.data");
-        let repo_file = repo.join("kernel.data");
-        write_usable_perf(&repo_file, 0);
+        write_usable_perf(&scratch_file, 0);
         assert!(
-            super::existing_perf_data(&scratch_file, &repo, &running_debug()).is_none(),
+            super::existing_perf_data(&scratch_file, &running_debug()).is_none(),
             "size-only leftover from an unknown kernel must not be reused"
         );
         let _ = fs::remove_dir_all(&scratch);
@@ -4079,10 +5884,9 @@ mod tests {
         fs::create_dir_all(&scratch).unwrap();
         fs::create_dir_all(&repo).unwrap();
         let scratch_file = scratch.join("kernel.data");
-        let repo_file = repo.join("kernel.data");
-        write_usable_perf(&repo_file, 0);
+        write_usable_perf(&scratch_file, 0);
         super::write_perf_kernel_identity(
-            &repo_file,
+            &scratch_file,
             &super::PerfKernelIdentity {
                 uname: "7.2.2-1-cachyos".into(),
                 pkgbase: Some("linux-cachyos-lto".into()),
@@ -4090,11 +5894,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            super::existing_perf_data(&scratch_file, &repo, &running_debug()).is_none(),
+            super::existing_perf_data(&scratch_file, &running_debug()).is_none(),
             "same uname, different pkgbase (debug vs AutoFDO -lto) must not be reused"
         );
         super::write_perf_kernel_identity(
-            &repo_file,
+            &scratch_file,
             &super::PerfKernelIdentity {
                 uname: "7.1.9-1-cachyos".into(),
                 pkgbase: Some("linux-cachyos".into()),
@@ -4102,7 +5906,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            super::existing_perf_data(&scratch_file, &repo, &running_debug()).is_none(),
+            super::existing_perf_data(&scratch_file, &running_debug()).is_none(),
             "same pkgbase, different uname must not be reused"
         );
         let _ = fs::remove_dir_all(&scratch);
@@ -4137,29 +5941,11 @@ mod tests {
     }
 
     #[test]
-    fn sync_perf_data_to_repo_copies_kernel_identity() {
-        let pid = std::process::id();
-        let root = std::env::temp_dir().join(format!("abs-pgo-sync-id-{pid}"));
-        let _ = fs::remove_dir_all(&root);
-        let scratch = root.join("scratch");
-        let repo = root.join("repo");
-        fs::create_dir_all(&scratch).unwrap();
-        fs::create_dir_all(&repo).unwrap();
-        let src = scratch.join("kernel.data");
-        write_usable_perf(&src, 0);
-        super::write_perf_kernel_identity(&src, &running_debug()).unwrap();
-        super::sync_perf_data_to_repo(&src, &repo).unwrap();
-        let dest = repo.join("kernel.data");
-        let id = super::read_perf_kernel_identity(&dest).expect("sidecar copied");
-        assert_eq!(id, running_debug());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn propeller_profiles_on_ram_defaults_true() {
         let pgo: PgoConfig = toml::from_str("").unwrap();
         assert!(pgo.propeller_profiles_on_ram);
         assert!(pgo.perf_data_on_ram);
+        assert_eq!(pgo.convert_relocate, "force");
         let pgo: PgoConfig = toml::from_str("propeller_profiles_on_ram = false\n").unwrap();
         assert!(!pgo.propeller_profiles_on_ram);
     }
@@ -4245,6 +6031,7 @@ mod tests {
             expected_kernel_uname: uname.map(str::to_string),
             expected_package_base: base.map(str::to_string),
             stage_history: Vec::new(),
+            compare_run_dir: None,
         }
     }
 
@@ -4319,6 +6106,7 @@ mod tests {
             expected_kernel_uname: Some("6.12.1-zen1-1-zen".into()),
             expected_package_base: Some("linux-zen".into()),
             stage_history: Vec::new(),
+            compare_run_dir: None,
         };
         let names = super::kernel_hold_package_names(&state);
         assert!(names.contains(&"linux-zen".to_string()));
@@ -4344,6 +6132,7 @@ mod tests {
             expected_kernel_uname: None,
             expected_package_base: None,
             stage_history: Vec::new(),
+            compare_run_dir: None,
         };
         fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
@@ -4381,10 +6170,13 @@ default = "aur"
             profile_scratch_dir: "auto".into(),
             perf_data_on_ram: true,
             propeller_profiles_on_ram: true,
+            convert_relocate: "force".into(),
             benchmark_command: None,
             benchmark_workdir: None,
-            benchmark_preset: "fast".into(),
-            profiling_quality: "maximum".into(),
+            benchmark_preset: "kernel".into(),
+            compare_preset: "auto".into(),
+            kernel_workload_seconds: 0,
+            profiling_quality: "sweet".into(),
             build_user: None,
             perf_event_args: "auto".into(),
             perf_extra_args: crate::config::PERF_EXTRA_ARGS_STANDARD.into(),
@@ -4399,6 +6191,7 @@ default = "aur"
             reboot_before_start: false,
             reuse_afdo_profile: false,
             reuse_propeller_profile: false,
+            skip_propeller: false,
             compare_current: false,
             compare_debug: false,
             compare_debug_clean: false,
@@ -4435,6 +6228,7 @@ default = "aur"
             expected_kernel_uname: Some("7.1.1-2.2-cachyos-lto".into()),
             expected_package_base: Some("linux-cachyos-lto".into()),
             stage_history: Vec::new(),
+            compare_run_dir: None,
         };
         let names = super::kernel_hold_package_names(&state);
         assert!(names.contains(&"linux-cachyos-lto".to_string()));
@@ -4453,6 +6247,7 @@ default = "aur"
             expected_kernel_uname: Some("7.1.1-2.2-cachyos-lto".into()),
             expected_package_base: Some("linux-cachyos-lto".into()),
             stage_history: Vec::new(),
+            compare_run_dir: None,
         };
         let msg = super::reboot_resume_message(&state, "linux-cachyos");
         assert!(msg.contains("vmlinuz-linux-cachyos-lto"));

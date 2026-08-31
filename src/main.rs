@@ -28,6 +28,7 @@ mod toml_pretty;
 mod upstream;
 mod utils;
 mod wizard;
+mod zram;
 
 use std::sync::{Arc, Mutex};
 
@@ -497,6 +498,7 @@ fn main() {
         if let Err(e) = ramdisk::force_unmount_configured(&config) {
             die!("{}", e);
         }
+        crate::zram::teardown_abs_zram();
         blog!("Ramdisk shutdown complete.");
         return;
     }

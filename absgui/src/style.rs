@@ -1474,6 +1474,25 @@ pub fn wizard_error_banner(app_theme: AppTheme) -> impl Fn(&Theme) -> container:
     }
 }
 
+pub fn warning_banner(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(match app_theme {
+            AppTheme::Dark => Color::from_rgba(0.98, 0.75, 0.14, 0.14),
+            AppTheme::Light => Color::from_rgba(0.76, 0.46, 0.11, 0.10),
+        })),
+        text_color: Some(warning(app_theme)),
+        border: Border {
+            color: match app_theme {
+                AppTheme::Dark => Color::from_rgba(0.98, 0.75, 0.14, 0.4),
+                AppTheme::Light => Color::from_rgba(0.76, 0.46, 0.11, 0.35),
+            },
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 pub fn wizard_success_banner(app_theme: AppTheme) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(match app_theme {

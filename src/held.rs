@@ -273,7 +273,7 @@ ready_made_packages_path = "/tmp"
 default_environment = "local"
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
+command_to_update_repositories = "pacman -Sy"
 command_to_perform_system_update = "pacman -Syu"
 ignore_flag = "--ignore"
 ignore_packages = []

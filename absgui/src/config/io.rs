@@ -546,5 +546,38 @@ default = "arch"
                 .as_deref(),
             Some("pacman -Su")
         );
+        assert_eq!(doc.system_update.auto_refresh_delay, 0);
+        assert!(!doc.system_update.remember_sudo);
+    }
+
+    #[test]
+    fn system_update_auto_refresh_delay_accepts_quoted_number() {
+        let text = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/abs-test/packages"
+chroot_base_path = "/tmp/abs-test/chroot"
+ready_made_packages_path = "/tmp/abs-test/ready"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+auto_refresh_delay = "15"
+remember_sudo = true
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+"#;
+        let doc: ConfigDocument = toml::from_str(text).expect("parse delay");
+        assert_eq!(doc.system_update.auto_refresh_delay, 15);
+        assert!(doc.system_update.remember_sudo);
     }
 }

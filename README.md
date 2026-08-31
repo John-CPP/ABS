@@ -258,7 +258,7 @@ Set `ABS_BINARY` if `abs` is not on `PATH`. Window theme/size: `~/.config/abs/ab
 
 Works on COSMIC as well as other desktops. External commands (system update, PGO in a TTY) use `cosmic-term` or `xdg-terminal-exec` when available; override with `ABSGUI_TERMINAL`. File and folder pickers use the XDG FileChooser portal when the desktop provides it; otherwise AbsGui tries `kdialog`, `zenity`, `matedialog`, `yad`, then `qarma`. Override with `ABS_FILE_DIALOG=portal|kdialog|zenity|matedialog|yad|qarma`. On Hyprland/Sway/niri, install `xdg-desktop-portal-gtk` (or `zenity`/`kdialog`) if Browse does nothing.
 
-The **System update** page lists pending pacman and AUR upgrades (`abs --pending-updates --json`). Official-repo packages install together; AUR packages install one by one using yay, paru, or pikaur from `command_to_perform_system_update`. Sudo passwords open a graphical askpass dialog.
+The **System update** page lists pending pacman and AUR upgrades (`abs --pending-updates --json`). Official-repo packages install together; AUR packages install one by one using yay, paru, or pikaur from `command_to_perform_system_update`. Opening the page loads the list once; further automatic refreshes follow `[system_update] auto_refresh_delay` (minutes; `0` = only the **Refresh** button). Sudo passwords open a graphical askpass dialog. Set `remember_sudo = true` to type the password once per AbsGui run; leave it `false` to be asked on every privileged command.
 
 ---
 
@@ -365,6 +365,7 @@ Optional tmpfs to speed compiles and spare the SSD. Disk `[paths]` stay the perm
 | `seed_chroot_from` | Optional disk tree to rsync into the ram chroot (unset = fresh `mkarchroot`) |
 | `sync_chroot_on_exit` | Rsync ram chroot back to `seed_chroot_from` (default `false`) |
 | `min_free_ram_mb` | Refuse to mount if `MemAvailable` is below this (default `4096`) |
+| `zram` | Temporary ABS-owned compressed swap for compiles and system update: `full` (max remaining RAM, default) or `off`. Independent of tmpfs. Per-package `[packages.NAME] zram = "off"` inherits or overrides. |
 | `warn_packages_ram` | Warn when `packages = true` (default `true`) |
 | `reclaim_mount_on_startup` | Unmount a stale tmpfs at `mount_point` before mounting (default `true`) |
 
@@ -423,7 +424,7 @@ Root-level (also accepted under `[build]` for old files):
 
 ## Kernel PGO (linux-cachyos)
 
-Three-stage CachyOS pipeline (debug build → AutoFDO → Propeller) with reboot checkpoints. Configure `[packages.linux-cachyos]` and `[packages.linux-cachyos.pgo]` (see `abs.toml.example`).
+Three-stage CachyOS pipeline (debug build → AutoFDO → Propeller) with reboot checkpoints. Set `skip_propeller = true` to stop after AutoFDO (no Propeller collection or compile; that AutoFDO kernel is the one you keep). Configure `[packages.linux-cachyos]` and `[packages.linux-cachyos.pgo]` (see `abs.toml.example`).
 
 ```bash
 abs --pgo linux-cachyos
@@ -434,13 +435,39 @@ abs --pgo-resume linux-cachyos
 abs --pgo-status linux-cachyos --json
 ```
 
-`profiles_archive_dir` is required. `ramdisk = "w"` keeps sources on disk and compile I/O on tmpfs. `propeller_profiles_on_ram` (default `true`) keeps stage-3 Propeller profiles on ramdisk scratch and skips the HDD archive — the final Propeller build runs in the same boot. With `auto_restart`, abs reboots at wait gates, installs a passwordless sudo helper (`/etc/sudoers.d/abs-pgo-<uid>`, removed when the pipeline ends), and opens a terminal after login so you can watch the next profile + build. With `select_boot_kernel` (default `true`), abs sets a one-shot bootloader entry for the stage kernel before reboot (`bootctl set-oneshot` on systemd-boot/Limine, `grub-reboot` on GRUB) without changing the permanent default.
+`profiles_archive_dir` is required. `ramdisk = "w"` keeps sources on disk and compile I/O on tmpfs. `propeller_profiles_on_ram` (default `true`) keeps stage-3 Propeller profiles on ramdisk scratch and skips the HDD archive — the final Propeller build runs in the same boot. `convert_relocate` (default `force`) copies the raw `.data` off tmpfs to `{profiles_archive_dir}/pgo-convert/<package>/` before convert so the converter working set is not stacked on the capture in RAM; `smart` keeps the file on ramdisk only when remaining `MemAvailable` covers a pessimistic peak (6× file for Propeller, 2× for llvm-profgen) plus `ramdisk.min_free_ram_mb`. With `auto_restart`, abs reboots at wait gates, installs a passwordless sudo helper (`/etc/sudoers.d/abs-pgo-<uid>`, removed when the pipeline ends), and opens a terminal after login so you can watch the next profile + build. With `select_boot_kernel` (default `true`), abs sets a one-shot bootloader entry for the stage kernel before reboot (`bootctl set-oneshot` on systemd-boot/Limine, `grub-reboot` on GRUB) without changing the permanent default.
 
 Stage 3 Propeller conversion needs a tool that can read the kernel's `SHT_LLVM_BB_ADDR_MAP` section. LLVM 22+ writes version 5, which `create_llvm_prof` 0.30 cannot read. With `propeller_tool = "auto"` (the default), ABS uses `generate_propeller_profiles` when it is on `PATH` or in `~/.cache/abs/llvm-propeller/`, and otherwise builds it from [llvm-propeller](https://github.com/google/llvm-propeller) against system LLVM (`cmake`, `ninja`, `clang`, `llvm`, `git`).
 
-Profiling uses the bundled `assets/pgo-benchmark.sh` (installed to `/usr/share/abs/pgo-benchmark.sh`) unless you set `benchmark_command`. From a `cargo build` without that file, ABS writes the same script to `~/.local/share/abs/pgo-benchmark.sh`. It expects `cachyos-benchmarker`, `sysbench`, and optionally `rg` on `PATH`.
+Profiling uses the bundled `assets/pgo-benchmark.sh` (installed to `/usr/share/abs/pgo-benchmark.sh`) unless you set `benchmark_command`. From a `cargo build` without that file, ABS writes the same script to `~/.local/share/abs/pgo-benchmark.sh`. It expects `stress-ng` and `perf` on `PATH`, and optionally `hackbench`, `fio`, `socat` and `sysbench`.
 
-Opt-in comparison benchmarks (`compare_current`, `compare_debug_clean`, `compare_autofdo_clean`, `compare_final`, all default `false`) write logs to `{profiles_archive_dir}/compare-benchmarks`. These are clean `cachyos-benchmarker` runs (no `perf`). A standalone clean run drops the page cache and does a short `fast` warm-up first; a clean run that immediately follows profiling on the same kernel skips that. Profiling logs still feed `with-overhead/` whenever any comparison is on. `reboot_before_start` reboots into the current kernel before the first comparison. `reuse_afdo_profile` / `reuse_propeller_profile` skip collection when a suitable archive exists (a debug or AutoFDO no-perf bench still builds and boots that kernel). At the end ABS builds `without-overhead/` and `with-overhead/` (if collection logs exist), plus `index.html`. Requires `cachyos-benchmarker`. Charts are generated by ABS (no Python).
+### Why the training workload decides whether PGO helps
+
+`perf record` samples kernel branches only (`:k`), so the training workload determines which kernel code AutoFDO and Propeller can see at all. This matters more than it first appears: AutoFDO does not treat unsampled functions as neutral, it treats them as **cold** — they lose inlining, get size-optimised, and Propeller moves their basic blocks to `.text.unlikely`.
+
+A userspace-bound workload (y-cruncher, blender, ffmpeg, `sysbench cpu`, `stress-ng --cpu`) spends nearly all its cycles in userspace. The only kernel samples it produces come from timer interrupts, the idle loop, page faults and perf's own sampling machinery. The result is a kernel optimised for timers and idle while the syscall entry/exit, VFS, dcache, socket, futex and scheduler wakeup paths — the ones that decide real performance — are pessimised. Such a build lands within noise of stock, or slightly behind it.
+
+`benchmark_preset` trains on syscall, scheduler, futex, sockets/pipes, page-fault/mmap and VFS lookup — the paths AutoFDO must see — plus a short composite of `hackbench` / `perf bench` / TCP loopback (and on sweet/long, tar + fio). `profiling_quality` picks the wall clock:
+
+| Profile | Train (under `perf record`) | Compare (no perf, default `kbench`) |
+| --- | --- | --- |
+| short | ~10 min | ~3 min (1 pass) |
+| **sweet** (default) | **~20 min** | **~6 min** (3 passes) |
+| long | ~60 min | ~10 min (3 longer passes) |
+
+`maximum` is an alias for long; `standard` maps to sweet. Two collection stages at sweet is about 40 min of profiling; kernel compiles still dominate wall time. Set `kernel_workload_seconds` only to override the table (capped at 60 min). Userspace suites (y-cruncher, blender, `sysbench cpu`) are not used for training or comparison.
+
+After conversion ABS classifies hot-function *counts* (syscall/sched/VFS vs idle/perf) and warns when a profile is idle-dominated.
+
+The workload saturates the machine. Stressors run in batches of 4 at a bounded worker count. `ABS_PGO_DRY_RUN=1` prints the plan without executing anything:
+
+```bash
+ABS_PGO_DRY_RUN=1 ABS_PGO_BENCHMARK=kernel ABS_PGO_PROFILE=sweet /usr/share/abs/pgo-benchmark.sh
+```
+
+### Comparison benchmarks
+
+Opt-in comparison benchmarks (`compare_current`, `compare_debug_clean`, `compare_autofdo_clean`, `compare_final`, all default `false`) write logs to `{profiles_archive_dir}/compare-benchmarks/YYYY-MM-DD-HHMMSS/` (one folder per `--pgo` / `--pgo-restart` pipeline). These are clean runs (no `perf`) and are intentionally shorter than training. Every scored clean run drops page cache, dentries, and inodes (`echo 3`) and does a short CPU-only warm-up first. Comparison always runs `kbench` (kernel-path metrics the charts can actually move). ABS zram is torn down for those scored runs (ramdisk stays mounted). `benchmark_preset` must be `kernel`; `compare_preset` must be `kbench` or `auto`. `reboot_before_start` reboots into the current kernel before the first comparison. `reuse_afdo_profile` / `reuse_propeller_profile` skip collection when a suitable archive exists. `skip_propeller` stops after the AutoFDO kernel; `compare_final` then scores that kernel instead of a Propeller build. At the end ABS builds `without-overhead/` (and `with-overhead/` only if old collection logs exist), plus `index.html`. Charts are generated by ABS (no Python).
 
 absgui pages: **Kernels** (list + default template; screenshot [above](#absgui)), **per-kernel** (PGO controls and build log), **System update** (pending pacman/AUR list, per-AUR install, `abs -RU`), **ABS settings** (full `abs.toml`), **App settings** (theme, window). The window app id is `absgui`, matching the installed `.desktop` file (Utility; System) and icon so Wayland taskbars show the logo.
 

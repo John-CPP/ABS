@@ -84,6 +84,46 @@ fn default_install_testing_phase_archlinux_packages() -> bool {
     false
 }
 
+fn deserialize_u32_from_int_or_str<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct U32Loose;
+
+    impl<'de> Visitor<'de> for U32Loose {
+        type Value = u32;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a non-negative integer or a numeric string")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
+            u32::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
+            u32::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_u32<E: de::Error>(self, v: u32) -> Result<u32, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
+            v.trim().parse().map_err(E::custom)
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<u32, E> {
+            self.visit_str(&v)
+        }
+    }
+
+    deserializer.deserialize_any(U32Loose)
+}
+
 fn default_self_update_install_path() -> String {
     "/usr/bin/abs".to_string()
 }
@@ -128,6 +168,10 @@ fn default_ramdisk_reclaim_mount_on_startup() -> bool {
     true
 }
 
+fn default_ramdisk_zram() -> String {
+    "full".to_string()
+}
+
 /// Optional tmpfs/ramdisk for chroot rootfs and per-package build workdirs (`src/`, `pkg/`).
 #[derive(Debug, Deserialize, Clone)]
 pub struct RamdiskConfig {
@@ -156,6 +200,9 @@ pub struct RamdiskConfig {
     /// Unmount `mount_point` before mounting when it is already mounted (e.g. after a crashed ABS run).
     #[serde(default = "default_ramdisk_reclaim_mount_on_startup")]
     pub reclaim_mount_on_startup: bool,
+    /// Temporary ABS-owned zram: `off` or `full` (max remaining RAM; default).
+    #[serde(default = "default_ramdisk_zram")]
+    pub zram: String,
 }
 
 impl Default for RamdiskConfig {
@@ -173,6 +220,7 @@ impl Default for RamdiskConfig {
             min_free_ram_mb: default_ramdisk_min_free_ram_mb(),
             warn_packages_ram: default_ramdisk_warn_packages_ram(),
             reclaim_mount_on_startup: default_ramdisk_reclaim_mount_on_startup(),
+            zram: default_ramdisk_zram(),
         }
     }
 }
@@ -302,6 +350,17 @@ pub struct SystemUpdateConfig {
     pub command_to_perform_system_update_no_refresh: Option<String>,
     pub ignore_flag: String,
     pub ignore_packages: Vec<String>,
+    /// Minutes between automatic pending-update fetches in AbsGui. `0` = Refresh button only
+    /// (first visit still loads the list). Accepts a TOML integer or string.
+    #[serde(
+        default,
+        alias = "system_update_auto_refresh_delay",
+        deserialize_with = "deserialize_u32_from_int_or_str"
+    )]
+    pub auto_refresh_delay: u32,
+    /// When true, AbsGui keeps the sudo password in a private runtime file until the app exits.
+    #[serde(default, alias = "system_update_remember_sudo")]
+    pub remember_sudo: bool,
 }
 
 impl SystemUpdateConfig {
@@ -342,6 +401,9 @@ pub struct PackageConfig {
     /// Per-package ramdisk targets: `w` = build workdir, `c` = chroot, `p` = packages (e.g. `"wcp"`).
     #[serde(default)]
     pub ramdisk: Option<String>,
+    /// Per-package zram: unset = inherit `[ramdisk].zram`; `off` or `full`.
+    #[serde(default)]
+    pub zram: Option<String>,
     /// CachyOS kernel PKGBUILD env overrides (maps to `_cpusched`, `_processor_opt`, etc.).
     #[serde(default)]
     pub kernel: Option<KernelBuildConfig>,
@@ -410,11 +472,13 @@ pub fn kernel_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option<Stri
     ]
 }
 
-/// Kernel options exposed in absgui / user config. PGO stages set LTO, AutoFDO, KCFI, etc. separately.
-pub fn kernel_user_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option<String>); 7] {
+/// Kernel options exposed in absgui / user config. PGO stages set LTO/AutoFDO separately;
+/// KCFI follows the user so a PGO kernel is comparable to stock.
+pub fn kernel_user_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option<String>); 8] {
     [
         ("_cpusched", &kernel.cpusched),
         ("_processor_opt", &kernel.processor_opt),
+        ("_use_kcfi", &kernel.use_kcfi),
         ("_HZ_ticks", &kernel.hz_ticks),
         ("_tickrate", &kernel.tickrate),
         ("_preempt", &kernel.preempt),
@@ -426,7 +490,7 @@ pub fn kernel_user_override_pairs(kernel: &KernelBuildConfig) -> [(&str, &Option
 /// Map GUI/config truthy values to the strings CachyOS PKGBUILDs actually test
 /// (`[ "$_cc_harder" = "yes" ]`). `y` from older GUI saves must become `yes`.
 pub fn normalize_kernel_override(key: &str, value: &str) -> String {
-    if key == "_cc_harder" {
+    if key == "_cc_harder" || key == "_use_kcfi" {
         let on = matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "y" | "yes" | "true" | "1"
@@ -445,18 +509,117 @@ fn default_auto_str() -> String {
 }
 
 fn default_profiling_quality() -> String {
-    "maximum".to_string()
+    "sweet".to_string()
 }
+
+/// Duration profile for PGO training (under perf) vs comparison (no perf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilingTier {
+    Short,
+    Sweet,
+    Long,
+}
+
+pub fn parse_profiling_tier(s: &str) -> ProfilingTier {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "short" | "quick" => ProfilingTier::Short,
+        "long" | "maximum" | "max" | "perfect" => ProfilingTier::Long,
+        // `standard` was the old lighter setting; it is closer to sweet than to short.
+        _ => ProfilingTier::Sweet,
+    }
+}
+
+impl ProfilingTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Short => "short",
+            Self::Sweet => "sweet",
+            Self::Long => "long",
+        }
+    }
+
+    /// Training wall time under `perf record` (seconds).
+    ///
+    /// Short is a real collection pass, not a smoke test. Sweet is the default
+    /// (two collection stages ≈ 40 min of profiling). Long is 60 min: past that,
+    /// the same kernel-path mix mostly re-counts the same edges.
+    pub fn train_seconds(self) -> u32 {
+        match self {
+            Self::Short => 600,
+            Self::Sweet => 1200,
+            Self::Long => KERNEL_TRAIN_CAP_SECS,
+        }
+    }
+
+    pub fn dense_lbr(self) -> bool {
+        !matches!(self, Self::Short)
+    }
+}
+
+/// Upper bound for `kernel` training under `perf record` (long profile, 60 min).
+pub const KERNEL_TRAIN_CAP_SECS: u32 = 3600;
 
 /// `perf record` flags after event args when `perf_extra_args` is left at the serde default.
-/// `standard`: stage scripts (`-c 100000`) scaled for llvm-profgen (~1.8×).
-/// `maximum`: further scaled (~1.1× headroom after a ~56000 run).
+/// Periods follow LLVM AutoFDO (`-b` LBR/BRS already carries a branch stack). A tight `-c`
+/// overweights PMI/perf-IRQ paths and does not improve llvm-profgen quality.
+///
+/// `--mmap-pages` is **per CPU** under `-a`. 4096 pages is 16MiB × NCPU. The old
+/// 131072 (512MiB × NCPU) fails the branch-stack probe with `failed to mmap:
+/// Cannot allocate memory` on typical desktops.
 fn default_perf_extra_args() -> String {
-    "--mmap-pages 131072 -a -N -b -c 56000".to_string()
+    PERF_EXTRA_ARGS_STANDARD.to_string()
 }
 
-pub const PERF_EXTRA_ARGS_STANDARD: &str = "--mmap-pages 131072 -a -N -b -c 56000";
-pub const PERF_EXTRA_ARGS_MAXIMUM: &str = "--mmap-pages 131072 -a -N -b -c 48000";
+pub const PERF_EXTRA_ARGS_STANDARD: &str = "--mmap-pages 4096 -a -N -b -c 1000003";
+pub const PERF_EXTRA_ARGS_MAXIMUM: &str = "--mmap-pages 4096 -a -N -b -c 400009";
+const PERF_EXTRA_ARGS_BASE: &str = "--mmap-pages 4096 -a -N -b";
+const PERF_EXTRA_ARGS_HUGE_BASE: &str = "--mmap-pages 131072 -a -N -b";
+const PERF_EXTRA_ARGS_HUGE_STANDARD: &str = "--mmap-pages 131072 -a -N -b -c 1000003";
+const PERF_EXTRA_ARGS_HUGE_MAXIMUM: &str = "--mmap-pages 131072 -a -N -b -c 400009";
+const PERF_EXTRA_ARGS_LEGACY_STANDARD: &str = "--mmap-pages 131072 -a -N -b -c 56000";
+const PERF_EXTRA_ARGS_LEGACY_MAXIMUM: &str = "--mmap-pages 131072 -a -N -b -c 48000";
+
+/// True when the stored extra-args string is a quality default (including older denser
+/// periods, the 512MiB/CPU mmap size, and mmap/LBR flags with no sample limit —
+/// those still follow quality).
+pub fn perf_extra_args_is_quality_default(s: &str) -> bool {
+    matches!(
+        s.trim(),
+        "" | PERF_EXTRA_ARGS_BASE
+            | PERF_EXTRA_ARGS_STANDARD
+            | PERF_EXTRA_ARGS_MAXIMUM
+            | PERF_EXTRA_ARGS_HUGE_BASE
+            | PERF_EXTRA_ARGS_HUGE_STANDARD
+            | PERF_EXTRA_ARGS_HUGE_MAXIMUM
+            | PERF_EXTRA_ARGS_LEGACY_STANDARD
+            | PERF_EXTRA_ARGS_LEGACY_MAXIMUM
+    )
+}
+
+/// True when extra args already set a period (`-c`/`--count`) or frequency (`-F`/`--freq`).
+/// Without either, `perf record` defaults to `-F 4000`, which OOMs a long LBR capture.
+pub fn perf_extra_has_sample_limit(s: &str) -> bool {
+    let mut tokens = s.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if matches!(t, "-c" | "--count" | "-F" | "--freq") {
+            return true;
+        }
+        if let Some(rest) = t
+            .strip_prefix("--count=")
+            .or_else(|| t.strip_prefix("--freq="))
+        {
+            if !rest.is_empty() {
+                return true;
+            }
+        }
+        if let Some(rest) = t.strip_prefix("-c").or_else(|| t.strip_prefix("-F")) {
+            if !rest.is_empty() && rest.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn default_afdo_tool() -> String {
     "llvm-profgen".to_string()
@@ -470,8 +633,53 @@ fn default_afdo_profile_name() -> String {
     "kernel-compilation.afdo".to_string()
 }
 
+/// Training workload. Always `kernel`: syscall/scheduler/VFS/network/mm/block paths.
 fn default_benchmark_preset() -> String {
-    "fast".to_string()
+    "kernel".to_string()
+}
+
+pub fn validate_pgo_benchmark_preset(s: &str) -> Result<(), String> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("kernel") {
+        return Ok(());
+    }
+    Err("Allowed: kernel".into())
+}
+
+pub fn validate_pgo_compare_preset(s: &str) -> Result<(), String> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("kbench") || t.eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    Err("Allowed: kbench, auto".into())
+}
+
+/// Scoring workload. Always `kbench` (kernel-path metrics). `auto` is an alias.
+fn default_compare_preset() -> String {
+    "auto".to_string()
+}
+
+/// 0 = pick the budget from `profiling_quality` (short 10 min, sweet 20 min, long 60 min).
+fn default_kernel_workload_seconds() -> u32 {
+    0
+}
+
+fn default_convert_relocate() -> String {
+    "force".to_string()
+}
+
+/// How to place a ramdisk capture before llvm-profgen / generate_propeller_profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertRelocateMode {
+    Force,
+    Smart,
+}
+
+pub fn parse_convert_relocate(s: &str) -> ConvertRelocateMode {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "smart" => ConvertRelocateMode::Smart,
+        _ => ConvertRelocateMode::Force,
+    }
 }
 
 /// Per-package multi-stage kernel PGO configuration.
@@ -492,17 +700,32 @@ pub struct PgoConfig {
     /// runs in the same boot, so a persistent HDD archive is not required.
     #[serde(default = "default_true")]
     pub propeller_profiles_on_ram: bool,
+    /// Before AutoFDO/Propeller convert: `force` (default) always moves a tmpfs
+    /// capture to disk; `smart` keeps it on ramdisk only when remaining RAM covers
+    /// a pessimistic converter working set plus `ramdisk.min_free_ram_mb`.
+    #[serde(default = "default_convert_relocate")]
+    pub convert_relocate: String,
     /// Optional override for the bundled PGO benchmark script (`assets/pgo-benchmark.sh`).
     pub benchmark_command: Option<String>,
-    /// Profiling workload: `fast` (sysbench + stress-ng) or `cachyos` (full cachyos-benchmarker).
-    /// Ignored during profiling when `profiling_quality = "maximum"` (always uses `cachyos`).
+    /// Training workload. Always the kernel path suite; leftover `fast`/`cachyos` values
+    /// are ignored at runtime.
     #[serde(default = "default_benchmark_preset")]
     pub benchmark_preset: String,
-    /// `standard` or `maximum` (default). Maximum uses denser perf sampling and the full
-    /// cachyos-benchmarker workload for llvm-profgen-quality kernel profiles.
+    /// Scoring workload for comparison runs (no perf). Always `kbench`; leftover
+    /// `cachyos` / `kbench+cachyos` values are ignored. `auto` is an alias for `kbench`.
+    #[serde(default = "default_compare_preset")]
+    pub compare_preset: String,
+    /// Seconds for the `kernel` training workload. `0` (default) uses the quality
+    /// profile: short 600, sweet 1200, long 3600. Capped at 3600.
+    #[serde(default = "default_kernel_workload_seconds")]
+    pub kernel_workload_seconds: u32,
+    /// `short` (~10 min train, ~3 min compare), `sweet` (default: ~20 min train,
+    /// ~6 min compare), `long` (~60 min train, ~10 min kbench).
+    /// Aliases: standard→sweet, maximum→long.
     #[serde(default = "default_profiling_quality")]
     pub profiling_quality: String,
-    /// Persistent directory for cachyos-benchmarker downloads (ffmpeg, kernel test tree, etc.).
+    /// On-disk working directory for kbench comparison logs (separate from ephemeral
+    /// profile scratch on tmpfs).
     /// When unset, uses `{profiles_archive_dir}/benchmark-workdir` or `~/.cache/abs/pgo-benchmark/PKG`.
     pub benchmark_workdir: Option<String>,
     pub build_user: Option<String>,
@@ -542,7 +765,12 @@ pub struct PgoConfig {
     /// requested) when suitable archived Propeller profiles exist.
     #[serde(default)]
     pub reuse_propeller_profile: bool,
-    /// Clean cachyos-benchmarker runs for comparison charts
+    /// Stop after the AutoFDO kernel: no Propeller collection and no Propeller compile.
+    /// The AutoFDO kernel is built without `_propeller` instrumentation so it is the
+    /// kernel you keep. `compare_final`, if enabled, scores that AutoFDO kernel.
+    #[serde(default)]
+    pub skip_propeller: bool,
+    /// Clean kbench runs for comparison charts
     /// in `{profiles_archive_dir}/compare-benchmarks`.
     /// `compare_current`: kernel already booted, before the debug PGO build (no perf).
     #[serde(default)]
@@ -550,13 +778,13 @@ pub struct PgoConfig {
     /// Kept for old configs; profiling logs join with-overhead whenever any comparison is on.
     #[serde(default)]
     pub compare_debug: bool,
-    /// Extra clean cachyos-benchmarker run of the debug kernel (no perf) after AutoFDO collection.
+    /// Extra clean kbench run of the debug kernel (no perf) after AutoFDO collection.
     #[serde(default)]
     pub compare_debug_clean: bool,
     /// Kept for old configs; profiling logs join with-overhead whenever any comparison is on.
     #[serde(default)]
     pub compare_autofdo: bool,
-    /// Extra clean cachyos-benchmarker run of the AutoFDO kernel (no perf) after Propeller collection.
+    /// Extra clean kbench run of the AutoFDO kernel (no perf) after Propeller collection.
     #[serde(default)]
     pub compare_autofdo_clean: bool,
     /// Clean run of the final Propeller kernel after the last reboot (no perf).
@@ -586,7 +814,7 @@ impl PgoConfig {
             .map(|p| expand_user_path(p))
     }
 
-    /// On-disk cache for cachyos-benchmarker assets (separate from ephemeral profile scratch on tmpfs).
+    /// On-disk cache for kbench comparison logs (separate from ephemeral profile scratch on tmpfs).
     pub fn resolved_benchmark_workdir(&self, package: &str) -> PathBuf {
         if let Some(path) = &self.benchmark_workdir {
             let expanded = expand_user_path(path);
@@ -611,7 +839,7 @@ impl PgoConfig {
             || self.compare_final
     }
 
-    /// Logs and comparison PNGs/HTML from comparison cachyos-benchmarker runs.
+    /// Logs and comparison PNGs/HTML from comparison kbench runs.
     /// Current and final are clean (no perf). Debug and AutoFDO reuse the profiling pass.
     pub fn resolved_compare_dir(&self, package: &str) -> PathBuf {
         if let Some(archive) = self.resolved_archive_dir() {
@@ -1068,6 +1296,16 @@ impl Config {
         Ok(config)
     }
 
+    pub fn zram_mode_for(
+        &self,
+        pkg: Option<&PackageConfig>,
+    ) -> Result<crate::zram::ZramMode, String> {
+        crate::zram::resolved_zram_mode(
+            self.ramdisk.zram.as_str(),
+            pkg.and_then(|p| p.zram.as_deref()),
+        )
+    }
+
     /// Load an existing config without creating a default file (for `--purge`).
     pub fn try_load_existing() -> Option<Config> {
         let user_config = user_config_path();
@@ -1184,6 +1422,28 @@ impl Config {
             {
                 return Err(format!("Invalid ramdisk for package {pkg_name:?}: {e}"));
             }
+            if let Some(z) = &pkg.zram
+                && let Err(e) = crate::zram::parse_zram_mode(z)
+            {
+                return Err(format!("Invalid zram for package {pkg_name:?}: {e}"));
+            }
+            if let Some(pgo) = &pkg.pgo {
+                if let Err(e) = validate_pgo_benchmark_preset(&pgo.benchmark_preset) {
+                    return Err(format!(
+                        "PGO preset does not exist: packages.{pkg_name}.pgo.benchmark_preset = {:?}\n{e}",
+                        pgo.benchmark_preset
+                    ));
+                }
+                if let Err(e) = validate_pgo_compare_preset(&pgo.compare_preset) {
+                    return Err(format!(
+                        "PGO preset does not exist: packages.{pkg_name}.pgo.compare_preset = {:?}\n{e}",
+                        pgo.compare_preset
+                    ));
+                }
+            }
+        }
+        if let Err(e) = crate::zram::parse_zram_mode(&self.ramdisk.zram) {
+            return Err(format!("Invalid ramdisk.zram: {e}"));
         }
         for (key, path) in [
             ("paths.packages_path", self.paths.packages_path.as_str()),
@@ -1242,6 +1502,7 @@ impl Config {
 
         println!("\n{}", "Ramdisk".green().bold());
         println!("  enabled: {}", self.ramdisk.enabled);
+        println!("  zram: {}", self.ramdisk.zram);
         if self.ramdisk.enabled {
             println!("  mount_point: {}", self.ramdisk.mount_point);
             println!("  size: {}", self.ramdisk.size);
@@ -1344,6 +1605,11 @@ impl Config {
                 .get_command_to_perform_system_update_no_refresh()
         );
         println!("  ignore_flag: {}", self.system_update.ignore_flag);
+        println!(
+            "  auto_refresh_delay: {} min",
+            self.system_update.auto_refresh_delay
+        );
+        println!("  remember_sudo: {}", self.system_update.remember_sudo);
         if self.system_update.ignore_packages.is_empty() {
             println!("  ignore_packages: (none)");
         } else {
@@ -1558,6 +1824,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_convert_relocate_defaults_to_force() {
+        use super::{ConvertRelocateMode, parse_convert_relocate};
+        assert_eq!(parse_convert_relocate(""), ConvertRelocateMode::Force);
+        assert_eq!(parse_convert_relocate("force"), ConvertRelocateMode::Force);
+        assert_eq!(parse_convert_relocate("FORCE"), ConvertRelocateMode::Force);
+        assert_eq!(parse_convert_relocate("smart"), ConvertRelocateMode::Smart);
+        assert_eq!(
+            parse_convert_relocate("unknown"),
+            ConvertRelocateMode::Force
+        );
+        let pgo: super::PgoConfig = toml::from_str("").unwrap();
+        assert_eq!(pgo.convert_relocate, "force");
+    }
+
+    #[test]
+    fn parse_profiling_tier_aliases() {
+        use super::{ProfilingTier, parse_profiling_tier};
+        assert_eq!(parse_profiling_tier("short"), ProfilingTier::Short);
+        assert_eq!(parse_profiling_tier("sweet"), ProfilingTier::Sweet);
+        assert_eq!(parse_profiling_tier("standard"), ProfilingTier::Sweet);
+        assert_eq!(parse_profiling_tier("long"), ProfilingTier::Long);
+        assert_eq!(parse_profiling_tier("maximum"), ProfilingTier::Long);
+        assert_eq!(ProfilingTier::Sweet.train_seconds(), 1200);
+        assert_eq!(ProfilingTier::Short.train_seconds(), 600);
+        assert_eq!(ProfilingTier::Long.train_seconds(), 3600);
+    }
+
+    #[test]
+    fn perf_extra_has_sample_limit_detects_period_and_freq() {
+        assert!(!super::perf_extra_has_sample_limit(
+            "--mmap-pages 131072 -a -N -b"
+        ));
+        assert!(!super::perf_extra_has_sample_limit(""));
+        assert!(super::perf_extra_has_sample_limit(
+            "--mmap-pages 131072 -a -N -b -c 400009"
+        ));
+        assert!(super::perf_extra_has_sample_limit("-c400009"));
+        assert!(super::perf_extra_has_sample_limit("--count=400009"));
+        assert!(super::perf_extra_has_sample_limit("-F 4000"));
+        assert!(super::perf_extra_has_sample_limit("--freq=99"));
+        assert!(super::perf_extra_args_is_quality_default(""));
+        assert!(super::perf_extra_args_is_quality_default(
+            "--mmap-pages 131072 -a -N -b"
+        ));
+    }
+
+    /// `--mmap-pages` is per CPU under `-a`. 131072 pages is 512MiB × NCPU and
+    /// OOMs the branch-stack probe (`perf record … -- true`) on typical Zen desktops.
+    #[test]
+    fn quality_default_perf_extra_uses_modest_mmap_pages() {
+        assert!(
+            super::PERF_EXTRA_ARGS_STANDARD.contains("--mmap-pages 4096"),
+            "{}",
+            super::PERF_EXTRA_ARGS_STANDARD
+        );
+        assert!(
+            !super::PERF_EXTRA_ARGS_STANDARD.contains("131072"),
+            "{}",
+            super::PERF_EXTRA_ARGS_STANDARD
+        );
+        assert!(
+            super::PERF_EXTRA_ARGS_MAXIMUM.contains("--mmap-pages 4096"),
+            "{}",
+            super::PERF_EXTRA_ARGS_MAXIMUM
+        );
+        assert!(
+            !super::PERF_EXTRA_ARGS_MAXIMUM.contains("131072"),
+            "{}",
+            super::PERF_EXTRA_ARGS_MAXIMUM
+        );
+        assert!(super::perf_extra_args_is_quality_default(
+            "--mmap-pages 131072 -a -N -b -c 1000003"
+        ));
+        assert!(super::perf_extra_args_is_quality_default(
+            "--mmap-pages 131072 -a -N -b -c 400009"
+        ));
+        assert!(super::perf_extra_args_is_quality_default(
+            "--mmap-pages 4096 -a -N -b"
+        ));
+    }
+
+    #[test]
     fn normalize_cc_harder_maps_y_to_yes() {
         assert_eq!(super::normalize_kernel_override("_cc_harder", "y"), "yes");
         assert_eq!(super::normalize_kernel_override("_cc_harder", "yes"), "yes");
@@ -1591,7 +1939,7 @@ ready_made_packages_path = "/tmp"
 default_environment = "local"
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
+command_to_update_repositories = "pacman -Sy"
 command_to_perform_system_update = "pacman -Syu"
 ignore_flag = "--ignore"
 ignore_packages = []
@@ -1635,7 +1983,7 @@ maximum_cpu_threads_cap = 15
 default_compilation_threads = 4
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
+command_to_update_repositories = "pacman -Sy"
 command_to_perform_system_update = "pacman -Syu"
 command_to_perform_system_update_no_refresh = "pacman -Su"
 ignore_flag = "--ignore"
@@ -1680,7 +2028,7 @@ default_environment = "local"
 ignore_already_made_packages = true
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
+command_to_update_repositories = "pacman -Sy"
 command_to_perform_system_update = "pacman -Syu"
 ignore_flag = "--ignore"
 ignore_packages = []
@@ -1720,7 +2068,7 @@ default_environment = "local"
 install_testing_phase_archlinux_packages = true
 
 [system_update]
-command_to_update_repositories = "pacman -Su"
+command_to_update_repositories = "pacman -Sy"
 command_to_perform_system_update = "pacman -Syu"
 command_to_perform_system_update_no_refresh = "pacman -Su"
 ignore_flag = "--ignore"
@@ -1749,6 +2097,8 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
             command_to_perform_system_update_no_refresh: None,
             ignore_flag: "--ignore".into(),
             ignore_packages: vec![],
+            auto_refresh_delay: 0,
+            remember_sudo: false,
         };
 
         // Derives from command_to_perform_system_update (replacing -Syu with -Su)
@@ -1823,6 +2173,174 @@ arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
         );
         assert!(config.ramdisk.sync_chroot_on_exit);
         assert_eq!(config.ramdisk.min_free_ram_mb, 2048);
+        assert_eq!(config.ramdisk.zram, "full");
+    }
+
+    #[test]
+    fn parse_ramdisk_zram_full() {
+        let toml_content = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp/abs/packages"
+chroot_base_path = "/tmp/abs/chroot"
+ready_made_packages_path = "/tmp/abs/ready"
+
+[ramdisk]
+enabled = true
+zram = "full"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+arch = "https://gitlab.archlinux.org/archlinux/packaging/packages"
+
+[packages]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.ramdisk.zram, "full");
+        assert_eq!(
+            crate::zram::parse_zram_mode(&config.ramdisk.zram).unwrap(),
+            crate::zram::ZramMode::Full
+        );
+    }
+
+    #[test]
+    fn ramdisk_zram_auto_fails_check() {
+        let text = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+[paths]
+packages_path = "/tmp/abs/packages"
+chroot_base_path = "/tmp/abs/chroot"
+ready_made_packages_path = "/tmp/abs/ready"
+[ramdisk]
+zram = "auto"
+[build]
+default_environment = "local"
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+[repositories]
+default = "arch"
+arch = "https://example.invalid"
+[packages]
+"#;
+        let err = Config::from_toml_text(text).unwrap_err();
+        assert!(err.contains("ramdisk.zram"), "{err}");
+        assert!(err.contains("off") || err.contains("full"), "{err}");
+    }
+
+    #[test]
+    fn package_zram_and_pgo_presets_validated() {
+        let ok = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+[paths]
+packages_path = "/tmp/abs/packages"
+chroot_base_path = "/tmp/abs/chroot"
+ready_made_packages_path = "/tmp/abs/ready"
+[ramdisk]
+zram = "full"
+[build]
+default_environment = "local"
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+[repositories]
+default = "arch"
+arch = "https://example.invalid"
+[packages.linux-cachyos]
+zram = "off"
+[packages.linux-cachyos.pgo]
+enabled = true
+profiles_archive_dir = "/tmp/pgo"
+benchmark_preset = "kernel"
+compare_preset = "kbench"
+"#;
+        let config = Config::from_toml_text(ok).unwrap();
+        assert_eq!(
+            config.packages["linux-cachyos"].zram.as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            config
+                .zram_mode_for(config.packages.get("linux-cachyos"))
+                .unwrap(),
+            crate::zram::ZramMode::Off
+        );
+
+        let bad_preset = ok.replace(
+            "benchmark_preset = \"kernel\"",
+            "benchmark_preset = \"cachyos\"",
+        );
+        let err = Config::from_toml_text(&bad_preset).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("cachyos"), "{err}");
+        assert!(err.contains("Allowed: kernel"), "{err}");
+    }
+
+    #[test]
+    fn system_update_auto_refresh_delay_accepts_int_or_string() {
+        let base = r#"
+config_version = 1
+manual_update_packages = []
+skip_install_packages = []
+
+[paths]
+packages_path = "/tmp"
+chroot_base_path = "/tmp"
+ready_made_packages_path = "/tmp"
+
+[build]
+default_environment = "local"
+
+[system_update]
+command_to_update_repositories = "pacman -Sy"
+command_to_perform_system_update = "pacman -Syu"
+ignore_flag = "--ignore"
+ignore_packages = []
+
+[repositories]
+default = "arch"
+
+[packages]
+"#;
+        let as_int: super::Config = toml::from_str(&base.replace(
+            "ignore_packages = []",
+            "ignore_packages = []\nauto_refresh_delay = 15\nremember_sudo = true",
+        ))
+        .unwrap();
+        assert_eq!(as_int.system_update.auto_refresh_delay, 15);
+        assert!(as_int.system_update.remember_sudo);
+
+        let as_str: super::Config = toml::from_str(&base.replace(
+            "ignore_packages = []",
+            "ignore_packages = []\nauto_refresh_delay = \"15\"\nsystem_update_remember_sudo = true",
+        ))
+        .unwrap();
+        assert_eq!(as_str.system_update.auto_refresh_delay, 15);
+        assert!(as_str.system_update.remember_sudo);
+
+        let missing: super::Config = toml::from_str(base).unwrap();
+        assert_eq!(missing.system_update.auto_refresh_delay, 0);
+        assert!(!missing.system_update.remember_sudo);
     }
 
     #[test]

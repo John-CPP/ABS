@@ -755,6 +755,92 @@ pub fn kill_processes_with_cwd_under(prefix: &Path, label: &str) {
     }
 }
 
+/// stress-ng / perf / llvm convert launched under PGO. They often live under the
+/// benchmark workdir or a sudo session, not the package repo cwd, so abort that
+/// only kills cwd-under-repo leaves them running.
+pub fn cmdline_is_pgo_workload(cmdline: &str) -> bool {
+    if cmdline.contains("--pgo-abort") || cmdline.contains("--pgo-status") {
+        return false;
+    }
+    cmdline.contains(".abs-sng")
+        || cmdline.contains("pgo-benchmark.sh")
+        || cmdline.contains("/pgo-scratch/")
+        || cmdline.contains("/pgo-convert/")
+}
+
+fn comm_is_pgo_worker(comm: &str) -> bool {
+    let c = comm.trim();
+    c.starts_with("stress-ng")
+        || c.starts_with("generate_propel")
+        || c == "llvm-profgen"
+        || c == "perf"
+}
+
+fn pid_in_abs_pgo_cgroup(pid: u32) -> bool {
+    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        return false;
+    };
+    text.contains("abs-pgo")
+}
+
+/// SIGTERM then SIGKILL PGO workload leftovers (stress-ng, perf record, converters).
+pub fn kill_pgo_workload_processes() {
+    let self_pid = std::process::id();
+    let pids = find_pgo_workload_pids(self_pid);
+    if pids.is_empty() {
+        return;
+    }
+    crate::vlog!(
+        "Sending SIGTERM to {} PGO workload process(es)...",
+        pids.len()
+    );
+    for pid in &pids {
+        signal_process_tree(*pid, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for pid in find_pgo_workload_pids(self_pid) {
+        signal_process_tree(pid, libc::SIGKILL);
+    }
+}
+
+fn find_pgo_workload_pids(self_pid: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let cmdline = fs::read(&cmdline_path)
+            .ok()
+            .map(|data| {
+                data.split(|&b| b == 0)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| String::from_utf8_lossy(part))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        if cmdline_is_pgo_workload(&cmdline) {
+            pids.push(pid);
+            continue;
+        }
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm_is_pgo_worker(&comm) && pid_in_abs_pgo_cgroup(pid) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 /// Kill other `abs` processes running PGO / kernel builds for `package` (e.g. a build started in
 /// an external terminal that absgui does not track by PID).
 #[cfg(unix)]
@@ -1220,6 +1306,36 @@ pub fn run_command<P: AsRef<Path>>(cmd: &str, args: &[&str], cwd: Option<P>) -> 
                 .map_or_else(|| "signal".to_string(), |c| c.to_string())
         ))
     }
+}
+
+/// `sudo ARGS` with `data` on stdin. GNU `cp` onto sysfs often writes 0 bytes.
+pub fn run_sudo_stdin(args: &[&str], data: &[u8]) -> Result<(), String> {
+    if crate::is_dry_run_mode() && !is_readonly_command("sudo", args) {
+        println!("[DRY RUN] {}", render_command_line("sudo", args));
+        return Ok(());
+    }
+    let owned = sudo_prefixed_args(args);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    echo_command("sudo", &refs, None::<&str>);
+    let mut command = Command::new("sudo");
+    command.args(&owned);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to execute 'sudo': {e}"))?;
+    track_child(child.id());
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(data)
+            .map_err(|e| format!("sudo stdin: {e}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait on sudo: {e}"))?;
+    untrack_child(child.id());
+    sudo_status_to_result(args, status)
 }
 
 fn run_command_labeled(mut command: Command, cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -2478,6 +2594,31 @@ mod artifact_tests {
         assert!(!is_package_artifact("mesa-26.1.0-1-x86_64.pkg.tar.zst.sig"));
         assert!(!is_package_artifact("PKGBUILD"));
         assert!(!is_package_artifact("mesa-26.1.0.tar.gz"));
+    }
+}
+
+#[cfg(test)]
+mod pgo_workload_kill_tests {
+    use super::cmdline_is_pgo_workload;
+
+    #[test]
+    fn cmdline_is_pgo_workload_matches_stress_ng_temp_and_skips_abort() {
+        assert!(cmdline_is_pgo_workload(
+            "stress-ng --close 8 --temp-path /media/storage/tmp/benchmark-workdir/.abs-sng"
+        ));
+        assert!(cmdline_is_pgo_workload(
+            "timeout -s INT -k 30 405 nice -n 0 stress-ng --syscall 8 --temp-path /tmp/.abs-sng"
+        ));
+        assert!(cmdline_is_pgo_workload(
+            "bash /home/john/.local/share/abs/pgo-benchmark.sh"
+        ));
+        assert!(cmdline_is_pgo_workload(
+            "perf record -o /run/abs-ram/pgo-scratch/linux-cachyos/propeller.data"
+        ));
+        assert!(!cmdline_is_pgo_workload(
+            "abs --pgo-abort linux-cachyos --no-wait"
+        ));
+        assert!(!cmdline_is_pgo_workload("stress-ng --cpu 8 --timeout 10s"));
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::abs_runner::{AbsRunOutput, PgoStatus};
+use crate::abs_runner::{AbsRunOutput, PendingUpdates, PgoStatus};
 use crate::app_settings::ThemePref;
 use crate::config::ConfigDocument;
 use crate::list_editors::PackageListField;
@@ -151,6 +151,7 @@ pub enum KStr {
     Source,
     BuildEnv,
     Ramdisk,
+    Zram,
     Alias,
     Compiler,
     UpstreamGithub,
@@ -168,7 +169,6 @@ pub enum KStr {
     ArchiveDir,
     Benchmark,
     BenchmarkWorkdir,
-    BenchmarkPreset,
     ProfilingQuality,
     BuildUser,
     SysctlCommand,
@@ -181,6 +181,7 @@ pub enum KStr {
     PropellerTool,
     AfdoProfileName,
     StateFile,
+    ConvertRelocate,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +199,7 @@ pub enum KBool {
     PgoRebootBeforeStart,
     PgoReuseAfdoProfile,
     PgoReusePropellerProfile,
+    PgoSkipPropeller,
     CcHarder,
     LtoSuffix,
     GccSuffix,
@@ -294,6 +296,8 @@ pub enum Message {
     SysUpdateFullCmd(String),
     SysUpdateNoRefreshCmd(String),
     SysUpdateIgnoreFlag(String),
+    SysUpdateAutoRefreshDelay(String),
+    SysUpdateRememberSudo(bool),
     // SysUpdateIgnorePackages handled via PackageListEdited
     RamdiskEnabled(bool),
     RamdiskWorkdir(bool),
@@ -305,6 +309,7 @@ pub enum Message {
     RamdiskSeedChroot(String),
     RamdiskSyncOnExit(bool),
     RamdiskMinFreeRam(String),
+    RamdiskZram(String),
     RamdiskWarnPackages(bool),
     RamdiskReclaimOnStartup(bool),
     RepoUrlChanged(String, String),
@@ -343,14 +348,15 @@ pub enum Message {
     PgoRestartFromScratch,
     /// Run from the selected phase until the next reboot wait (`--pgo-resume [--pgo-stage …]`).
     PgoStartFromPhase,
-    /// Continue after a reboot wait gate (`--pgo-resume`, runs until the next reboot wait).
+    /// Continue a saved pipeline (`--pgo-resume`). Wait gates omit `--pgo-stage`.
     PgoContinueAfterReboot,
     PgoAbort,
     KernelBuildStart,
     SystemUpdateStart,
     SystemUpdateAbort,
     PendingUpdatesRefresh,
-    PendingUpdatesLoaded(Result<crate::abs_runner::PendingUpdates, String>),
+    PendingUpdatesMaybeRefresh,
+    PendingUpdatesLoaded(Result<PendingUpdates, String>),
     /// Redraw the system-update fetch overlay (spinning gear).
     FetchOverlayTick,
     InstallRepoUpdates,
