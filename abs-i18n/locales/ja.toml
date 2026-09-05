@@ -310,7 +310,7 @@ explanation = "空きメモリがこれ（メガバイト）より少ないと�
 
 [wizard.field.ramdisk.zram]
 title = "一時的な圧縮スワップ（zram）のサイズはどう決めますか？"
-explanation = "full（推奨）は残りの RAM が許す限りの圧縮スワップを用意します。使わない zram は上限であり、事前確保ではありません。off は ABS の zram を無効にします。RAM ディスクとは独立で、コンパイルとシステム更新にも使います（PGO 変換だけではありません）。"
+explanation = "full（推奨）は残りの RAM が許す限りの圧縮スワップを用意します。使わない zram は上限であり、事前確保ではありません。off は ABS の zram を無効にします。RAM ディスクとは独立で、実際のコンパイルが始まったときだけ使います（バイナリパッケージのダウンロードやインストールでは使いません）。"
 
 [wizard.field.check_for_update_on_startup]
 title = "新しい ABS があるとき知らせますか？"
@@ -370,7 +370,7 @@ help = "一時的な abs-pgo zram を用意しません。すでに RAM や独�
 
 [wizard.choice.zram.full]
 label = "残りの RAM が許す限り（full）"
-help = "残りの MemAvailable ほぼ全部を圧縮 RAM 上限にし、disksize はその 4 倍で ABS zram を常に用意します。コンパイルとシステム更新にも使います。"
+help = "残りの MemAvailable ほぼ全部を圧縮 RAM 上限にし、disksize はその 4 倍で ABS zram を常に用意します。実際のコンパイルが始まったときだけ使い、バイナリパッケージのダウンロードやインストールでは使いません。"
 
 [cli.set_lang]
 unknown = "不明な言語 {code} です。次のいずれかを使ってください: {list}"
@@ -860,8 +860,8 @@ ramdisk_global_p = "既定：ラムディスク p を使うパッケージのソ
 ramdisk_seed = "新しいラムディスク chroot の種にする、既存の chroot ディレクトリ（任意）。"
 ramdisk_sync = "ビルド終了時にラムディスク chroot の内容をディスクへ同期します。"
 ramdisk_min_free = "マウント前に必要な最小空き RAM（MiB）。これを下回ると ABS は中止します。"
-ramdisk_zram = "コンパイルとシステム更新用の一時 abs-pgo zram。full は残りの RAM ほぼ全部を圧縮スワップ上限にします（disksize は 4 倍）。off は無効。RAM ディスクとは独立。perf なしの kbench では解除します。"
-package_zram = "パッケージ単位の zram。inherit は [ramdisk] zram を使い、off / full はこのパッケージのコンパイルだけ上書きします。システム更新は常に全体設定です。"
+ramdisk_zram = "実際のコンパイルが始まったときの一時 abs-pgo zram。full は残りの RAM ほぼ全部を圧縮スワップ上限にします（disksize は 4 倍）。off は無効。RAM ディスクとは独立。バイナリパッケージのダウンロード/インストールでは使いません。perf なしの kbench では解除します。"
+package_zram = "パッケージ単位の zram。inherit は [ramdisk] zram を使い、off / full はこのパッケージのコンパイルだけ上書きします。バイナリのシステム更新では ABS zram を使いません。"
 ramdisk_warn_packages = "tmpfs 上の packages_path が空き RAM を超えそうなときに警告します。"
 ramdisk_reclaim = "マウント前に mount_point の既存マウントを外します（クラッシュした実行からの復旧）。"
 repo_url = "この名前付きリポジトリの pacman リポジトリ URL。"

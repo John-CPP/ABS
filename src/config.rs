@@ -200,7 +200,7 @@ pub struct RamdiskConfig {
     /// Unmount `mount_point` before mounting when it is already mounted (e.g. after a crashed ABS run).
     #[serde(default = "default_ramdisk_reclaim_mount_on_startup")]
     pub reclaim_mount_on_startup: bool,
-    /// Temporary ABS-owned zram: `off` or `full` (max remaining RAM; default).
+    /// Temporary ABS-owned zram when a compile starts: `off` or `full` (max remaining RAM; default).
     #[serde(default = "default_ramdisk_zram")]
     pub zram: String,
 }

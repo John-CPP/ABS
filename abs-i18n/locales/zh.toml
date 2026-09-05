@@ -310,7 +310,7 @@ explanation = "若电脑空闲内存少于此值（以兆字节计），ABS 不�
 
 [wizard.field.ramdisk.zram]
 title = "ABS 应如何为临时压缩交换（zram）分配大小？"
-explanation = "full（推荐）在剩余内存允许范围内尽量提供压缩交换。未使用的 zram 只是上限，不会预先占满。off 关闭 ABS zram。与内存盘无关，用于编译和系统更新，不只是 PGO 转换。"
+explanation = "full（推荐）在剩余内存允许范围内尽量提供压缩交换。未使用的 zram 只是上限，不会预先占满。off 关闭 ABS zram。与内存盘无关，仅在真正开始编译时使用，下载或安装二进制包时不用。"
 
 [wizard.field.check_for_update_on_startup]
 title = "有新版本 ABS 时通知你？"
@@ -370,7 +370,7 @@ help = "不建立临时 abs-pgo zram。已有足够内存或自备交换时使�
 
 [wizard.choice.zram.full]
 label = "剩余内存允许的最大（full）"
-help = "始终用几乎全部剩余 MemAvailable 作为压缩内存上限，disksize 为 4 倍，建立 ABS zram。用于编译和系统更新，不只是 PGO 转换。"
+help = "始终用几乎全部剩余 MemAvailable 作为压缩内存上限，disksize 为 4 倍，建立 ABS zram。仅在真正开始编译时使用，下载或安装二进制包时不用。"
 
 [cli.set_lang]
 unknown = "未知语言 {code}。请使用以下之一：{list}"
@@ -860,8 +860,8 @@ ramdisk_global_p = "默认：对使用内存盘 p 的软件包，在 tmpfs 上�
 ramdisk_seed = "可选的现有 chroot 目录，复制后用于填充新的内存盘 chroot。"
 ramdisk_sync = "构建结束后将内存盘 chroot 内容同步回磁盘。"
 ramdisk_min_free = "挂载前所需的最小空闲内存（MiB）；低于此值 ABS 会中止。"
-ramdisk_zram = "用于编译和系统更新的临时 abs-pgo zram。full 用几乎全部剩余内存作为压缩交换上限（disksize 为 4 倍）。off 关闭。与内存盘无关；无 perf 的 kbench 会先拆除。"
-package_zram = "按软件包的 zram：inherit 使用 [ramdisk] zram；off 或 full 仅覆盖本包编译。系统更新始终用全局设置。"
+ramdisk_zram = "真正开始编译时才用的临时 abs-pgo zram。full 用几乎全部剩余内存作为压缩交换上限（disksize 为 4 倍）。off 关闭。与内存盘无关；下载/安装二进制包时不用；无 perf 的 kbench 会先拆除。"
+package_zram = "按软件包的 zram：inherit 使用 [ramdisk] zram；off 或 full 仅覆盖本包编译。二进制系统更新不使用 ABS zram。"
 ramdisk_warn_packages = "当 tmpfs 上的 packages_path 可能超出可用内存时发出警告。"
 ramdisk_reclaim = "挂载前先卸载 mount_point 上已有的挂载（从崩溃运行中恢复）。"
 repo_url = "此命名仓库的 pacman 仓库 URL。"

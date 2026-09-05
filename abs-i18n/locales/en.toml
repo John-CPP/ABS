@@ -310,7 +310,7 @@ explanation = "If the computer has less free memory than this (in megabytes), AB
 
 [wizard.field.ramdisk.zram]
 title = "How should ABS size temporary compressed swap (zram)?"
-explanation = "full (recommended) always gives as much compressed swap as remaining RAM allows. Unused zram is a cap, not reserved up front. off disables ABS zram. Independent of the RAM disk — used for compiles and system update, not only PGO convert."
+explanation = "full (recommended) always gives as much compressed swap as remaining RAM allows. Unused zram is a cap, not reserved up front. off disables ABS zram. Independent of the RAM disk — used when a real compile starts, not for binary package download or install."
 
 [wizard.field.check_for_update_on_startup]
 title = "Tell you when a newer ABS is available?"
@@ -370,7 +370,7 @@ help = "Never bring up the temporary abs-pgo zram device. Use this if you alread
 
 [wizard.choice.zram.full]
 label = "As much as remaining RAM allows (full)"
-help = "Always sets up ABS zram using almost all remaining MemAvailable as the compressed-RAM cap, with disksize at 4× that. Used for compiles and system update, not only PGO convert."
+help = "Always sets up ABS zram using almost all remaining MemAvailable as the compressed-RAM cap, with disksize at 4× that. Used when a real compile starts, not for binary package download or install."
 
 [cli.set_lang]
 unknown = "Unknown language {code}. Use one of: {list}"
@@ -860,8 +860,8 @@ ramdisk_global_p = "Default: clone sources under packages_path on tmpfs for pack
 ramdisk_seed = "Optional existing chroot directory copied to seed a fresh ramdisk chroot."
 ramdisk_sync = "Sync ramdisk chroot contents back to disk when the build finishes."
 ramdisk_min_free = "Minimum free RAM (MiB) required before mounting; ABS aborts if below this."
-ramdisk_zram = "Temporary abs-pgo zram for compiles and system update. full uses almost all remaining RAM as the compressed-swap cap (disksize 4×). off disables it. Independent of the RAM disk; torn down for no-perf comparison benches."
-package_zram = "Per-package zram: inherit uses [ramdisk] zram; off or full overrides for this package's compile. System update always uses the global setting."
+ramdisk_zram = "Temporary abs-pgo zram when a compile starts. full uses almost all remaining RAM as the compressed-swap cap (disksize 4×). off disables it. Independent of the RAM disk; not used for binary package download/install; torn down for no-perf comparison benches."
+package_zram = "Per-package zram: inherit uses [ramdisk] zram; off or full overrides for this package's compile. Binary system updates do not use ABS zram."
 ramdisk_warn_packages = "Warn when packages_path on tmpfs may exceed available RAM."
 ramdisk_reclaim = "Unmount an existing mount at mount_point before mounting (recover from crashed runs)."
 repo_url = "Pacman repository URL for this named repo."

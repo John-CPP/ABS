@@ -89,7 +89,7 @@ sync_chroot_on_exit = false
 min_free_ram_mb = 4096
 # Temporary ABS-owned compressed swap (independent of the RAM disk).
 # full (default): max remaining RAM as the compressed-RAM cap, disksize 4× that.
-# off: do not bring up ABS zram. Used for compiles and system update, not only PGO convert.
+# off: do not bring up ABS zram. Used when a real compile starts (not binary package install).
 zram = "full"
 # Print a warning when packages = true because full-repo-on-RAM can consume many gigabytes.
 warn_packages_ram = true

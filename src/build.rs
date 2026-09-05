@@ -37,6 +37,25 @@ fn ramdisk_srcdest_env(repo_dir: &Path, targets: &ramdisk::RamdiskTargets) -> St
     )
 }
 
+fn ensure_package_ramdisk(config: &Config, pkg: &str, targets: &ramdisk::RamdiskTargets) {
+    if let Err(e) = ramdisk::ensure_for_targets(config, targets) {
+        die!("Ramdisk setup failed for {}: {}", pkg, e);
+    }
+}
+
+fn require_package_compile_zram(
+    config: &Config,
+    pkg_config: Option<&crate::config::PackageConfig>,
+) {
+    crate::zram::require_headroom(
+        "package compile",
+        config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+        config
+            .zram_mode_for(pkg_config)
+            .unwrap_or_else(|e| die!("{e}")),
+    );
+}
+
 /// Env prefix for local/PGO makepkg: persistent SRCDEST (when needed) plus ramdisk cache redirects.
 fn ramdisk_makepkg_env_prefix(repo_dir: &Path, targets: &ramdisk::RamdiskTargets) -> String {
     format!(
@@ -1075,16 +1094,12 @@ pub fn process_package(
         Ok(t) => t,
         Err(e) => die!("Invalid ramdisk targets for {}: {}", pkg, e),
     };
-    if let Err(e) = ramdisk::ensure_for_targets(config, &ramdisk_targets) {
-        die!("Ramdisk setup failed for {}: {}", pkg, e);
+    // Git clones on tmpfs (`p`) need the ramdisk before `prepare_repo`.
+    // Workdir/chroot ramdisk and ABS zram wait until a real compile starts so
+    // already-made / binary install paths do not bring up a zram device.
+    if ramdisk_targets.packages {
+        ensure_package_ramdisk(config, pkg, &ramdisk_targets);
     }
-    crate::zram::require_headroom(
-        "package compile",
-        config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
-        config
-            .zram_mode_for(pkg_config)
-            .unwrap_or_else(|e| die!("{e}")),
-    );
     ramdisk::warn_if_packages_on_ram(config, pkg, &ramdisk_targets);
     let packages_path = ramdisk::download_packages_path(config, &ramdisk_targets);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
@@ -1255,6 +1270,11 @@ pub fn process_package(
     let skip_tests = effective_cfg.skip_tests;
     let threads =
         compilation_threads.or_else(|| crate::build_env::resolve_package_threads(pkg, config, cli));
+
+    if !ramdisk_targets.packages {
+        ensure_package_ramdisk(config, pkg, &ramdisk_targets);
+    }
+    require_package_compile_zram(config, pkg_config);
 
     let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, false) {
         Ok(guard) => guard,

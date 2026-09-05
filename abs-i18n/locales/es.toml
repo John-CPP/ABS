@@ -310,7 +310,7 @@ explanation = "Si el equipo tiene menos memoria libre que esto (en megabytes), A
 
 [wizard.field.ramdisk.zram]
 title = "¿Cómo debe ABS dimensionar el swap comprimido temporal (zram)?"
-explanation = "full (recomendado) da tanto swap comprimido como permita la RAM restante. El zram no usado es un tope, no se reserva de antemano. off desactiva el zram de ABS. Independiente del disco RAM: se usa en compilaciones y actualizaciones del sistema, no solo en convert PGO."
+explanation = "full (recomendado) da tanto swap comprimido como permita la RAM restante. El zram no usado es un tope, no se reserva de antemano. off desactiva el zram de ABS. Independiente del disco RAM: se usa cuando arranca una compilación real, no al descargar o instalar paquetes binarios."
 
 [wizard.field.check_for_update_on_startup]
 title = "¿Avisarte cuando hay un ABS más reciente?"
@@ -370,7 +370,7 @@ help = "No activa el zram temporal abs-pgo. Úsalo si ya tienes RAM o swap propi
 
 [wizard.choice.zram.full]
 label = "Tanto como permita la RAM restante (full)"
-help = "Siempre configura zram de ABS usando casi todo el MemAvailable restante como tope de RAM comprimida, con disksize a 4×. Para compilaciones y actualizaciones del sistema, no solo convert PGO."
+help = "Siempre configura zram de ABS usando casi todo el MemAvailable restante como tope de RAM comprimida, con disksize a 4×. Cuando arranca una compilación real, no al descargar o instalar paquetes binarios."
 
 [cli.set_lang]
 unknown = "Idioma desconocido {code}. Usa uno de: {list}"
@@ -860,8 +860,8 @@ ramdisk_global_p = "Por defecto: clonar fuentes bajo packages_path en tmpfs para
 ramdisk_seed = "Directorio chroot existente opcional que se copia para sembrar un chroot ramdisk nuevo."
 ramdisk_sync = "Sincronizar el contenido del chroot ramdisk al disco al terminar la compilación."
 ramdisk_min_free = "RAM libre mínima (MiB) antes de montar; ABS aborta si hay menos."
-ramdisk_zram = "zram temporal abs-pgo para compilaciones y actualizaciones del sistema. full usa casi toda la RAM restante como tope de swap comprimido (disksize 4×). off lo desactiva. Independiente del disco RAM; se baja para kbench sin perf."
-package_zram = "zram por paquete: inherit usa [ramdisk] zram; off o full anula para la compilación de este paquete. La actualización del sistema usa siempre el valor global."
+ramdisk_zram = "zram temporal abs-pgo cuando arranca una compilación. full usa casi toda la RAM restante como tope de swap comprimido (disksize 4×). off lo desactiva. Independiente del disco RAM; no se usa al descargar/instalar paquetes binarios; se baja para kbench sin perf."
+package_zram = "zram por paquete: inherit usa [ramdisk] zram; off o full anula para la compilación de este paquete. Las actualizaciones binarias del sistema no usan zram de ABS."
 ramdisk_warn_packages = "Avisar si packages_path en tmpfs puede superar la RAM disponible."
 ramdisk_reclaim = "Desmontar un montaje existente en mount_point antes de montar (recuperación tras ejecuciones caídas)."
 repo_url = "URL del repositorio pacman de este repo con nombre."

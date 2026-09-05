@@ -3,7 +3,7 @@ use crate::utils::{
     ABSGUI_ICON_SIZES, absgui_hicolor_icon_path, is_package_artifact, run_command,
     run_command_quiet, run_command_with_output_silent, sh_single_quote, vercmp_silent,
 };
-use crate::{blog, vlog};
+use crate::{blog, die, vlog};
 use colored::Colorize;
 use std::ffi::OsStr;
 use std::fs;
@@ -474,6 +474,7 @@ fn run_pacman_self_update(
             aur_dir.display(),
             pkgdest
         );
+        require_self_update_compile_zram(config);
         let cmdline = format!(
             "PKGDEST={} makepkg -Csr --noconfirm",
             sh_single_quote(pkgdest)
@@ -739,6 +740,7 @@ fn warn_if_refresh_failed(result: Result<(), String>, installed: &Path) {
 
 fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String> {
     blog!("Compiling latest release...");
+    require_self_update_compile_zram(config);
     run_command("cargo", &["build", "--release"], Some(repo_dir))?;
 
     let release_dir = repo_dir.join("target").join("release");
@@ -786,6 +788,14 @@ fn run_binary_self_update(config: &Config, repo_dir: &Path) -> Result<(), String
     }
 
     Ok(())
+}
+
+fn require_self_update_compile_zram(config: &Config) {
+    crate::zram::require_headroom(
+        "package compile",
+        config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
+        config.zram_mode_for(None).unwrap_or_else(|e| die!("{e}")),
+    );
 }
 
 /// Run self update (explicitly called by CLI or auto-update on startup)

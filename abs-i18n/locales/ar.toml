@@ -310,7 +310,7 @@ explanation = "إذا كان للحاسوب ذاكرة حرة أقل من هذا
 
 [wizard.field.ramdisk.zram]
 title = "كيف يحدد ABS حجم الـ swap المضغوط المؤقت (zram)؟"
-explanation = "full (موصى به) يعطي أكبر swap مضغوط تسمح به الذاكرة المتبقية. الـ zram غير المستخدم سقف وليس حجزاً مسبقاً. off يعطل zram الخاص بـ ABS. مستقل عن قرص RAM — للتجميع وتحديث النظام، وليس لتحويل PGO فقط."
+explanation = "full (موصى به) يعطي أكبر swap مضغوط تسمح به الذاكرة المتبقية. الـ zram غير المستخدم سقف وليس حجزاً مسبقاً. off يعطل zram الخاص بـ ABS. مستقل عن قرص RAM — عند بدء تجميع حقيقي، وليس لتنزيل أو تثبيت الحزم الجاهزة."
 
 [wizard.field.check_for_update_on_startup]
 title = "إخبارك عند توفر إصدار أحدث من ABS؟"
@@ -370,7 +370,7 @@ help = "لا يُنشئ جهاز abs-pgo المؤقت. إن كانت الذاك�
 
 [wizard.choice.zram.full]
 label = "بقدر ما تسمح الذاكرة المتبقية (full)"
-help = "يرفع دائماً zram الخاص بـ ABS باستخدام معظم MemAvailable المتبقي كسقف للذاكرة المضغوطة، وdisksize = 4×. للتجميع وتحديث النظام، وليس لتحويل PGO فقط."
+help = "يرفع دائماً zram الخاص بـ ABS باستخدام معظم MemAvailable المتبقي كسقف للذاكرة المضغوطة، وdisksize = 4×. عند بدء تجميع حقيقي، وليس لتنزيل أو تثبيت الحزم الجاهزة."
 
 [cli.set_lang]
 unknown = "لغة غير معروفة {code}. استخدم واحدة من: {list}"
@@ -860,8 +860,8 @@ ramdisk_global_p = "الافتراضي: استنساخ المصادر تحت pac
 ramdisk_seed = "مجلد chroot موجود اختياري يُنسخ لبذر chroot جديد على قرص الذاكرة."
 ramdisk_sync = "مزامنة محتويات chroot على قرص الذاكرة إلى القرص عند انتهاء البناء."
 ramdisk_min_free = "أدنى ذاكرة حرة (ميبيبايت) قبل التحميل؛ يتوقف ABS إن نقصت عنها."
-ramdisk_zram = "zram مؤقت abs-pgo للتجميع وتحديث النظام. full يستخدم معظم الذاكرة المتبقية كسقف للـ swap المضغوط (disksize 4×). off يعطله. مستقل عن قرص RAM؛ يُزال لـ kbench بدون perf."
-package_zram = "zram للحزمة: inherit يأخذ [ramdisk] zram؛ off أو full يخص تجميع هذه الحزمة. تحديث النظام يستخدم الإعداد العام دائماً."
+ramdisk_zram = "zram مؤقت abs-pgo عند بدء التجميع. full يستخدم معظم الذاكرة المتبقية كسقف للـ swap المضغوط (disksize 4×). off يعطله. مستقل عن قرص RAM؛ لا يُستخدم لتنزيل/تثبيت الحزم الجاهزة؛ يُزال لـ kbench بدون perf."
+package_zram = "zram للحزمة: inherit يأخذ [ramdisk] zram؛ off أو full يخص تجميع هذه الحزمة. تحديث النظام بالحزم الجاهزة لا يستخدم zram الخاص بـ ABS."
 ramdisk_warn_packages = "التحذير عندما قد يتجاوز packages_path على tmpfs الذاكرة المتاحة."
 ramdisk_reclaim = "فصل تحميل موجود عند mount_point قبل التحميل (التعافي من تشغيلات تعطّلت)."
 repo_url = "عنوان مستودع pacman لهذا المستودع المسمّى."

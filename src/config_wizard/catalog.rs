@@ -769,7 +769,7 @@ const ZRAM_CHOICES: &[ChoiceDef] = &[
     ChoiceDef {
         value: "full",
         label: "As much as remaining RAM allows (full)",
-        help: "Always sets up ABS zram using almost all remaining MemAvailable as the compressed-RAM cap, with disksize at 4× that. Used for compiles and system updates, not only converting profiles. Unused zram is a cap, not reserved up front.",
+        help: "Always sets up ABS zram using almost all remaining MemAvailable as the compressed-RAM cap, with disksize at 4× that. Used when a real compile starts (makepkg/chroot/PGO), not for binary package download or install. Unused zram is a cap, not reserved up front.",
         suggested: true,
     },
     ChoiceDef {
@@ -1318,7 +1318,7 @@ const RAMDISK_FIELDS: &[FieldDef] = &[
         id: "ramdisk.zram",
         kind: FieldKind::Choice,
         title: "How should ABS size temporary compressed swap (zram)?",
-        explanation: "full (recommended) always gives as much compressed swap as remaining RAM allows. Unused zram is a cap, not reserved up front. off disables ABS zram. This is independent of the RAM disk — used for compiles and system updates, not only converting profiles.",
+        explanation: "full (recommended) always gives as much compressed swap as remaining RAM allows. Unused zram is a cap, not reserved up front. off disables ABS zram. This is independent of the RAM disk — used when a real compile starts, not for binary package download or install.",
         suggested: Suggested::Str("full"),
         optional: false,
         in_gap_fill: true,

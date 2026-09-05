@@ -145,23 +145,13 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
 
     vlog!("Executing system update: {}", argv.join(" "));
 
-    if zram_for_system_update(mode) {
-        crate::zram::require_headroom(
-            "system update",
-            config.ramdisk.min_free_ram_mb.saturating_mul(1024 * 1024),
-            config.zram_mode_for(None).unwrap_or_else(|e| die!("{e}")),
-        );
-    }
+    // Binary download/install does not need ABS zram. Watched-package compiles
+    // bring it up in `process_package` only if makepkg/chroot actually starts.
 
     if let Err(e) = run_argv_command(&argv, None::<&str>) {
         die!("System update failed: {}", e);
     }
     true
-}
-
-/// Repo refresh (`pacman -Sy` / pending-list fetch) is not a compile. Zram is for `-U` / `-RU`.
-fn zram_for_system_update(mode: SystemUpdateMode) -> bool {
-    !matches!(mode, SystemUpdateMode::UpdateRepositories)
 }
 
 fn system_update_mode_label(mode: SystemUpdateMode) -> &'static str {
@@ -301,15 +291,6 @@ mod tests {
             system_update_mode_label(SystemUpdateMode::PerformUpdateNoRefresh),
             "system update"
         );
-        assert!(!zram_for_system_update(
-            SystemUpdateMode::UpdateRepositories
-        ));
-        assert!(zram_for_system_update(
-            SystemUpdateMode::PerformUpdateWithRefresh
-        ));
-        assert!(zram_for_system_update(
-            SystemUpdateMode::PerformUpdateNoRefresh
-        ));
     }
 
     #[test]

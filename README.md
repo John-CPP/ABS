@@ -365,7 +365,7 @@ Optional tmpfs to speed compiles and spare the SSD. Disk `[paths]` stay the perm
 | `seed_chroot_from` | Optional disk tree to rsync into the ram chroot (unset = fresh `mkarchroot`) |
 | `sync_chroot_on_exit` | Rsync ram chroot back to `seed_chroot_from` (default `false`) |
 | `min_free_ram_mb` | Refuse to mount if `MemAvailable` is below this (default `4096`) |
-| `zram` | Temporary ABS-owned compressed swap for compiles and system update: `full` (max remaining RAM, default) or `off`. Independent of tmpfs. Per-package `[packages.NAME] zram = "off"` inherits or overrides. |
+| `zram` | Temporary ABS-owned compressed swap when a compile starts: `full` (max remaining RAM, default) or `off`. Independent of tmpfs. Not used for binary package download/install (`abs -U` / `-RU` pacman). Per-package `[packages.NAME] zram = "off"` inherits or overrides. |
 | `warn_packages_ram` | Warn when `packages = true` (default `true`) |
 | `reclaim_mount_on_startup` | Unmount a stale tmpfs at `mount_point` before mounting (default `true`) |
 

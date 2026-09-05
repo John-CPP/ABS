@@ -310,7 +310,7 @@ explanation = "Wenn der Rechner weniger freien Speicher hat als dieser Wert (in 
 
 [wizard.field.ramdisk.zram]
 title = "Wie soll ABS temporären komprimierten Swap (zram) bemessen?"
-explanation = "full (empfohlen) gibt so viel komprimierten Swap, wie der restliche RAM erlaubt. Ungenutztes zram ist eine Obergrenze, kein Vorab-Reservieren. off schaltet ABS-zram aus. Unabhängig von der RAM-Disk — für Compiles und System-Updates, nicht nur PGO-Convert."
+explanation = "full (empfohlen) gibt so viel komprimierten Swap, wie der restliche RAM erlaubt. Ungenutztes zram ist eine Obergrenze, kein Vorab-Reservieren. off schaltet ABS-zram aus. Unabhängig von der RAM-Disk — wenn ein echtes Compile startet, nicht für Binärpaket-Download oder -Installation."
 
 [wizard.field.check_for_update_on_startup]
 title = "Bescheid geben, wenn eine neuere ABS-Version verfügbar ist?"
@@ -370,7 +370,7 @@ help = "Richtet das temporäre abs-pgo-zram nicht ein. Wenn bereits genug RAM od
 
 [wizard.choice.zram.full]
 label = "So viel restlicher RAM erlaubt (full)"
-help = "Richtet ABS-zram immer mit fast dem gesamten restlichen MemAvailable als komprimiertem RAM-Limit ein, disksize = 4×. Für Compiles und System-Updates, nicht nur PGO-Convert."
+help = "Richtet ABS-zram immer mit fast dem gesamten restlichen MemAvailable als komprimiertem RAM-Limit ein, disksize = 4×. Wenn ein echtes Compile startet, nicht für Binärpaket-Download oder -Installation."
 
 [cli.set_lang]
 unknown = "Unbekannte Sprache {code}. Eine von: {list}"
@@ -860,8 +860,8 @@ ramdisk_global_p = "Vorgabe: Quellen unter packages_path auf tmpfs klonen für P
 ramdisk_seed = "Optionales vorhandenes Chroot-Verzeichnis, das eine frische Ramdisk-Chroot vorbefüllt."
 ramdisk_sync = "Ramdisk-Chroot-Inhalt nach Build-Ende zurück auf die Platte synchronisieren."
 ramdisk_min_free = "Mindestens freier RAM (MiB) vor dem Einhängen; ABS bricht ab, wenn weniger frei ist."
-ramdisk_zram = "Temporäres abs-pgo-zram für Compiles und System-Updates. full nutzt fast den gesamten restlichen RAM als komprimiertes Swap-Limit (disksize 4×). off schaltet es aus. Unabhängig von der RAM-Disk; für kbench ohne perf wird es abgebaut."
-package_zram = "Pro-Paket-zram: inherit nutzt [ramdisk] zram; off oder full gilt nur für dieses Paket. System-Updates nutzen immer die globale Einstellung."
+ramdisk_zram = "Temporäres abs-pgo-zram, wenn ein Compile startet. full nutzt fast den gesamten restlichen RAM als komprimiertes Swap-Limit (disksize 4×). off schaltet es aus. Unabhängig von der RAM-Disk; nicht für Binärpaket-Download/-Installation; für kbench ohne perf wird es abgebaut."
+package_zram = "Pro-Paket-zram: inherit nutzt [ramdisk] zram; off oder full gilt nur für dieses Paket. Binäre System-Updates nutzen kein ABS-zram."
 ramdisk_warn_packages = "Warnen, wenn packages_path auf tmpfs den verfügbaren RAM überschreiten könnte."
 ramdisk_reclaim = "Vor dem Einhängen einen vorhandenen Mount an mount_point aushängen (Wiederherstellung nach abgestürzten Läufen)."
 repo_url = "Pacman-Repository-URL für dieses benannte Repo."

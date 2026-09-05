@@ -1,4 +1,4 @@
-//! Temporary ABS-owned zram when a PGO/ramdisk step looks too big for RAM.
+//! Temporary ABS-owned zram when a compile, PGO, or ramdisk step needs extra swap.
 
 pub const ABS_ZRAM_LABEL: &str = "abs-pgo";
 pub const MEM_LIMIT_FLOOR: u64 = 256 * 1024 * 1024;
@@ -454,7 +454,7 @@ fn try_cover(need: u64, generation: u32, mode: ZramMode) -> (u64, ZramAction, St
     (have, action, tried)
 }
 
-/// Before convert / compile / ramdisk mount / system update. `off` skips setup.
+/// Before convert / compile / ramdisk mount. `off` skips setup.
 /// `full` adds the largest ABS zram remaining RAM allows; loops until the user
 /// continues or stops.
 pub fn ensure_headroom(step: &str, need_bytes: u64, mode: ZramMode) -> Result<OomGate, String> {
