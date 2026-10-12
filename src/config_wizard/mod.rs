@@ -2369,6 +2369,14 @@ enabled = true
         );
         assert!(missing.contains(&"ramdisk.size".to_string()), "{missing:?}");
         assert!(
+            missing.contains(&"ramdisk.pacman_cache".to_string()),
+            "{missing:?}"
+        );
+        assert!(
+            missing.contains(&"ramdisk.save_built_packages".to_string()),
+            "{missing:?}"
+        );
+        assert!(
             !missing.contains(&"ramdisk.enabled".to_string()),
             "{missing:?}"
         );
@@ -2528,7 +2536,7 @@ self_update_use_pacman = true
 self_update_at_updates = false
 install_absgui = true
 paths= { packages_path = "/media/storage/packages/abs/packages", chroot_base_path = "/media/storage/packages/abs/chroot", ready_made_packages_path = "/media/storage/packages/abs/ready" }
-ramdisk= { enabled = true, mount_point = "/run/abs-ram", size = "69G", mode = "0755", build_workdir = true, chroot = true, packages = true, sync_chroot_on_exit = false, min_free_ram_mb = 4096, zram = "full", warn_packages_ram = false, reclaim_mount_on_startup = true }
+ramdisk= { enabled = true, mount_point = "/run/abs-ram", size = "69G", mode = "0755", build_workdir = true, chroot = true, packages = true, sync_chroot_on_exit = false, min_free_ram_mb = 4096, zram = "full", warn_packages_ram = false, reclaim_mount_on_startup = true, pacman_cache = false, save_built_packages = true }
 build= { default_environment = "local", ignore_compilation_failures = true, compile_first_install_after = true, clean_install_by_default = true, ignore_already_made_packages = false, concurrent_repos_downloads_limit = 10, concurrent_compilations_limit = 2, fast_aur_rpc_update_checks = true, system_update_first = true, clean_chroot_after_compilation = true, global_cpu_threads_mode = "strict" }
 system_update= { command_to_update_repositories = "yay -Sy --quiet", command_to_perform_system_update = "yay -Syu --quiet", ignore_flag = "--ignore", ignore_packages = [] }
 repositories= { default = "arch", venomo = "https://github.com/Ven0m0/PKG.git", arch = "https://gitlab.archlinux.org/archlinux/packaging/packages", aur = "https://aur.archlinux.org" }
