@@ -419,6 +419,8 @@ mod tests {
             | "gui.system_update.source_aur"
             | "gui.system_update.source_abs"
             | "gui.system_update.old_to_new"
+            | "gui.system_update.pgo_paused_pkg"
+            | "gui.field.ramdisk_zram"
             | "gui.abs.ramdisk_c"
             | "gui.kernels.spec_lto"
             | "gui.kernels.filter_lto"

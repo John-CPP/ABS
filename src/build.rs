@@ -1263,9 +1263,6 @@ pub fn process_package(
         bump_pkgrel(repo_dir);
     }
 
-    // Drop older PKGDEST artifacts for this base name so install prompts do not list stale builds.
-    remove_stale_pkgs_in_pkgdest(&config.paths.ready_made_packages_path, base_pkg_name);
-
     let build_env = effective_cfg.build_env.clone();
     let skip_tests = effective_cfg.skip_tests;
     let threads =
@@ -1274,6 +1271,17 @@ pub fn process_package(
     if !ramdisk_targets.packages {
         ensure_package_ramdisk(config, pkg, &ramdisk_targets);
     }
+    let _pacman_ram = if ramdisk_targets.pacman_cache {
+        match crate::pacman_redirect::begin_build(config) {
+            Ok(guard) => Some(guard),
+            Err(e) => die!("Pacman ramdisk redirect failed for {pkg}: {e}"),
+        }
+    } else {
+        None
+    };
+    let pkgdest = ramdisk::pkgdest_for(config, &ramdisk_targets);
+    // Drop older PKGDEST artifacts for this base name so install prompts do not list stale builds.
+    remove_stale_pkgs_in_pkgdest(&pkgdest, base_pkg_name);
     require_package_compile_zram(config, pkg_config);
 
     let workdir_guard = match WorkdirGuard::setup(config, repo_dir, &ramdisk_targets, false) {
@@ -1340,7 +1348,7 @@ pub fn process_package(
         let mut build_cmd = format!(
             "{}PKGDEST={} makepkg --syncdeps --noconfirm --needed -f",
             env_prefix,
-            sh_single_quote(&config.paths.ready_made_packages_path)
+            sh_single_quote(&pkgdest)
         );
         if cli.clean && !ramdisk_targets.build_workdir {
             build_cmd.push_str(" -c");
@@ -1408,10 +1416,18 @@ pub fn process_package(
         ensure_pkgsource_pgp_keys(build_dir);
         let mut build_cmd = format!(
             "PKGDEST={} makechrootpkg -r {} -d {}",
-            sh_single_quote(&config.paths.ready_made_packages_path),
+            sh_single_quote(&pkgdest),
             sh_single_quote(&chrootdir.to_string_lossy()),
             sh_single_quote(&repo_dir.to_string_lossy())
         );
+        if ramdisk_targets.pacman_cache
+            && !ramdisk_targets.chroot
+            && let Some(cache) = ramdisk::pacman_cache_path()
+        {
+            let bind = format!("{}:/var/cache/pacman/pkg", cache.display());
+            build_cmd.push_str(" -d ");
+            build_cmd.push_str(&sh_single_quote(&bind));
+        }
         // Give each concurrent build its own chroot working copy so parallel `makechrootpkg`
         // invocations do not clobber the shared default `<chrootdir>/$USER` copy.
         if let Some(copy) = chroot_copy {
@@ -1442,7 +1458,13 @@ pub fn process_package(
 
     // Bash: install then post-update (both only if not `-o` and not deferred). Hooks still see the bumped PKGBUILD.
     if !cli.compile_only && !install_deferred_this_run {
-        crate::install::install_artifacts(pkg, base_pkg_name, Some(repo_dir), config);
+        crate::install::install_artifacts_from(
+            pkg,
+            base_pkg_name,
+            Some(repo_dir),
+            config,
+            &pkgdest,
+        );
 
         if let Some(pc) = pkg_config
             && let Some(cmd) = &pc.post_update_command
@@ -1488,7 +1510,7 @@ fn format_pgo_makepkg_cmd(
     let ramdisk_env = ramdisk_makepkg_env_prefix(repo_dir, targets);
     let pkgdest = format!(
         "PKGDEST={}",
-        crate::utils::sh_single_quote(&config.paths.ready_made_packages_path)
+        crate::utils::sh_single_quote(&ramdisk::pkgdest_for(config, targets))
     );
     let mut parts = Vec::new();
     if !ramdisk_env.is_empty() {
@@ -1573,6 +1595,14 @@ pub fn process_package_pgo(
     if let Err(e) = ramdisk::ensure_for_targets(config, &ramdisk_targets) {
         die!("Ramdisk setup failed for {}: {}", pkg, e);
     }
+    let _pacman_ram = if ramdisk_targets.pacman_cache {
+        match crate::pacman_redirect::begin_build(config) {
+            Ok(guard) => Some(guard),
+            Err(e) => die!("Pacman ramdisk redirect failed for {pkg}: {e}"),
+        }
+    } else {
+        None
+    };
     ramdisk::warn_if_packages_on_ram(config, pkg, &ramdisk_targets);
     let packages_path = ramdisk::download_packages_path(config, &ramdisk_targets);
     let (repo_name, repo_url_string, base_pkg) = resolve_pkg_repo(pkg, cli, config, Some(spec));
@@ -1660,7 +1690,14 @@ pub fn process_package_pgo(
     if !pgo.skip_abs_install && !cli.compile_only {
         let pkgbase = pgo_pkgbase_from_env(pkg, &pgo.env_vars);
         blog!("PGO stage installs packages for pkgbase {pkgbase}");
-        crate::install::install_pgo_artifacts(pkg, &pkgbase, Some(repo_dir), config, &pgo.env_vars);
+        crate::install::install_pgo_artifacts(
+            pkg,
+            &pkgbase,
+            Some(repo_dir),
+            config,
+            &pgo.env_vars,
+            &ramdisk::pkgdest_for(config, &ramdisk_targets),
+        );
     }
 
     if !pgo.defer_pkgbuild_restore {

@@ -354,6 +354,10 @@ pub struct RamdiskSection {
     pub chroot: bool,
     #[serde(default)]
     pub packages: bool,
+    #[serde(default)]
+    pub pacman_cache: bool,
+    #[serde(default = "default_true")]
+    pub save_built_packages: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_chroot_from: Option<String>,
     #[serde(default)]
@@ -394,6 +398,8 @@ impl Default for RamdiskSection {
             build_workdir: false,
             chroot: false,
             packages: false,
+            pacman_cache: false,
+            save_built_packages: true,
             seed_chroot_from: None,
             sync_chroot_on_exit: false,
             min_free_ram_mb: default_min_free_ram(),

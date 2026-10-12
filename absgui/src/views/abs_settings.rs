@@ -456,6 +456,20 @@ pub fn view<'a>(
                 app_theme,
                 Message::RamdiskPackages,
             ),
+            field_checkbox(
+                "pacman cache (d)",
+                Some(field_help::ramdisk_global_d()),
+                config.ramdisk.pacman_cache,
+                app_theme,
+                Message::RamdiskPacmanCache,
+            ),
+            field_checkbox(
+                "save_built_packages",
+                Some(field_help::ramdisk_save_built()),
+                config.ramdisk.save_built_packages,
+                app_theme,
+                Message::RamdiskSaveBuilt,
+            ),
             field_path(
                 "seed_chroot_from (optional)",
                 Some(field_help::ramdisk_seed()),

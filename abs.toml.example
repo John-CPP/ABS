@@ -81,6 +81,14 @@ build_workdir = false
 chroot = false
 # Use tmpfs for the entire packages_path (git clones and sources). High RAM use; off by default.
 packages = false
+# Download pacman packages onto the ramdisk during system update and builds (`d`).
+# Existing cache files on disk are still used. New downloads are discarded.
+# yay/paru build directories move too, for the update command that actually runs them.
+# Configs are restored when the step finishes, on the next ABS start, and by --ramdisk-shutdown.
+pacman_cache = false
+# Write packages compiled by ABS, yay, or paru into ready_made_packages_path.
+# false keeps those built files on the ramdisk. Pacman repo downloads are always discarded.
+save_built_packages = true
 # Optional disk directory to rsync into the ram chroot before first use (copies the entire tree; leave unset for a fresh mkarchroot on RAM).
 # seed_chroot_from = ""
 # On normal ABS exit, rsync the ram chroot back to seed_chroot_from when sync_chroot_on_exit = true (requires seed_chroot_from).

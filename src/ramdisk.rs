@@ -134,13 +134,15 @@ pub struct RamdiskTargets {
     pub build_workdir: bool,
     pub chroot: bool,
     pub packages: bool,
+    /// Pacman package cache (and yay/paru build dirs during system update) on tmpfs.
+    pub pacman_cache: bool,
     /// PGO profile collection scratch (perf data) on tmpfs before archiving.
     pub profiles: bool,
 }
 
 impl RamdiskTargets {
     pub fn any(&self) -> bool {
-        self.build_workdir || self.chroot || self.packages || self.profiles
+        self.build_workdir || self.chroot || self.packages || self.pacman_cache || self.profiles
     }
 }
 
@@ -164,13 +166,16 @@ pub fn format_ramdisk_targets(targets: &RamdiskTargets) -> String {
     if targets.packages {
         s.push('p');
     }
+    if targets.pacman_cache {
+        s.push('d');
+    }
     if targets.profiles {
         s.push('r');
     }
     s
 }
 
-/// Parse `w` (workdir), `c` (chroot), `p` (packages), `r` (PGO profile scratch).
+/// Parse `w` (workdir), `c` (chroot), `p` (packages), `d` (pacman cache), `r` (PGO profile scratch).
 /// Separators are ignored (`wcp`, `w,c,p`, `w-c-p`).
 pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
     let mut targets = RamdiskTargets::default();
@@ -189,6 +194,10 @@ pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
                 targets.packages = true;
                 saw = true;
             }
+            'd' => {
+                targets.pacman_cache = true;
+                saw = true;
+            }
             'r' => {
                 targets.profiles = true;
                 saw = true;
@@ -196,7 +205,7 @@ pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
             ',' | ' ' | '+' | '/' | '-' | '_' => {}
             _ => {
                 return Err(format!(
-                    "invalid ramdisk target '{ch}' in {:?} (use w=workdir, c=chroot, p=packages, r=profiles)",
+                    "invalid ramdisk target '{ch}' in {:?} (use w=workdir, c=chroot, p=packages, d=pacman cache, r=profiles)",
                     code
                 ));
             }
@@ -204,7 +213,7 @@ pub fn parse_ramdisk_targets(code: &str) -> Result<RamdiskTargets, String> {
     }
     if !code.trim().is_empty() && !saw {
         return Err(format!(
-            "ramdisk targets {:?} contain no recognized letters (use w, c, p, r)",
+            "ramdisk targets {:?} contain no recognized letters (use w, c, p, d, r)",
             code
         ));
     }
@@ -238,6 +247,7 @@ pub fn resolve_ramdisk_targets(
         build_workdir: config.ramdisk.build_workdir,
         chroot: config.ramdisk.chroot,
         packages: config.ramdisk.packages,
+        pacman_cache: config.ramdisk.pacman_cache,
         profiles: false,
     })
 }
@@ -250,6 +260,25 @@ pub fn resolve_ramdisk_targets_for_pkg(config: &Config, pkg_name: &str) -> Ramdi
 pub fn packages_path_for_pkg(config: &Config, pkg_name: &str) -> String {
     let targets = resolve_ramdisk_targets_for_pkg(config, pkg_name);
     download_packages_path(config, &targets)
+}
+
+/// Where finished `.pkg.tar` files go. The ready folder, unless `d` is on and
+/// `save_built_packages` is false (then they stay on the ramdisk).
+pub fn pkgdest_for(config: &Config, targets: &RamdiskTargets) -> String {
+    if targets.pacman_cache
+        && !config.ramdisk.save_built_packages
+        && let Some(mount) = session_mount_point()
+    {
+        let dir = mount.join("pkgdest");
+        let _ = fs::create_dir_all(&dir);
+        return dir.to_string_lossy().into_owned();
+    }
+    config.paths.ready_made_packages_path.clone()
+}
+
+/// `$mount/pacman` while a ramdisk session is active.
+pub fn pacman_cache_path() -> Option<PathBuf> {
+    session_mount_point().map(|m| m.join("pacman"))
 }
 
 pub fn warn_if_packages_on_ram(config: &Config, pkg_name: &str, targets: &RamdiskTargets) {
@@ -413,8 +442,9 @@ fn tmpfs_mount_options(config: &RamdiskConfig) -> Result<String, String> {
     validate_ramdisk_size(&config.size)?;
     validate_ramdisk_mode(&config.mode)?;
     let (uid, gid) = invoking_uid_gid();
+    // noswap: Linux 6.4+. Without it, swappiness (often 150–180 with zram) writes the ramdisk into zram.
     Ok(format!(
-        "size={},mode={},uid={},gid={}",
+        "size={},mode={},uid={},gid={},noswap",
         config.size.trim(),
         config.mode.trim(),
         uid,
@@ -1160,6 +1190,7 @@ fn sync_chroot_to_seed(session: &RamdiskSession) {
 }
 
 pub fn shutdown_on_interrupt() {
+    crate::pacman_redirect::restore_pending();
     if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1185,6 +1216,7 @@ pub fn shutdown_on_interrupt() {
 }
 
 pub fn shutdown() {
+    crate::pacman_redirect::restore_pending();
     if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1207,6 +1239,7 @@ pub fn shutdown() {
 /// Unmount the configured ramdisk when the abs process no longer has session state
 /// (e.g. GUI abort killed abs, or user ran `--ramdisk-shutdown`).
 pub fn force_unmount_configured(config: &Config) -> Result<(), String> {
+    crate::pacman_redirect::restore_pending();
     let mount_point = PathBuf::from(config.ramdisk.mount_point.trim());
     if mount_point.as_os_str().is_empty() {
         return Ok(());
@@ -1363,7 +1396,10 @@ mod tests {
     #[test]
     fn parse_ramdisk_targets_letters() {
         let t = parse_ramdisk_targets("wcp").unwrap();
-        assert!(t.build_workdir && t.chroot && t.packages && !t.profiles);
+        assert!(t.build_workdir && t.chroot && t.packages && !t.pacman_cache && !t.profiles);
+        let t = parse_ramdisk_targets("wd").unwrap();
+        assert!(t.build_workdir && t.pacman_cache && !t.packages);
+        assert_eq!(format_ramdisk_targets(&t), "wd");
         let t = parse_ramdisk_targets("wr").unwrap();
         assert!(t.build_workdir && t.profiles && !t.chroot && !t.packages);
         assert_eq!(format_ramdisk_targets(&t), "wr");
@@ -1575,6 +1611,9 @@ packages = false
         assert!(validate_ramdisk_size("16G,uid=0").is_err());
         assert!(validate_ramdisk_mode("0755").is_ok());
         assert!(validate_ramdisk_mode("0777,noexec").is_err());
+        let opts = tmpfs_mount_options(&crate::config::RamdiskConfig::default()).unwrap();
+        assert!(opts.contains(",noswap"), "{opts}");
+        assert!(!opts.contains(",,"), "{opts}");
         let ram_32g = 32 * 1024 * 1024 * 1024;
         assert_eq!(ramdisk_size_bytes("16G", ram_32g).unwrap(), ram_32g / 2);
         assert_eq!(ramdisk_size_bytes("50%", ram_32g).unwrap(), ram_32g / 2);

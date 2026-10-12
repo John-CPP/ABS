@@ -866,17 +866,24 @@ where
     col.width(Length::Fill).into()
 }
 
-pub fn parse_ramdisk_flags(value: &str) -> (bool, bool, bool, bool) {
+pub fn parse_ramdisk_flags(value: &str) -> (bool, bool, bool, bool, bool) {
     let lower = value.to_ascii_lowercase();
     (
         lower.contains('w'),
         lower.contains('c'),
         lower.contains('p'),
+        lower.contains('d'),
         lower.contains('r'),
     )
 }
 
-pub fn encode_ramdisk_flags(workdir: bool, chroot: bool, packages: bool, profiles: bool) -> String {
+pub fn encode_ramdisk_flags(
+    workdir: bool,
+    chroot: bool,
+    packages: bool,
+    pacman: bool,
+    profiles: bool,
+) -> String {
     let mut s = String::new();
     if workdir {
         s.push('w');
@@ -886,6 +893,9 @@ pub fn encode_ramdisk_flags(workdir: bool, chroot: bool, packages: bool, profile
     }
     if packages {
         s.push('p');
+    }
+    if pacman {
+        s.push('d');
     }
     if profiles {
         s.push('r');
@@ -898,6 +908,7 @@ pub fn ramdisk_targets_field(
     workdir: bool,
     chroot: bool,
     packages: bool,
+    pacman: bool,
     profiles: bool,
     app_theme: AppTheme,
 ) -> Element<'static, Message> {
@@ -928,6 +939,13 @@ pub fn ramdisk_targets_field(
                 move |v| Message::SetRamdiskTarget(target, RamdiskLetter::Packages, v),
             ),
             field_checkbox(
+                abs_i18n::t("gui.abs.ramdisk_d"),
+                Some(field_help::ramdisk_d()),
+                pacman,
+                app_theme,
+                move |v| Message::SetRamdiskTarget(target, RamdiskLetter::Pacman, v),
+            ),
+            field_checkbox(
                 abs_i18n::t("gui.abs.ramdisk_r"),
                 Some(field_help::ramdisk_r()),
                 profiles,
@@ -946,6 +964,7 @@ pub fn kernel_ramdisk_targets_field(
     workdir: bool,
     chroot: bool,
     packages: bool,
+    pacman: bool,
     profiles: bool,
     app_theme: AppTheme,
 ) -> Element<'static, Message> {
@@ -967,6 +986,13 @@ pub fn kernel_ramdisk_targets_field(
                 packages,
                 app_theme,
                 move |v| Message::SetRamdiskTarget(target, RamdiskLetter::Packages, v),
+            ),
+            field_checkbox(
+                abs_i18n::t("gui.field.ramdisk_kernel_d"),
+                Some(field_help::ramdisk_d()),
+                pacman,
+                app_theme,
+                move |v| Message::SetRamdiskTarget(target, RamdiskLetter::Pacman, v),
             ),
             field_checkbox(
                 abs_i18n::t("gui.field.ramdisk_kernel_r"),
@@ -1921,10 +1947,12 @@ mod tests {
 
     #[test]
     fn ramdisk_flags_roundtrip() {
-        assert_eq!(parse_ramdisk_flags("wcp"), (true, true, true, false));
-        assert_eq!(parse_ramdisk_flags("wcr"), (true, true, false, true));
-        assert_eq!(parse_ramdisk_flags("wc"), (true, true, false, false));
-        assert_eq!(encode_ramdisk_flags(true, false, true, true), "wpr");
+        assert_eq!(parse_ramdisk_flags("wcp"), (true, true, true, false, false));
+        assert_eq!(parse_ramdisk_flags("wcr"), (true, true, false, false, true));
+        assert_eq!(parse_ramdisk_flags("wc"), (true, true, false, false, false));
+        assert_eq!(parse_ramdisk_flags("wd"), (true, false, false, true, false));
+        assert_eq!(encode_ramdisk_flags(true, false, true, false, true), "wpr");
+        assert_eq!(encode_ramdisk_flags(true, false, false, true, false), "wd");
     }
 
     #[test]

@@ -337,22 +337,18 @@ pub fn install_pgo_artifacts(
     repo_dir: Option<&Path>,
     config: &Config,
     makepkg_env: &HashMap<String, String>,
+    pkgdest: &str,
 ) {
     let Some(repo_dir) = repo_dir else {
         ewarn!("PGO install skipped: no package repository directory");
         return;
     };
-    let mut files = collect_pgo_candidate_files(
-        repo_dir,
-        pkgbase,
-        &config.paths.ready_made_packages_path,
-        makepkg_env,
-    );
+    let mut files = collect_pgo_candidate_files(repo_dir, pkgbase, pkgdest, makepkg_env);
     if files.is_empty() {
         ewarn!(
             "No installable artifacts for pkgbase {pkgbase} in {}; \
              expected packages like {pkgbase} and {pkgbase}-dbg after the build",
-            config.paths.ready_made_packages_path
+            pkgdest
         );
         return;
     }
@@ -585,7 +581,23 @@ pub fn install_artifacts(
     repo_dir: Option<&Path>,
     config: &Config,
 ) {
-    install_artifacts_inner(pkg_input, base_pkg_name, repo_dir, config, false);
+    install_artifacts_from(
+        pkg_input,
+        base_pkg_name,
+        repo_dir,
+        config,
+        &config.paths.ready_made_packages_path,
+    );
+}
+
+pub fn install_artifacts_from(
+    pkg_input: &str,
+    base_pkg_name: &str,
+    repo_dir: Option<&Path>,
+    config: &Config,
+    pkgdest: &str,
+) {
+    install_artifacts_inner(pkg_input, base_pkg_name, repo_dir, config, pkgdest, false);
 }
 
 fn install_artifacts_inner(
@@ -593,14 +605,10 @@ fn install_artifacts_inner(
     base_pkg_name: &str,
     repo_dir: Option<&Path>,
     config: &Config,
+    pkgdest: &str,
     auto_install_all: bool,
 ) {
-    let mut files = collect_candidate_files(
-        pkg_input,
-        base_pkg_name,
-        repo_dir,
-        &config.paths.ready_made_packages_path,
-    );
+    let mut files = collect_candidate_files(pkg_input, base_pkg_name, repo_dir, pkgdest);
     if files.is_empty() {
         vlog!("No installable artifacts found for {}", pkg_input);
         return;

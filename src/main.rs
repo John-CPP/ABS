@@ -13,6 +13,7 @@ mod held;
 mod install;
 mod package_pattern;
 mod package_spec;
+mod pacman_redirect;
 mod pending_updates;
 mod pgo;
 mod pgo_benchmark;
@@ -305,6 +306,7 @@ fn main() {
     };
     set_verbosity(v);
     set_dry_run_mode(cli.dry_run);
+    pacman_redirect::restore_pending();
     set_force_sudo_clean(cli.use_sudo_clean);
     crate::utils::set_skip_exit_pause(cli.no_wait);
 
@@ -658,7 +660,11 @@ fn main() {
 
         if config.build.system_update_first {
             blog!("Performing system update before compilation...");
-            system::run_system_update(&config, system::SystemUpdateMode::PerformUpdateWithRefresh);
+            system::run_system_update_with(
+                &config,
+                system::SystemUpdateMode::PerformUpdateWithRefresh,
+                cli.ramdisk.as_deref(),
+            );
             // Pacman may have updated trigger packages during -Syu.
             for spec in held_specs_for_drifts(&config) {
                 if held_queued.insert(spec.name.clone()) {
@@ -709,7 +715,7 @@ fn main() {
             } else {
                 system::SystemUpdateMode::PerformUpdateWithRefresh
             };
-            system::run_system_update(&config, mode);
+            system::run_system_update_with(&config, mode, cli.ramdisk.as_deref());
             // Reload so trigger snapshots match what the first compile pass wrote.
             let config_after = config::Config::load_config();
             let post_held = held_specs_for_drifts(&config_after);

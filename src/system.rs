@@ -111,6 +111,14 @@ pub(crate) fn packages_ignored_during_system_update(config: &Config) -> Vec<Stri
 ///
 /// Returns `false` when a kernel PGO pipeline is in progress and the update was skipped.
 pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
+    run_system_update_with(config, mode, None)
+}
+
+pub fn run_system_update_with(
+    config: &Config,
+    mode: SystemUpdateMode,
+    cli_ramdisk: Option<&str>,
+) -> bool {
     crate::utils::apply_gui_nested_sudo_askpass();
     let active = crate::pgo::active_pipelines(config);
     if !active.is_empty() {
@@ -145,8 +153,20 @@ pub fn run_system_update(config: &Config, mode: SystemUpdateMode) -> bool {
 
     vlog!("Executing system update: {}", argv.join(" "));
 
-    // Binary download/install does not need ABS zram. Watched-package compiles
-    // bring it up in `process_package` only if makepkg/chroot actually starts.
+    let redirect_packages =
+        matches!(
+            mode,
+            SystemUpdateMode::PerformUpdateWithRefresh | SystemUpdateMode::PerformUpdateNoRefresh
+        ) && crate::pacman_redirect::system_update_wants_redirect(config, cli_ramdisk);
+    // Mounting the ramdisk brings up ABS zram when `[ramdisk] zram = "full"`.
+    let _pacman_ram = if redirect_packages {
+        match crate::pacman_redirect::begin_system_update(config, &cmd_str) {
+            Ok(guard) => Some(guard),
+            Err(e) => die!("Pacman ramdisk redirect failed: {e}"),
+        }
+    } else {
+        None
+    };
 
     if let Err(e) = run_argv_command(&argv, None::<&str>) {
         die!("System update failed: {}", e);

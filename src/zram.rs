@@ -196,6 +196,25 @@ pub fn is_abs_pgo_label(label: &str) -> bool {
     label.trim() == ABS_ZRAM_LABEL
 }
 
+/// A zram swap that is not labeled [`ABS_ZRAM_LABEL`]. Controllers such as
+/// zram-swapcontrol pin `zram0` (`num_devices=1`, hot_remove). A second device races them.
+pub fn foreign_zram_swap_dev(proc_swaps: &str, lsblk: &str) -> Option<String> {
+    let abs = abs_pgo_zram_from_lsblk(lsblk);
+    for line in proc_swaps.lines().skip(1) {
+        let Some(dev) = line.split_whitespace().next() else {
+            continue;
+        };
+        if !is_zram_dev(dev) {
+            continue;
+        }
+        if abs.as_deref() == Some(dev) {
+            continue;
+        }
+        return Some(dev.to_string());
+    }
+    None
+}
+
 pub fn parse_oom_prompt(input: &str) -> OomPrompt {
     match input.trim().to_ascii_lowercase().as_str() {
         "c" | "continue" | "y" | "yes" => OomPrompt::Continue,
@@ -283,6 +302,12 @@ fn lsblk_table() -> String {
 
 fn find_abs_pgo_zram() -> Option<String> {
     abs_pgo_zram_from_lsblk(&lsblk_table())
+}
+
+fn foreign_zram_blocks_new_abs() -> bool {
+    let table = lsblk_table();
+    let swaps = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
+    foreign_zram_swap_dev(&swaps, &table).is_some()
 }
 
 fn zram_sysfs_disksize(dev: &str) -> Option<u64> {
@@ -433,9 +458,15 @@ fn try_cover(need: u64, generation: u32, mode: ZramMode) -> (u64, ZramAction, St
     let (abs_swap, abs_ml) = abs_zram_accounting();
     let non_abs_swap = swap.saturating_sub(abs_swap);
     let have = usable_have(avail, swap, abs_swap, abs_ml).unwrap_or(non_abs_swap);
-    let action = plan_zram_mode(need, avail, non_abs_swap, generation, mode);
+    let mut action = plan_zram_mode(need, avail, non_abs_swap, generation, mode);
     let mut tried = describe_action(action);
-    if let ZramAction::Setup {
+    if matches!(action, ZramAction::Setup { .. }) && foreign_zram_blocks_new_abs() {
+        if !crate::is_dry_run_mode() {
+            crate::blog!("Another program already has zram swap; not adding {ABS_ZRAM_LABEL}");
+        }
+        action = ZramAction::NoneNeeded;
+        tried = "using existing zram swap".into();
+    } else if let ZramAction::Setup {
         disksize,
         mem_limit,
     } = action
@@ -463,7 +494,10 @@ pub fn ensure_headroom(step: &str, need_bytes: u64, mode: ZramMode) -> Result<Oo
     }
     if crate::is_dry_run_mode() {
         let avail = mem_available_bytes();
-        let action = plan_zram_mode(need_bytes, avail, swap_free_bytes(), 0, mode);
+        let mut action = plan_zram_mode(need_bytes, avail, swap_free_bytes(), 0, mode);
+        if matches!(action, ZramAction::Setup { .. }) && foreign_zram_blocks_new_abs() {
+            action = ZramAction::NoneNeeded;
+        }
         println!(
             "[DRY RUN] OOM gate {step}: need {} zram={mode:?} → {action:?}",
             fmt_gib(need_bytes)
@@ -798,6 +832,24 @@ mod tests {
             Some("/dev/zram1")
         );
         assert_eq!(super::abs_pgo_zram_from_lsblk("zram0 zram-swap\n"), None);
+    }
+
+    #[test]
+    fn foreign_zram_swap_is_left_alone() {
+        let swaps = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n\
+                     /dev/zram0                              partition\t344605180\t0\t\t100\n";
+        assert_eq!(
+            super::foreign_zram_swap_dev(swaps, "zram0 zram0\n").as_deref(),
+            Some("/dev/zram0")
+        );
+        assert_eq!(super::foreign_zram_swap_dev(swaps, "zram0 abs-pgo\n"), None);
+        let both = "Filename Type Size Used Priority\n\
+                    /dev/zram0 partition 100 0 100\n\
+                    /dev/zram1 partition 100 0 -2\n";
+        assert_eq!(
+            super::foreign_zram_swap_dev(both, "zram0 zram0\nzram1 abs-pgo\n").as_deref(),
+            Some("/dev/zram0")
+        );
     }
 
     #[test]

@@ -164,6 +164,10 @@ fn default_ramdisk_warn_packages_ram() -> bool {
     true
 }
 
+fn default_save_built_packages() -> bool {
+    true
+}
+
 fn default_ramdisk_reclaim_mount_on_startup() -> bool {
     true
 }
@@ -189,6 +193,12 @@ pub struct RamdiskConfig {
     pub chroot: bool,
     #[serde(default)]
     pub packages: bool,
+    /// Download pacman packages onto the ramdisk during system update and builds.
+    #[serde(default)]
+    pub pacman_cache: bool,
+    /// Write packages compiled by ABS, yay, or paru into `ready_made_packages_path`.
+    #[serde(default = "default_save_built_packages")]
+    pub save_built_packages: bool,
     #[serde(default)]
     pub seed_chroot_from: Option<String>,
     #[serde(default)]
@@ -215,6 +225,8 @@ impl Default for RamdiskConfig {
             build_workdir: default_ramdisk_build_workdir(),
             chroot: default_ramdisk_chroot(),
             packages: false,
+            pacman_cache: false,
+            save_built_packages: default_save_built_packages(),
             seed_chroot_from: None,
             sync_chroot_on_exit: false,
             min_free_ram_mb: default_ramdisk_min_free_ram_mb(),
@@ -1535,6 +1547,11 @@ impl Config {
             println!("  build_workdir: {}", self.ramdisk.build_workdir);
             println!("  chroot: {}", self.ramdisk.chroot);
             println!("  packages: {}", self.ramdisk.packages);
+            println!("  pacman_cache: {}", self.ramdisk.pacman_cache);
+            println!(
+                "  save_built_packages: {}",
+                self.ramdisk.save_built_packages
+            );
             println!(
                 "  seed_chroot_from: {}",
                 self.ramdisk.seed_chroot_from.as_deref().unwrap_or("(none)")

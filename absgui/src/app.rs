@@ -1853,6 +1853,8 @@ impl App {
             Message::RamdiskWorkdir(v) => self.config.ramdisk.build_workdir = v,
             Message::RamdiskChroot(v) => self.config.ramdisk.chroot = v,
             Message::RamdiskPackages(v) => self.config.ramdisk.packages = v,
+            Message::RamdiskPacmanCache(v) => self.config.ramdisk.pacman_cache = v,
+            Message::RamdiskSaveBuilt(v) => self.config.ramdisk.save_built_packages = v,
             Message::RamdiskSize(v) => self.config.ramdisk.size = v,
             Message::RamdiskMode(v) => self.config.ramdisk.mode = v,
             Message::RamdiskMountPoint(v) => self.config.ramdisk.mount_point = v,
@@ -2055,15 +2057,16 @@ impl App {
             Message::SetRamdiskTarget(target, letter, enabled) => {
                 if let Some(pkg) = self.target_pkg_mut(target) {
                     let current = kstr_value(pkg, KStr::Ramdisk);
-                    let (mut w, mut c, mut p, mut r) = parse_ramdisk_flags(&current);
+                    let (mut w, mut c, mut p, mut d, mut r) = parse_ramdisk_flags(&current);
                     match letter {
                         RamdiskLetter::Workdir => w = enabled,
                         RamdiskLetter::Chroot => c = enabled,
                         RamdiskLetter::Packages => p = enabled,
+                        RamdiskLetter::Pacman => d = enabled,
                         RamdiskLetter::Profiles => r = enabled,
                     }
-                    set_kstr(pkg, KStr::Ramdisk, encode_ramdisk_flags(w, c, p, r));
-                    if w || c || p || r {
+                    set_kstr(pkg, KStr::Ramdisk, encode_ramdisk_flags(w, c, p, d, r));
+                    if w || c || p || d || r {
                         self.config.ramdisk.enabled = true;
                     }
                 }
@@ -4534,7 +4537,7 @@ fn kernel_form<'a>(
     let hugepage = kstr_pick_value(pkg, fallback, KStr::Hugepage);
     let source = kstr_pick_value(pkg, fallback, KStr::Source);
     let build_env = kstr_pick_value(pkg, fallback, KStr::BuildEnv);
-    let (ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r) = parse_ramdisk_flags(&ramdisk_str);
+    let (ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_d, ramdisk_r) = parse_ramdisk_flags(&ramdisk_str);
     let kernel = card_section(
         abs_i18n::t("gui.kernels.options"),
         theme,
@@ -4688,7 +4691,9 @@ fn kernel_form<'a>(
                 theme,
                 move |v| Message::PackageCompileAlone(target, v),
             ),
-            kernel_ramdisk_targets_field(target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r, theme),
+            kernel_ramdisk_targets_field(
+                target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_d, ramdisk_r, theme,
+            ),
             field_pick(
                 abs_i18n::t("gui.field.package_zram"),
                 Some(field_help::package_zram()),
@@ -5038,7 +5043,7 @@ fn package_form<'a>(
     theme: AppTheme,
 ) -> Element<'a, Message> {
     let ramdisk_str = kstr_value(pkg, KStr::Ramdisk);
-    let (ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r) = parse_ramdisk_flags(&ramdisk_str);
+    let (ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_d, ramdisk_r) = parse_ramdisk_flags(&ramdisk_str);
 
     let source_build = card_section(
         abs_i18n::t("gui.packages.source_build"),
@@ -5090,7 +5095,9 @@ fn package_form<'a>(
                 theme,
                 move |v| Message::SetPackageOptBool(target, KOptBool::Tests, v),
             ),
-            ramdisk_targets_field(target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_r, theme),
+            ramdisk_targets_field(
+                target, ramdisk_w, ramdisk_c, ramdisk_p, ramdisk_d, ramdisk_r, theme,
+            ),
             field_pick(
                 abs_i18n::t("gui.field.package_zram"),
                 Some(field_help::package_zram()),

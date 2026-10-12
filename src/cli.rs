@@ -113,7 +113,7 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
 
-    /// Ramdisk targets for all packages on this run (`w`=workdir, `c`=chroot, `p`=packages, `disabled`=off).
+    /// Ramdisk targets for all packages on this run (`w`=workdir, `c`=chroot, `p`=packages, `d`=pacman cache, `disabled`=off).
     /// Avoids shell glob issues with bracket syntax in zsh. Bracket `pkg[ramdisk=wcp]` overrides this.
     #[arg(long, value_name = "WCP|disabled")]
     pub ramdisk: Option<String>,

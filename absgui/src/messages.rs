@@ -222,6 +222,7 @@ pub enum RamdiskLetter {
     Workdir,
     Chroot,
     Packages,
+    Pacman,
     Profiles,
 }
 
@@ -307,6 +308,8 @@ pub enum Message {
     RamdiskWorkdir(bool),
     RamdiskChroot(bool),
     RamdiskPackages(bool),
+    RamdiskPacmanCache(bool),
+    RamdiskSaveBuilt(bool),
     RamdiskSize(String),
     RamdiskMode(String),
     RamdiskMountPoint(String),
