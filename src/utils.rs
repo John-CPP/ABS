@@ -2282,8 +2282,71 @@ pub fn makepkg_printsrcinfo_full_version(repo_dir: &Path) -> Result<String, Stri
     parse_srcinfo_full_version(&text)
 }
 
+/// Top-level `epoch` / `pkgver` / `pkgrel` when they are plain tokens.
+/// `None` if `pkgver()` will rewrite the version, or a value is not a literal
+/// (`$var`, command substitution). Callers then use `makepkg --printsrcinfo`.
+fn literal_pkgbuild_full_version(text: &str) -> Option<String> {
+    let mut epoch: Option<String> = None;
+    let mut pkgver: Option<String> = None;
+    let mut pkgrel: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with("pkgver()") {
+            return None;
+        }
+        if raw.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let Some((key, rest)) = line.split_once('=') else {
+            continue;
+        };
+        if !matches!(key, "epoch" | "pkgver" | "pkgrel") {
+            continue;
+        }
+        let value = literal_assign_value(rest)?;
+        match key {
+            "epoch" => epoch = Some(value),
+            "pkgver" => pkgver = Some(value),
+            "pkgrel" => pkgrel = Some(value),
+            _ => {}
+        }
+    }
+    let pkgver = pkgver?;
+    let pkgrel = pkgrel?;
+    if let Some(e) = epoch
+        && e != "0"
+        && !e.is_empty()
+    {
+        return Some(format!("{e}:{pkgver}-{pkgrel}"));
+    }
+    Some(format!("{pkgver}-{pkgrel}"))
+}
+
+fn literal_assign_value(rest: &str) -> Option<String> {
+    let rest = rest.split('#').next()?.trim();
+    let rest = if rest.len() >= 2 {
+        let bytes = rest.as_bytes();
+        let quote = bytes[0];
+        if (quote == b'"' || quote == b'\'') && bytes[rest.len() - 1] == quote {
+            &rest[1..rest.len() - 1]
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+    if rest.is_empty() || rest.contains(['$', '`', ' ', '\t', '(', ')']) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// Fast version read for comparisons: `.SRCINFO` if present and not older than PKGBUILD,
-/// else **`makepkg --printsrcinfo`**. Never `source`s the PKGBUILD on the host.
+/// else top-level `pkgver`/`pkgrel` literals, else **`makepkg --printsrcinfo`**.
+/// Never `source`s the PKGBUILD on the host.
 pub fn read_pkg_full_version_from_dir(pkg_dir: &Path) -> Result<String, String> {
     if crate::is_dry_run_mode() {
         return Err("dry-run".into());
@@ -2313,6 +2376,16 @@ pub fn read_pkg_full_version_from_dir(pkg_dir: &Path) -> Result<String, String> 
         return parse_srcinfo_full_version(&text);
     }
 
+    if let Ok(text) = fs::read_to_string(&pkgbuild_path)
+        && let Some(ver) = literal_pkgbuild_full_version(&text)
+    {
+        return Ok(ver);
+    }
+
+    crate::vlog!(
+        "PKGBUILD version is not a literal assignment; running makepkg --printsrcinfo in {}...",
+        pkg_dir.display()
+    );
     makepkg_printsrcinfo_full_version(pkg_dir)
 }
 
@@ -2636,6 +2709,32 @@ mod version_tests {
     fn parse_srcinfo_no_epoch() {
         let s = "pkgver=1.0\npkgrel=3\n";
         assert_eq!(parse_srcinfo_full_version(s).unwrap(), "1.0-3");
+    }
+
+    #[test]
+    fn literal_pkgbuild_version_skips_makepkg() {
+        use super::literal_pkgbuild_full_version;
+        let qemu = "pkgbase=qemu\npkgver=11.1.2\npkgrel=1\npkgname=(qemu-full)\n";
+        assert_eq!(
+            literal_pkgbuild_full_version(qemu).as_deref(),
+            Some("11.1.2-1")
+        );
+        assert_eq!(
+            literal_pkgbuild_full_version("epoch=2\npkgver='1.0'\npkgrel=\"3\"\n").as_deref(),
+            Some("2:1.0-3")
+        );
+        assert_eq!(
+            literal_pkgbuild_full_version("pkgver=1.0 # keep\npkgrel=1\n").as_deref(),
+            Some("1.0-1")
+        );
+        let dynamic = "pkgver=1.0\npkgrel=1\npkgver() {\n  pkgver=2.0\n}\n";
+        assert_eq!(literal_pkgbuild_full_version(dynamic), None);
+        assert_eq!(
+            literal_pkgbuild_full_version("pkgver=$foo\npkgrel=1\n"),
+            None
+        );
+        let nested = "pkgver=9\npkgrel=1\npackage_foo() {\n  pkgver=1\n}\n";
+        assert_eq!(literal_pkgbuild_full_version(nested).as_deref(), Some("9-1"));
     }
 
     #[test]
